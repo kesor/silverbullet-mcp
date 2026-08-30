@@ -123,6 +123,7 @@ gated journal surface** (T10–T13).
 - [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated) (commit `7025d`): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env. File was untracked at the time T7 was marked resolved on the map; commit `7025d` retroactively stages the file with no changes. *(T10 promoted the `X-Sync-Mode` fix and updated this test to assert the marker appears in the structured payload instead of treating the 307 as expected behavior.)*
 - [T8. Write-envelope fog (X-* headers on PUT)](#t8-write-envelope-fog-x--headers-on-put) (commit `9275c`): full design-doc envelope — `write_page` sends every X-* header `docs/design.md` § SilverBullet client contract calls out for PUT, on top of the static `X-Source: external` + `X-Permission: rw` + `Content-Type: text/markdown`. New per-call fields: `X-Created = X-Last-Modified = int(time.time_ns() / 1_000_000)` (epoch ms, the unit SB's `header_i64` parses); `X-Content-Length = len(content.encode("utf-8"))` (UTF-8 byte count, matching SB's `meta.size`). Static fields stay in `_WRITE_HEADERS`; new `_epoch_ms()` helper isolates the timestamp computation. Operator chose this path on the basis that the design doc calls for the full envelope and SB's PUT handler reads (but mostly ignores) these from the request — `server-common/src/space/disk.rs::write_file` honors `meta.last_modified > 0` (stamps file mtime) but ignores `meta.created / meta.size / meta.perm`. Live PUT against the dev-box SB on `127.0.0.1:63000` succeeded with the new envelope; response carried `X-Last-Modified` matching our value (file mtime honored) and `X-Created` a few ms later (file btime, since the disk impl ignores request `created`). Bridge doesn't observe either side. 41 passed + 1 skipped.
 - [T10. Journal-tools config gate (foundation)](#t10-journal-tools-config-gate-foundation) (commit `46d81`): new module `src/mcp_silverbullet/journal.py` (gate + four skeleton tools); `Settings.journal` resolved by `load_settings`; `build_mcp(..., journal=...)` calls `register_journal_tools` only when `JournalConfig.enabled`. Three-gate check (truthy opt-in / non-empty path / readable) → INFO log on open, WARN on requested-but-unusable, silent on off. Skeleton tools raise `ToolError("journal tool not implemented yet; landing in T11/T12")` so a stray call surfaces loudly. Drive-by: `sb_client.list_pages` now sends `X-Sync-Mode: 1` so SB 2.x's `handle_fs_list` returns JSON instead of 307-redirecting to the SPA (prior map's T3 mock-only coverage missed it; T6 smoke parked it as "effectively moot" once the journal surface replaced the original search tool). New `tests/test_journal_gate.py` (11 cases). 54 passed (with live env) / 53 passed + 1 skipped (without); `nix flake check` green.
+- [T11. Read tools (histogram / tag_summary / recent_pages)](#t11-read-tools-histogram--tag_summary--recent_pages): three of the four T10 skeletons replaced with real implementations in `src/mcp_silverbullet/journal.py`. New helpers: `_validate_prefix` (rejects `..` / leading `/` with a `ToolError`), `_iter_md` (`rglob("*.md")` filtered to skip hidden directory segments), `_bucket_key` (basename regex `^\d{4}-\d{2}-\d{2}` → `YYYY-MM`, else UTC mtime), `_parse_tags` (hand-rolled frontmatter scanner for `tags: scalar` OR `tags:\n  - item\n  - item` — no PyYAML dep), `_unquote`, `_mtime_iso` (UTC ISO-8601), `PageRef` dataclass. New tests `tests/test_journal_read.py` (19 cases); inverted the T10 skeleton-error tests in `tests/test_journal_gate.py` so only `pages_touching_topic` (T12) still raises the skeleton error. Three SDK-shape carry-forwards worth flagging: (1) `dict[str, X]` return types emit the dict directly via a `RootModel` (no `{"result": …}` wrap); (2) `list[X]` returns *are* wrapped in `{"result": …}`; (3) `ToolError` raised from a tool handler is wire-level `is_error=True` with the message prefixed `"Error executing tool <name>: "`. Live smoke against `/var/lib/silverbullet/`: histogram returns the real distribution (`2023-10: 18`, `2024-09: 7`, …), `tag_summary` top tags are `daily: 75`, `quick: 36`, `daily-journal: 33`, `contact: 20`, …, `recent_pages(limit=5, prefix="Daily")` returns the five newest `Daily/*.md`. 72 passed + 1 skip (T7 env-gated); `nix flake check` green.
 
 ## Tickets
 
@@ -496,9 +497,102 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: open
+> **Assignee**: claude (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved
 > **Question**: What three pure-Python read tools does the
 > journal surface expose?
+> **Context**: With T10's gate in place and the four skeleton
+> tools registered, T11 replaces three of them with real
+> implementations that are *purely* filesystem reads — no
+> subprocess, no `rg`, no external deps. All three accept an
+> optional `prefix: str = ""` parameter (validated: no `..`, no
+> leading `/`, treated as a path-segment substring against file
+> names; if non-empty, restricts the inventory to files whose
+> relative path contains the segment).
+>
+> - **`journal_histogram(prefix: str = "") -> dict[str, int]`** —
+>   walk `*.md` under `space_path` (filtered by `prefix`),
+>   bucket by `YYYY-MM` extracted from the *filename* if it
+>   matches `^\d{4}-\d{2}-\d{2}` (the SB daily-journal naming
+>   convention), else from the file's mtime. Returns
+>   `{"2025-12": 22, "2026-01": 27, ...}` sorted by key.
+> - **`tag_summary(prefix: str = "") -> dict[str, int]`** —
+>   walk `*.md` files, parse YAML frontmatter (`---\n...\n---\n`),
+>   extract `tags:` (single string or list of strings; case
+>   preserved). Returns `{"meta": 50, "daily": 111, ...}`
+>   sorted by count desc.
+> - **`recent_pages(limit: int = 10, prefix: str = "") ->
+>   list[PageRef]`** — files sorted by mtime desc, returns
+>   `{name, mtime_iso, size_bytes}[]` truncated to `limit`.
+>   `PageRef` is a frozen dataclass; same shape as `FileMeta`
+>   plus `mtime_iso`.
+>
+> **Files when resolved**: `src/mcp_silverbullet/journal.py`
+> (replacing the three T10 skeleton bodies), no other module
+> changes. **Tests when resolved**: Layer-1 tests against a
+> tmpdir fixture populated with synthetic `*.md` files (one
+> with frontmatter, one without; one matching
+> `^\d{4}-\d{2}-\d{2}`, one not). Asserts on the three return
+> shapes for empty space, prefix-restricted space,
+> mixed-content space. Skeleton-error tests in
+> `test_journal_gate.py` get dropped (or inverted: assert
+> real behavior, not placeholder errors).
+> **Blocks on**: T10.
+> **Unblocks**: T13.
+> **Resolution**: replaced the three T10 skeleton bodies with
+> real implementations in `src/mcp_silverbullet/journal.py`.
+> New helpers: `_validate_prefix` (rejects `..` and leading
+> `/` with a `ToolError` before any FS call), `_iter_md`
+> (`Path.rglob("*.md")` filtered to skip hidden directory
+> segments like `.git` / `.cache` / `.ssh`), `_bucket_key`
+> (basename regex `^\d{4}-\d{2}-\d{2}` → `YYYY-MM`; falls
+> back to UTC mtime), `_parse_tags` (hand-rolled frontmatter
+> scanner for `tags: scalar` OR `tags:\n  - item\n  - item`;
+> no PyYAML — the standing-preferences dep policy is
+> off-the-shelf only, and SB's frontmatter shape is
+> bounded), `_unquote` (strips a matching pair of `'`/`"`
+> from a tag value), `_mtime_iso` (UTC ISO-8601), `PageRef`
+> dataclass. Frontmatter parser returns `[]` for malformed
+> frontmatter (no closing fence) rather than raising — the
+> tool's job is to count tags, and we'd rather under-count
+> than refuse to return.
+>
+> Three SDK-shape facts the resolution locked down (future
+> journal work hits them again): (1) `dict[str, X]` return
+> types go through a Pydantic `RootModel` and the
+> `structured_content` payload is the dict itself, NOT wrapped
+> in `{"result": …}`; (2) `list[X]` return types ARE wrapped
+> in `{"result": …}` — so `journal_histogram` / `tag_summary`
+> tests assert on the bare dict, while `recent_pages` asserts
+> on `{"result": […]}`; (3) the SDK prepends `"Error executing
+> tool <name>: "` to `ToolError` text raised from a tool
+> handler, so `is_error=True` text includes that prefix.
+>
+> New tests: `tests/test_journal_read.py` (19 cases) covers
+> empty space, daily-filename bucketing, mtime fallback,
+> substring prefix (with the documented "Areas/Daily Notes.md
+> still matches prefix='Daily'" behavior), hidden-dir skip,
+> `..` / `/` prefix rejection (raises `ToolError`), scalar +
+> list tag shapes, case preservation, quote stripping,
+> malformed frontmatter, mtime-desc ordering, `limit`
+> truncation (and `limit=0`), the `name`/`mtime_iso`/
+> `size_bytes` payload shape, and `mtime_iso.endswith("+00:00")`.
+> Inverted the T10 skeleton-error tests in
+> `tests/test_journal_gate.py`: now the three T11 tools return
+> empty-collection shapes against an empty `tmp_path`, and
+> only `pages_touching_topic` (T12) still raises the skeleton
+> error.
+>
+> Live smoke against `/var/lib/silverbullet/` with
+> `MCP_SILVERBULLET_JOURNAL_TOOLS=1`:
+> `journal_histogram` returns the real distribution
+> (`2023-10: 18`, `2024-09: 7`, …), `tag_summary` top tags
+> are `daily: 75`, `quick: 36`, `daily-journal: 33`,
+> `contact: 20`, …, `recent_pages(limit=5, prefix="Daily")`
+> returns the five newest `Daily/*.md` files, and
+> `pages_touching_topic` still raises the T12 skeleton
+> error. 72 tests pass + 1 skip (T7 env-gated); `nix flake
+> check` green.
 > **Context**: With T10's gate in place and the four skeleton
 > tools registered, T11 replaces three of them with real
 > implementations that are *purely* filesystem reads — no

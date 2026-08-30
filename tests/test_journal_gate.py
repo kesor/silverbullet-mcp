@@ -1,4 +1,5 @@
-"""Layer-1 tests for the journal-tools config gate (T10).
+"""Layer-1 tests for the journal-tools config gate (T10) and the three
+T11 read tools' boot-time behavior.
 
 The journal surface is an optional, strictly-additive set of four
 direct-FS read tools. It ships only when two env vars agree: the
@@ -8,6 +9,14 @@ covers all three modes of the gate (off, on-but-unusable, on) at the
 boundary where it lives: the boot-time ``resolve_journal_config``
 helper, the ``build_mcp`` registration call, and the resulting
 ``list_tools`` inventory.
+
+The T11 ticket inverted the T10 skeleton-error tests for the three
+read tools (``journal_histogram`` / ``tag_summary`` /
+``recent_pages``) into ``tests/test_journal_read.py``, where the
+real behaviors (returned shapes, prefix filtering, mtime sorting,
+frontmatter parsing) live. ``pages_touching_topic`` still raises
+``ToolError("… T12")`` until T12 lands; this file keeps the wire
+shape for that one tool under the ``pages_touching_topic`` test.
 
 Each test reuses the in-memory ``Client(mcp, raise_exceptions=True)``
 pattern from ``tests/test_tools_in_memory.py`` and the
@@ -171,10 +180,17 @@ async def test_build_mcp_omits_journal_tools_when_gate_is_off() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_mcp_registers_journal_skeleton_when_gate_is_on(
+async def test_build_mcp_registers_journal_tools_when_gate_is_on(
     tmp_path,
 ) -> None:
-    """Gate on = four journal tools present alongside the ``/.fs`` tools."""
+    """Gate on = four journal tools present alongside the ``/.fs`` tools.
+
+    The three T11 read tools (``journal_histogram``, ``tag_summary``,
+    ``recent_pages``) round-trip against the empty ``tmp_path`` —
+    they return empty results without raising, proving the T10
+    skeletons have been replaced. ``pages_touching_topic`` (T12) is
+    the remaining skeleton and still raises ``ToolError``.
+    """
     server = _build(
         lambda req: httpx.Response(200),
         journal=JournalConfig(enabled=True, space_path=str(tmp_path)),
@@ -182,17 +198,37 @@ async def test_build_mcp_registers_journal_skeleton_when_gate_is_on(
     async with Client(server, raise_exceptions=True) as client:
         tools = await client.list_tools()
         names = {t.name for t in tools.tools}
-    assert names == SB_TOOL_NAMES | JOURNAL_TOOL_NAMES
+        assert names == SB_TOOL_NAMES | JOURNAL_TOOL_NAMES
+        # T11: the three read tools are no longer skeletons — an
+        # empty ``tmp_path`` is a valid (empty) space, so each
+        # returns its empty-collection shape with ``is_error=False``.
+        # ``dict[str, int]`` returns go through a RootModel and are
+        # emitted unwrapped; ``list[…]`` returns are wrapped in
+        # ``{"result": …}``.
+        empty = await client.call_tool("journal_histogram", {})
+        assert empty.is_error is False
+        assert empty.structured_content == {}
+        empty = await client.call_tool("tag_summary", {})
+        assert empty.is_error is False
+        assert empty.structured_content == {}
+        empty = await client.call_tool("recent_pages", {})
+        assert empty.is_error is False
+        assert empty.structured_content == {"result": []}
+        # T12: ``pages_touching_topic`` is still a skeleton.
+        skel = await client.call_tool(
+            "pages_touching_topic", {"query": "anything"}
+        )
+        assert skel.is_error is True
 
 
 # --- skeleton tool behavior ------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_skeleton_journal_tools_raise_not_implemented(
+async def test_pages_touching_topic_skeleton_raises_not_implemented(
     tmp_path,
 ) -> None:
-    """Each skeleton tool raises a ``ToolError`` until T11/T12 fill in the body.
+    """``pages_touching_topic`` (T12) still raises a ``ToolError`` skeleton.
 
     Going through the wire (not calling the handler directly) so a
     future SDK rename of the registry attribute doesn't break the
@@ -204,22 +240,13 @@ async def test_skeleton_journal_tools_raise_not_implemented(
         journal=JournalConfig(enabled=True, space_path=str(tmp_path)),
     )
     async with Client(server, raise_exceptions=True) as client:
-        for tool_name in sorted(JOURNAL_TOOL_NAMES):
-            # The four tool signatures differ: one takes a required
-            # ``query``, the rest take optional ``prefix`` /
-            # ``limit``. Call each with the right minimum-arg set so
-            # a future T11/T12 signature change fails loudly here
-            # rather than silently dropping a required parameter.
-            kwargs: dict[str, object] = {}
-            if tool_name == "pages_touching_topic":
-                kwargs = {"query": "anything"}
-            result = await client.call_tool(tool_name, kwargs)
-            assert result.is_error is True, (
-                f"{tool_name} should be a T10 skeleton, not a real implementation"
-            )
-            assert "not implemented" in result.content[0].text, (
-                f"{tool_name} error text was {result.content[0].text!r}"
-            )
+        result = await client.call_tool(
+            "pages_touching_topic", {"query": "anything"}
+        )
+    assert result.is_error is True
+    assert "not implemented" in result.content[0].text, (
+        f"pages_touching_topic error text was {result.content[0].text!r}"
+    )
 
 
 # --- register_journal_tools is a no-op when the gate is off -----------
