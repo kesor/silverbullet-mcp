@@ -96,7 +96,7 @@ export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:3000
 export MCP_SILVERBULLET_RESOURCE_URL=https://acme.example.com/mcp
 # extra Host values nginx/cloudflared might forward (comma-separated)
 export MCP_SILVERBULLET_ALLOWED_HOSTS=acme.example.com
-nix run .#mcp-silverbullet    # or: uv sync && uv run mcp-silverbullet
+uv run mcp-silverbullet    # or with Nix: nix run .#mcp-silverbullet
 ```
 
 The AUD tag is a hex string Cloudflare generates when you create the
@@ -192,11 +192,12 @@ http {
 ```
 
 The `recommended-proxy_set_header-headers.conf` file that ships with
-NixOS's `services.nginx` includes `proxy_set_header Host $host;` by
-default. On any location where you also set your own `proxy_set_header
-Host …`, the include fires AFTER your directive and adds a second
-Host header. **Disable the include for the `/mcp` location** (or copy
-out only the headers you need, as shown above).
+several common nginx setups (NixOS's `services.nginx`, Debian/Ubuntu's
+`nginx-extras`, ...) includes `proxy_set_header Host $host;` by
+default. On any location where you also set your own
+`proxy_set_header Host …`, the include fires AFTER your directive
+and adds a second Host header. **Disable the include for the `/mcp`
+location** (or copy out only the headers you need, as shown above).
 
 You can verify the config with `nginx -t` and reload with
 `nginx -s reload` after editing.
@@ -274,7 +275,7 @@ ingress:
 
 You need two Access applications:
 
-### 4a. The MCP app (sb.kesor.net/mcp)
+### 4a. The MCP app (acme.example.com/mcp)
 
 Cloudflare dashboard → Zero Trust → Access → Applications → Add an
 application → Self-hosted.
