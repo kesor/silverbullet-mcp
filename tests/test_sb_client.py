@@ -110,6 +110,13 @@ async def test_write_page_round_trip_body_and_returns_etag() -> None:
     assert captured["x-source"] == "external"
     assert captured["x-permission"] == "rw"
     assert captured["content-type"] == "text/markdown"
+    # Full design-doc envelope (T8): every X-* header the design doc §
+    # SilverBullet client contract PUT row lists is present.
+    assert captured["x-created"] == captured["x-last-modified"]
+    assert int(captured["x-created"]) > 0
+    # ``X-Content-Length`` is the UTF-8 byte count of the body,
+    # matching SB's ``meta.size`` (``# new body`` = 10 bytes).
+    assert captured["x-content-length"] == "10"
 
 
 @pytest.mark.asyncio
@@ -169,6 +176,34 @@ async def test_write_page_body_is_utf8_markdown() -> None:
         await sb.write_page("unicode", body)
 
     assert received[0] == body.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_write_page_x_content_length_matches_utf8_byte_count() -> None:
+    """``X-Content-Length`` is the UTF-8 byte count, not the codepoint count.
+
+    Locks the value to ``len(content.encode("utf-8"))`` so a future
+    refactor that uses ``len(content)`` (Python's codepoint count)
+    fails loudly — non-ASCII pages would silently disagree with what
+    the body actually sends.
+    """
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    # ``é`` is 1 codepoint but 2 UTF-8 bytes; ``π`` is 1 codepoint but
+    # 2 UTF-8 bytes. Total: 2 + 1 (the leading ``a``) = 3 bytes for
+    # the body, 4 bytes including the trailing newline. Pick a body
+    # where codepoint count and byte count diverge clearly.
+    body = "éπ\n"
+    async with _client(handler) as sb:
+        await sb.write_page("unicode", body)
+
+    assert len(body) == 3  # codepoints
+    assert len(body.encode("utf-8")) == 5  # bytes
+    assert captured["x-content-length"] == "5"
 
 
 @pytest.mark.asyncio

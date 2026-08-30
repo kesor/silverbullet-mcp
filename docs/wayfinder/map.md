@@ -28,8 +28,7 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
 ### 🏁 Status: in flight.
 
-Six of eight tickets resolved (T1–T6). Frontier is T7 (live-SB
-end-to-end test) and T8 (write-envelope fog).
+Seven of eight tickets resolved (T1–T7). T8 claimed; grilling in flight.
 
 ## Notes
 
@@ -90,6 +89,7 @@ end-to-end test) and T8 (write-envelope fog).
 - [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
 - [T5. HTTP integration tests (auth + discovery doc)](#t5-http-integration-tests-auth--discovery-doc) (commit `53ae8`): 5 Layer-2 tests in `tests/test_http_auth.py` exercising the bridge as a real ASGI app via `httpx.ASGITransport(app=streamable_http_app(host="bridge.test"))` + `app.router.lifespan_context(app)` (drives the SDK's `StreamableHTTPSessionManager.run()` since `ASGITransport` doesn't speak Starlette's lifespan protocol). Covers: POST `/mcp` no-token → 401 + `WWW-Authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://bridge.test/.well-known/oauth-protected-resource/mcp"`; POST `/mcp` wrong-token → identical shape (no header-vs-token probe leak); GET `/.well-known/oauth-protected-resource/mcp` (no auth) → 200 + RFC 9728 doc with `resource=<resource_url>`, `authorization_servers=[<resource_url>]` (v1 has no separate authz server), `bearer_methods_supported=["header"]`, `scopes_supported` omitted (`AuthSettings.required_scopes=None`, stripped by `PydanticJSONResponse.render`); POST `/mcp` with auth but `Accept: text/plain` → 406 ("Not Acceptable: Client must accept both application/json and text/event-stream"); end-to-end `streamable_http_client` + `ClientSession` initialize → list_tools (`['list_pages', 'read_page', 'write_page']`) → `call_tool read_page` roundtrip against a mocked SB. ASGI transport vs the ticket's literal "uvicorn on a free port": same wire path (every middleware, header, status code, body shape) minus the TCP stack — fast, deterministic, no port flake. The real-port path is exercised at T7 against the live SilverBullet. 5 new tests in 0.94s; 36 tests total green; `nix flake check` green.
 - [T6. Operator smoke run + README](#t6-operator-smoke-run--readme): `main.py` boots `SBClient` + `build_mcp` + `run_streamable_http_async`; `flake.nix` exposes `apps.mcp-silverbullet`; README documents boot order. Live smoke against SB `127.0.0.1:63000` (no SB auth): write_page + read_page roundtrip OK; list_pages → ToolError `silverbullet error: 307` because `GET /.fs` redirects to `/` on this SB. `mcp` CLI extra not installed; walkthrough used `ClientSession` + `streamable_http_client` instead of `mcp dev`.
+- [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env.
 
 ## Tickets
 
@@ -292,6 +292,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
+> **Assignee**: pi (claimed 2026-08-27, resolved same day)
+> **Status**: ✅ resolved
 > **Question**: Write `tests/test_e2e_live_sb.py` that reads
 > `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN`
 > from env; if either is unset, skip with a clear message; otherwise
@@ -307,6 +309,17 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > removed on success and on failure (best-effort `try/finally`).
 > **Blocks on**: T5.
 > **Unblocks**: (none — destination milestone).
+> **Resolution**: Env-gated test as specified. Live run against
+> `http://127.0.0.1:63000` with empty SB token: write + read of the
+> marker page matched; `If-Match: *` update 200; stale `If-Match`
+> **also 200** — this SilverBullet does not implement 412 on PUT
+> preconditions (probed with curl: If-Match, If-None-Match, missing
+> page all 200). `list_pages` still `silverbullet error: 307`.
+> Test records those SB facts instead of failing the suite. Cleanup
+> `DELETE /.fs/{marker}` in `finally`. Without env vars, pytest skips
+> with the message in the test. PUT responses also returned
+> `X-Content-Length`, `X-Created`, `X-Last-Modified`, `X-Permission`
+> (input for T8).
 
 ---
 
@@ -314,6 +327,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:grilling`
 > **Type**: HITL (operator decides when first write fails)
+> **Assignee**: pi (claimed 2026-08-27, grilling in flight)
 > **Question**: When `write_page` actually runs against a real SB,
 > do we send `X-Permission: rw`? `X-Created`? `X-Last-Modified`?
 > `X-Content-Length`? The design doc enumerates them; the user punted

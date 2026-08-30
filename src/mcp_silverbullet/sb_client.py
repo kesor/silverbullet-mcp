@@ -13,13 +13,19 @@ Three entry points:
 - :func:`list_pages` — ``GET /.fs``
 
 The status-code mapping lives in :func:`_raise_for_status` and matches
-the table in ``docs/design.md`` § Tools. Headers carry the bridge
-identity (``X-Source: external``, ``X-Permission: rw``) so SB's
-attribution log distinguishes bridge writes from editor / sync writes.
+the table in ``docs/design.md`` § Tools. The PUT envelope carries the
+full header set the design doc § SilverBullet client contract calls
+out for writes (``X-Source: external``, ``X-Permission: rw``,
+``X-Created``, ``X-Last-Modified``, ``X-Content-Length``,
+``Content-Type: text/markdown``, optional ``If-Match`` /
+``If-None-Match``) so SB's attribution log distinguishes bridge
+writes from editor / sync writes, and so future SB versions that
+honor request-side meta can read it without a bridge change.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +36,10 @@ import httpx2 as httpx
 # ``max_request_body_size`` default (4 MiB).
 _BODY_LIMIT_BYTES = 4 * 1024 * 1024
 
+# Per-call fields (``X-Created`` / ``X-Last-Modified`` /
+# ``X-Content-Length``) are stamped at request time so each write
+# reflects the moment the PUT leaves the bridge; the static fields
+# below are inherited by every call.
 _WRITE_HEADERS = {
     # Required by SilverBullet's `VALID_WRITE_SOURCES` so the attribution
     # log tags the write as coming from the bridge, not the editor.
@@ -38,6 +48,19 @@ _WRITE_HEADERS = {
     # `X-Permission: rw`.
     "X-Permission": "rw",
 }
+
+
+def _epoch_ms() -> int:
+    """Epoch milliseconds, the unit SB's ``header_i64`` parses.
+
+    Matches the ``FileMeta.created`` / ``FileMeta.last_modified`` shape
+    in ``silverbullet_server_common::types::FileMeta`` (epoch ms). The
+    disk impl of ``write_file`` honors ``last_modified > 0`` by
+    stamping the file's mtime, but ignores ``created`` / ``size`` /
+    ``perm`` — so we send them all (per the design doc § SilverBullet
+    client contract PUT row) and let SB pick what it wants.
+    """
+    return time.time_ns() // 1_000_000
 
 
 class SBError(Exception):
@@ -160,6 +183,16 @@ class SBClient:
         # SB's `/.fs` PUT handler reads ``Content-Type`` to decide how to
         # store the body; httpx doesn't auto-set it for ``content=str``.
         headers["Content-Type"] = "text/markdown"
+        # Full design-doc envelope (T8): ``X-Created``, ``X-Last-Modified``,
+        # ``X-Content-Length`` round out the PUT request headers per
+        # ``docs/design.md`` § SilverBullet client contract. Values are
+        # stamped at request time so each write reflects the moment
+        # the PUT leaves the bridge (``X-Content-Length`` is the UTF-8
+        # byte count, matching SB's ``meta.size``).
+        now_ms = _epoch_ms()
+        headers["X-Created"] = str(now_ms)
+        headers["X-Last-Modified"] = str(now_ms)
+        headers["X-Content-Length"] = str(len(content.encode("utf-8")))
         if if_match is not None:
             headers["If-Match"] = if_match
         elif if_none_match:
