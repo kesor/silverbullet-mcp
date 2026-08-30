@@ -10,12 +10,19 @@ v1.1 map (full CRUD + editing, in progress): [`docs/wayfinder/map-v1.1.md`](docs
 
 ## What it exposes
 
-Three tools and one resource template:
+Five tools and one resource template:
 
 - `read_page(name)` — markdown body
-- `write_page(name, content, if_match?)` — create/update
+- `write_page(name, content, if_match?)` — create/update; returns the new ETag
+- `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the new ETag
+- `delete_page(name, if_match?)` — hard delete; returns the deleted page's ETag
 - `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA)
 - `silverbullet://page/{name}` — same body as `read_page`, for attaching context
+
+Every write tool honors `if_match` (`"*"` to require existence,
+`<etag>` to require an exact body match, `None` for unconditional).
+Concurrent edits from two clients fail with a 412 — the second
+client's stale etag does not overwrite the first client's write.
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
 
@@ -101,8 +108,9 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's three tools — `read_page`,
-`write_page`, `list_pages` — register as direct Pi tools.
+`/reload` in Pi and the bridge's five tools — `read_page`,
+`write_page`, `append_to_page`, `delete_page`, `list_pages` —
+register as direct Pi tools.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so

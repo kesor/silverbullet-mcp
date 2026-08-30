@@ -1,23 +1,28 @@
 """MCP server wiring for the bridge.
 
-Locked at T4 of the prior map: three tools (``read_page``,
-``write_page``, ``list_pages``) and one resource template
+Locked at T4 of the prior map (three ``/.fs``-backed tools) and grown
+by v1.1: T18 added ``delete_page``, T19 added ``append_to_page``.
+Today the bridge registers five ``/.fs``-backed tools
+(``read_page`` / ``write_page`` / ``delete_page`` / ``append_to_page``
+/ ``list_pages``) plus one resource template
 (``silverbullet://page/{name}``). Each tool closes over a single
 :class:`SBClient` opened at boot; SB's typed exceptions translate to
 :mcp_exc:`ToolError` with the exact wording from
-``docs/design.md`` § Tools § Status-code mapping.
+``docs/design.md`` § Tools § Status-code mapping, all funneled
+through :func:`_translate_sb_errors`.
 
 T10 of the current map adds an optional, gated journal surface
 (``journal_histogram`` / ``tag_summary`` / ``recent_pages`` /
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the three ``/.fs``-backed tools and the resource
+registers only the five ``/.fs``-backed tools and the resource
 template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
-client contract for the SB-side status codes, and ``docs/wayfinder/map.md``
-for the T3/T4/T10 decisions this implements.
+client contract for the SB-side status codes, and
+``docs/wayfinder/map.md`` (v1) / ``docs/wayfinder/map-v1.1.md`` (v1.1)
+for the T3/T4/T10/T18/T19 decisions this implements.
 """
 
 from __future__ import annotations
@@ -152,8 +157,9 @@ def build_mcp(
     mcp = MCPServer(
         name=name,
         instructions=(
-            "Read, write, and list SilverBullet pages. Three tools "
-            "(`read_page`, `write_page`, `list_pages`) plus one "
+            "Read, write, append to, delete, and list SilverBullet "
+            "pages. Five tools (`read_page`, `write_page`, "
+            "`append_to_page`, `delete_page`, `list_pages`) plus one "
             "resource template `silverbullet://page/{name}` for "
             "attaching page bodies to conversation context."
         ),
@@ -171,13 +177,16 @@ def build_mcp(
 
 
 def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
-    """Attach the three ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the five ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
-    are decorators that take the function; we wrap each handler in a
-    ``try/except`` that maps SB exceptions to :exc:`ToolError` per the
-    design doc's status-code mapping.
+    are decorators that take the function; each tool handler wraps
+    its ``sb_client`` call in :func:`_translate_sb_errors`, which
+    maps SB exceptions to :exc:`ToolError` per the design doc's
+    status-code mapping. The resource template uses the SDK's
+    separate ``ResourceError`` shapes (JSON-RPC protocol errors vs
+    tool-handler ``is_error=True``) and keeps its own translation.
 
     The journal surface (T11/T12) is gated separately — see
     :func:`mcp_silverbullet.journal.register_journal_tools`, called by
@@ -235,6 +244,46 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
     ) -> str | None:
         async with _translate_sb_errors(name):
             return await sb_client.delete_page(name, if_match=if_match)
+
+    @mcp.tool(
+        title="Append to page",
+        description=(
+            "Append text to the end of a SilverBullet page, separated "
+            "from the existing body by a single newline (skipped when "
+            "the body already ends in a newline, so callers that pass "
+            "leading newlines get exactly one separator). The tool "
+            "returns the new ETag so the caller can chain edits "
+            "without re-reading. `if_match=\"*\"` requires the page "
+            "to exist; `if_match=<etag>` requires the body hash to "
+            "match (protects against concurrent appends landing out "
+            "of order). 404-equivalent ToolError if the page is "
+            "missing; 412 if the precondition fails; 413 if the "
+            "combined body exceeds 4 MiB."
+        ),
+    )
+    async def append_to_page(
+        name: str,
+        text: str,
+        if_match: str | None = None,
+    ) -> str | None:
+        # An empty append is almost certainly a caller bug (the
+        # caller meant to write something and forgot to fill it in);
+        # surface it loudly upfront so the read-modify-write round
+        # trip isn't wasted on a no-op. ``write_page(name, content)``
+        # is the right tool for "create with this body" and
+        # ``append_to_page(name, "")`` would only ever mean that.
+        if not text:
+            raise ToolError("text must not be empty")
+        async with _translate_sb_errors(name):
+            body = await sb_client.read_page(name)
+            new_body = (
+                body + "\n" + text
+                if body and not body.endswith("\n")
+                else body + text
+            )
+            return await sb_client.write_page(
+                name, new_body, if_match=if_match
+            )
 
     @mcp.tool(
         title="List pages",

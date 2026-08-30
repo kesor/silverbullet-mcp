@@ -52,7 +52,13 @@ JOURNAL_TOOL_NAMES = {
     "recent_pages",
     "pages_touching_topic",
 }
-SB_TOOL_NAMES = {"read_page", "write_page", "delete_page", "list_pages"}
+SB_TOOL_NAMES = {
+    "read_page",
+    "write_page",
+    "delete_page",
+    "list_pages",
+    "append_to_page",
+}
 
 
 def _build(handler, journal: JournalConfig | None = None) -> MCPServer:

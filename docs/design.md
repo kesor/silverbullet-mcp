@@ -208,12 +208,16 @@ dev = [
 
 ## § Tools
 
-Locked at T4. **Three tools, one resource template.**
+v1 locked three tools at T4; v1.1 grew the surface to five (T18 added
+`delete_page`, T19 added `append_to_page`). **Five tools, one
+resource template.**
 
 | Tool | Input (Python type hint) | SB call | Side effects |
 |---|---|---|---|
 | `read_page` | `name: str` | `GET /.fs/{name}` | none |
 | `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | may create / overwrite / refuse on `412` |
+| `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | may append / refuse on `412` (concurrent-write protection) |
+| `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | none |
 
 Resource template:
@@ -254,10 +258,12 @@ we are.
 
 ### What we are not doing (v1)
 
-- `delete_page`, `move_page`, `append_page`.
-- `search_pages` (server-side query — would need either client-side
-  filtering over `list_pages`, or SB-side Space-Lua, neither of which
-  we want v1).
+- `move_page` (v1.1's T22 candidate; not built yet).
+- `search_pages` via SB-side server-side query — would need either
+  client-side filtering over `list_pages`, or SB-side Space-Lua,
+  neither of which we want v1. v1.1's `pages_touching_topic` is a
+  direct-FS name+content search that lives behind the journal gate,
+  not a server-side SB query.
 - Templates for Space Lua objects (`silverbullet://lua/...`) — would
   expose `/.shell`, which is a rich and dangerous axis.
 - `subscriptions/listen` channels for live file-watcher notifications.

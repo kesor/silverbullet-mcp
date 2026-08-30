@@ -124,6 +124,26 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     assert read_back.is_error is False, read_back
                     assert read_back.content[0].text == body
 
+                    # ``append_to_page`` is the v1.1 T19 read-modify-
+                    # write tool; lock the round-trip shape against
+                    # the live SB while we have a session open. The
+                    # separator rule (one ``\n`` inserted unless the
+                    # body already ends in one) is the headline
+                    # semantic; assert on the wire result.
+                    appended = await session.call_tool(
+                        "append_to_page",
+                        {"name": MARKER, "text": "appended\n"},
+                    )
+                    assert appended.is_error is False, appended
+
+                    after_append = await session.call_tool(
+                        "read_page", {"name": MARKER}
+                    )
+                    assert after_append.is_error is False, after_append
+                    # Body ended in ``\n`` already, so no extra
+                    # separator is inserted between the two halves.
+                    assert after_append.content[0].text == body + "appended\n"
+
                     # Ticket asked for 412 on If-Match. HTTP If-Match: *
                     # requires the page to exist (should 200 here).
                     # A stale etag should 412 — this live SB ignores
