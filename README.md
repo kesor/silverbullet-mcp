@@ -438,6 +438,10 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
 | `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the six journal tools above (T10–T12, T34, T35); requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
 | `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages` (T28). Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. Partial failures (404 / 412 / 5xx / timeout on one page) leave that row's etag as `null` rather than failing the whole call. |
+| `MCP_SILVERBULLET_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. `DEBUG` dumps sanitized HTTP request metadata and classifies uvicorn's opaque `Invalid HTTP request received` warnings (HTTP/2 preface vs TLS ClientHello vs junk). `UVICORN_LOG_LEVEL` is ignored — uvicorn is configured from this var. |
+| `MCP_SILVERBULLET_DEBUG` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) is a one-knob alias for `LOG_LEVEL=debug`. Explicit `LOG_LEVEL` wins if both are set. |
+
+`WARNING: Invalid HTTP request received.` from uvicorn means the first bytes on the socket were not HTTP/1. This uvicorn build does not log *what* they were, even at debug. Set `MCP_SILVERBULLET_LOG_LEVEL=debug` (or `MCP_SILVERBULLET_DEBUG=1`) and the bridge logs a classification + the first 200 bytes next to that warning. Typical causes behind Cloudflare Access / cloudflared: HTTP/2 to an HTTP/1 origin (`http2-preface`), HTTPS hitting the HTTP port (`tls-clienthello`), or a TCP health check with no HTTP (`empty` / `unknown`).
 
 ### Cloudflare Access boot example
 

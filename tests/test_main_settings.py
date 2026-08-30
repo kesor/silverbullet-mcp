@@ -319,3 +319,37 @@ def test_build_verifier_picks_static_in_static_mode() -> None:
     # Compare against the literal bytes — same constant-time
     # compare the verifier itself runs.
     assert v._token == b"secret"  # noqa: SLF001
+
+
+# --- log level ---------------------------------------------------------
+
+
+def test_log_level_defaults_to_info() -> None:
+    s = load_settings(_JWT_ENV)
+    assert s.log_level == "INFO"
+
+
+def test_log_level_debug_from_env() -> None:
+    s = load_settings({**_JWT_ENV, "MCP_SILVERBULLET_LOG_LEVEL": "debug"})
+    assert s.log_level == "DEBUG"
+
+
+def test_debug_flag_enables_debug_log_level() -> None:
+    s = load_settings({**_JWT_ENV, "MCP_SILVERBULLET_DEBUG": "1"})
+    assert s.log_level == "DEBUG"
+
+
+def test_explicit_log_level_wins_over_debug_flag() -> None:
+    s = load_settings(
+        {
+            **_JWT_ENV,
+            "MCP_SILVERBULLET_DEBUG": "1",
+            "MCP_SILVERBULLET_LOG_LEVEL": "warning",
+        }
+    )
+    assert s.log_level == "WARNING"
+
+
+def test_unknown_log_level_rejected() -> None:
+    with pytest.raises(SystemExit, match="MCP_SILVERBULLET_LOG_LEVEL"):
+        load_settings({**_JWT_ENV, "MCP_SILVERBULLET_LOG_LEVEL": "verbose"})

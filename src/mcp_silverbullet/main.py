@@ -24,6 +24,10 @@ from dataclasses import dataclass
 from mcp.server.auth.provider import TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
 
+from mcp_silverbullet.http_debug import (
+    RequestDumpMiddleware,
+    install_httptools_debug_hook,
+)
 from mcp_silverbullet.journal import (
     JournalConfig,
     _is_truthy,
@@ -59,6 +63,15 @@ _DEFAULT_JWT_ALGORITHMS: tuple[str, ...] = ("RS256",)
 # modest NTP drift.
 _DEFAULT_JWT_LEEWAY_SECONDS = 30
 
+# Inbound log level. ``INFO`` is the v1.x default (journal-gate
+# lines + uvicorn access). ``DEBUG`` also dumps sanitized HTTP
+# request metadata and classifies uvicorn's opaque
+# "Invalid HTTP request received" warnings (HTTP/2 preface vs
+# TLS ClientHello vs junk). Accepted values match uvicorn /
+# the MCP SDK: DEBUG / INFO / WARNING / ERROR / CRITICAL.
+_DEFAULT_LOG_LEVEL = "INFO"
+_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -85,6 +98,7 @@ class Settings:
     jwt_jwks_url: str | None
     jwt_algorithms: tuple[str, ...]
     jwt_leeway_seconds: int
+    log_level: str
 
 
 def _parse_csv(raw: str) -> tuple[str, ...]:
@@ -214,6 +228,22 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
     list_pages_hydrate_etags = _is_truthy(
         env.get("MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS", "")
     )
+    # ``MCP_SILVERBULLET_DEBUG=1`` is a one-knob alias for
+    # ``LOG_LEVEL=debug`` so an operator debugging a live
+    # service doesn't have to remember the level names.
+    # Explicit ``LOG_LEVEL`` wins when both are set.
+    log_level_raw = (env.get("MCP_SILVERBULLET_LOG_LEVEL") or "").strip()
+    if log_level_raw:
+        log_level = log_level_raw.upper()
+    elif _is_truthy(env.get("MCP_SILVERBULLET_DEBUG", "")):
+        log_level = "DEBUG"
+    else:
+        log_level = _DEFAULT_LOG_LEVEL
+    if log_level not in _LOG_LEVELS:
+        raise SystemExit(
+            f"MCP_SILVERBULLET_LOG_LEVEL must be one of "
+            f"{sorted(_LOG_LEVELS)}, got {log_level_raw!r}"
+        )
     return Settings(
         token=token,
         sb_url=(env.get("MCP_SILVERBULLET_SB_URL") or _DEFAULT_SB_URL).rstrip("/"),
@@ -232,6 +262,7 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         jwt_jwks_url=jwt_jwks_url,
         jwt_algorithms=jwt_algorithms,
         jwt_leeway_seconds=jwt_leeway_seconds,
+        log_level=log_level,
     )
 
 
@@ -276,11 +307,27 @@ async def serve(settings: Settings | None = None) -> None:
     # ``resolve_journal_config``) actually reach the operator's
     # terminal. Without this the root logger discards INFO by
     # default and the gate's open / closed messages are invisible.
+    # ``log_level`` is parsed *inside* ``load_settings``, so the
+    # first ``basicConfig`` uses INFO; we re-apply after parse so
+    # ``LOG_LEVEL=debug`` actually takes effect.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = settings if settings is not None else load_settings()
+    logging.getLogger().setLevel(settings.log_level)
+    logging.getLogger("mcp_silverbullet").setLevel(settings.log_level)
+    logging.getLogger("uvicorn").setLevel(settings.log_level)
+    logging.getLogger("uvicorn.error").setLevel(settings.log_level)
+    if settings.log_level == "DEBUG":
+        install_httptools_debug_hook()
+        logging.info(
+            "debug logging on (MCP_SILVERBULLET_LOG_LEVEL=%s); "
+            "non-HTTP/1 first-bytes and sanitized request metadata "
+            "will be logged. UVICORN_LOG_LEVEL is ignored — uvicorn "
+            "is configured from this env var, not its own.",
+            settings.log_level,
+        )
     async with SBClient(settings.sb_url, settings.sb_token) as sb:
         verifier = build_verifier(settings)
         mcp = build_mcp(
@@ -289,17 +336,51 @@ async def serve(settings: Settings | None = None) -> None:
             resource_url=settings.resource_url,
             journal=settings.journal,
             list_pages_hydrate_etags=settings.list_pages_hydrate_etags,
+            log_level=settings.log_level,
         )
         print(
             f"mcp-silverbullet listening on http://{settings.host}:{settings.port}/mcp "
-            f"(SB {settings.sb_url}, auth={settings.auth_mode})",
+            f"(SB {settings.sb_url}, auth={settings.auth_mode}, "
+            f"log={settings.log_level})",
             file=sys.stderr,
         )
-        await mcp.run_streamable_http_async(
-            host=settings.host,
-            port=settings.port,
-            transport_security=_transport_security(settings),
-        )
+        await _run_http(mcp, settings)
+
+
+async def _run_http(mcp: object, settings: Settings) -> None:
+    """Bind uvicorn ourselves so debug logging can wrap the ASGI app.
+
+    The SDK's ``run_streamable_http_async`` constructs
+    ``uvicorn.Config`` with only ``log_level`` and no hook to add
+    middleware or diagnose httptools parse failures. We duplicate
+    the ~15-line boot so ``LOG_LEVEL=debug`` can:
+
+    - attach :class:`RequestDumpMiddleware` (sanitized headers +
+      status for requests that *did* parse as HTTP/1);
+    - pass ``log_level`` and ``proxy_headers=True`` (cloudflared
+      sets ``X-Forwarded-*``; without this the access log shows
+      127.0.0.1 for every client).
+    """
+    import uvicorn
+    from mcp.server.mcpserver.server import MCPServer
+
+    assert isinstance(mcp, MCPServer)
+    starlette_app = mcp.streamable_http_app(
+        transport_security=_transport_security(settings),
+        host=settings.host,
+    )
+    if settings.log_level == "DEBUG":
+        starlette_app.add_middleware(RequestDumpMiddleware)
+    config = uvicorn.Config(
+        starlette_app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level.lower(),
+        access_log=True,
+        proxy_headers=True,
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 def run() -> None:

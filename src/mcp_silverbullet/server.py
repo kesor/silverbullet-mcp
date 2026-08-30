@@ -827,6 +827,7 @@ def build_mcp(
     name: str = "mcp-silverbullet",
     journal: JournalConfig | None = None,
     list_pages_hydrate_etags: bool = False,
+    log_level: str = "INFO",
 ) -> MCPServer:
     """Build the configured :class:`MCPServer`.
 
@@ -901,6 +902,8 @@ def build_mcp(
     """
     mcp = MCPServer(
         name=name,
+        debug=(log_level == "DEBUG"),
+        log_level=log_level,  # type: ignore[arg-type]
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
             "check existence of, diff, enumerate, search, and "
