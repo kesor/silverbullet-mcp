@@ -8,7 +8,7 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All nine ``/.fs``-backed tools (``read_page``, ``page_exists``,
+- All ten ``/.fs``-backed tools (``read_page``, ``page_exists``,
   ``write_page``, ``delete_page``, ``append_to_page``,
   ``patch_page_lines``, ``patch_page_replace``, ``move_page``,
   ``list_pages``) on the 200 happy path;
@@ -3951,3 +3951,389 @@ async def test_read_page_timeout_returns_tool_error() -> None:
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool read_page: silverbullet request timed out"
+
+
+# --- diff_pages (T27) -------------------------------------------------
+#
+# T27 adds ``diff_pages(name, other_name?, other_body?)`` — a line-
+# based unified diff between two pages or a page and a literal
+# string. The wire shape is ``{diff, name, other?}``: ``diff`` is the
+# unified diff (empty string when the two bodies are identical),
+# ``name`` is the read-side envelope for the first page (with the
+# page's name included so the shape is parallel with ``other``),
+# and ``other`` is the same envelope for the second page when
+# ``other_name`` was given. The tool returns 404-equivalent ToolError
+# when either page is missing; passing neither or both of
+# ``other_name`` / ``other_body`` is rejected upfront so the read
+# round trip isn't wasted on a confused input shape.
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_page_vs_page_returns_unified_diff() -> None:
+    """Two pages, both exist: diff with both envelopes surfaced.
+
+    Locks the wire shape and the basic diff content. The first
+    page's name appears in the ``fromfile`` header of the diff
+    (``--- first``), the second's in the ``tofile`` header
+    (``+++ second``); the agent reading the diff back can map
+    ``-`` lines to ``first`` and ``+`` lines to ``second`` without
+    ambiguity. Both envelopes carry ``name`` (parallel shape;
+    the second envelope's name is what the agent needs to know
+    which page the right side came from).
+    """
+    pages = {
+        "first": "alpha\nbeta\ngamma\n",
+        "second": "alpha\nBETA\ngamma\n",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        name = request.url.path.removeprefix("/.fs/")
+        if name not in pages:
+            return httpx.Response(404, text="page not found")
+        return httpx.Response(
+            200,
+            text=pages[name],
+            headers={
+                "ETag": f'"{name}-etag"',
+                "X-Content-Length": str(len(pages[name].encode("utf-8"))),
+            },
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "first", "other_name": "second"},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    # Per-page envelopes include ``name`` so the shape is parallel
+    # (the second envelope's ``name`` is what the agent reads to
+    # know which page the diff's right side came from).
+    assert payload["name"] == {
+        "name": "first",
+        "body": "alpha\nbeta\ngamma\n",
+        "etag": '"first-etag"',
+        "size_bytes": 17,
+        "last_modified_ms": None,
+    }
+    assert payload["other"] == {
+        "name": "second",
+        "body": "alpha\nBETA\ngamma\n",
+        "etag": '"second-etag"',
+        "size_bytes": 17,
+        "last_modified_ms": None,
+    }
+    # ``difflib.unified_diff`` normals ``---``/``+++`` headers with
+    # the file names; assert on the structural pieces so a future
+    # ``difflib`` upgrade that tweaks the header format doesn't
+    # break this test.
+    diff = payload["diff"]
+    assert "--- first\n" in diff
+    assert "+++ second\n" in diff
+    assert "-beta\n" in diff
+    assert "+BETA\n" in diff
+    assert " alpha\n" in diff  # unchanged context line
+    assert " gamma\n" in diff  # unchanged context line
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_page_vs_literal_string() -> None:
+    """``other_body`` (no second GET): only the first-page envelope surfaces.
+
+    The literal-string variant issues one read, not two — the
+    second body comes from the caller's argument, not from SB.
+    The wire shape drops the ``other`` envelope (it's ``None``,
+    not an empty envelope with ``name=<literal>``, because the
+    literal never had a name to begin with). The diff's ``tofile``
+    header uses ``<literal>`` so the agent can tell which side
+    came from where.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/only"
+        return httpx.Response(
+            200,
+            text="hello\nworld\n",
+            headers={"ETag": '"only-etag"'},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "only", "other_body": "hello\nWORLD\n"},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["name"]["body"] == "hello\nworld\n"
+    # ``other`` is ``None`` for the literal-string case — there
+    # is no second page envelope to surface.
+    assert payload["other"] is None
+    diff = payload["diff"]
+    assert "--- only\n" in diff
+    assert "+++ <literal>\n" in diff
+    assert "-world\n" in diff
+    assert "+WORLD\n" in diff
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_identical_bodies_yields_empty_diff() -> None:
+    """Identical inputs → ``diff=""`` (no-op patch, no ``-``/``+`` lines).
+
+    ``difflib.unified_diff`` returns an empty iterator when the two
+    inputs are equal, so the diff string is empty. The agent
+    reading the diff back reads ``""`` as "would have changed
+    nothing" without parsing the ``original`` / ``patched``
+    bodies — same shape as :func:`_dry_run_payload`'s no-op case.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        return httpx.Response(200, text="same\nlines\n", headers={"ETag": '"e"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "a", "other_name": "b"},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["diff"] == ""
+    # Both envelopes still surface (the caller might want the
+    # etag from either side for an ``if_match`` round-trip after
+    # the diff, even though the bodies are identical).
+    assert payload["name"]["body"] == "same\nlines\n"
+    assert payload["other"]["body"] == "same\nlines\n"
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_neither_other_name_nor_other_body_errors() -> None:
+    """Passing neither flag → ToolError upfront, no read round trip.
+
+    Locks the input-validation contract: a caller that confused
+    the two flags (or forgot to pass either) gets the same
+    specific ``ToolError`` the live path would surface, not a
+    confusing partial-diff result. The error fires before any
+    GET to SB so the call costs nothing.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, text="body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("diff_pages", {"name": "any"})
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: pass exactly one of other_name or other_body"
+    )
+    # No GET was issued — the input validation fires before any
+    # read round trip.
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_both_other_name_and_other_body_errors() -> None:
+    """Passing both flags → same ToolError upfront, no read round trip.
+
+    Same contract as the neither-flag case: ambiguous input is
+    rejected before the read round trip so the agent sees the
+    specific ToolError without paying for a wasted GET. The error
+    wording is shared with the neither-flag case because the
+    caller's bug is the same shape — they confused the two flags
+    — and the agent gets one diagnostic to learn from either way.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, text="body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {
+                "name": "any",
+                "other_name": "second",
+                "other_body": "literal",
+            },
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: pass exactly one of other_name or other_body"
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_first_page_missing_returns_404_with_name_in_wording() -> None:
+    """First page missing → ``ToolError(\"page not found: <name>\")`` for the first page.
+
+    The agent passed two names (``name`` + ``other_name``); when
+    the first one is missing the wording surfaces the first name
+    so the agent can tell which side failed. The same shape as
+    the read tool's 404 wording — :func:`_translate_sb_errors`
+    threads the same exception translation into ``diff_pages``.
+    No second read is attempted because the first one's 404
+    short-circuits the handler.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/.fs/missing-first":
+            return httpx.Response(404, text="page not found")
+        return httpx.Response(200, text="present")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "missing-first", "other_name": "present"},
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: page not found: missing-first"
+    )
+    # Only one GET was issued — the first-page 404 short-circuits
+    # before the second read.
+    assert calls == [("GET", "/.fs/missing-first")]
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_second_page_missing_returns_404_with_other_name_in_wording() -> None:
+    """Other page missing → ``ToolError(\"page not found: <other_name>\")``.
+
+    The error wording carries the *other* page's name when the
+    second read 404s, so the agent can distinguish "first page
+    missing" from "second page missing" without inspecting the
+    call. Same design-doc ``ToolError`` shape as the read tool's
+    404 handling.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/.fs/missing-other":
+            return httpx.Response(404, text="page not found")
+        return httpx.Response(200, text="present", headers={"ETag": '"p"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "present", "other_name": "missing-other"},
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: page not found: missing-other"
+    )
+    # Both GETs were issued — the first read succeeded (so the
+    # handler proceeded to the second), then the second read
+    # 404'd.
+    assert calls == [
+        ("GET", "/.fs/present"),
+        ("GET", "/.fs/missing-other"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_5xx_on_first_read_returns_tool_error() -> None:
+    """A 5xx on the first read surfaces the same wording as the read tool.
+
+    :func:`_translate_sb_errors` threads the same exception
+    translation through every tool that wraps an ``sb_client``
+    call; ``diff_pages`` is no exception. The error message is
+    the SB-side ``silverbullet error: <status>`` wording, and
+    no second read is attempted.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(500, text="internal error")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "any", "other_name": "second"},
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: silverbullet error: 500"
+    )
+    assert calls == [("GET", "/.fs/any")]
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_timeout_on_first_read_returns_tool_error() -> None:
+    """An httpx timeout on the first read → ``\"silverbullet request timed out\"``.
+
+    Same translation as the read tool: ``httpx.TimeoutException``
+    on a wrapped ``sb_client`` call surfaces as a ToolError with
+    the design-doc wording, so the agent sees one error shape
+    across every tool.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "any", "other_body": "literal"},
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool diff_pages: silverbullet request timed out"
+    )
+
+
+@pytest.mark.asyncio
+async def test_diff_pages_does_not_issue_writes() -> None:
+    """``diff_pages`` is read-only — no PUT / DELETE / PATCH requests.
+
+    Locks the no-side-effects contract the ticket calls out:
+    ``diff_pages`` is a read tool. The handler tracks every
+    request method and asserts only GETs were issued. A future
+    refactor that accidentally threads a write into the diff
+    flow (e.g. caching the diff server-side) would surface as
+    test failure rather than a silent SB mutation.
+    """
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(200, text="body", headers={"ETag": '"e"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "a", "other_name": "b"},
+        )
+
+    assert result.is_error is False
+    assert methods == ["GET", "GET"]  # one read per page, no writes
+

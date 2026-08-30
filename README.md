@@ -7,11 +7,11 @@ side-car on loopback; it does not provision tunnels.
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
-v1.2 map (agent-facing QOL + bullet primitives, three open tickets after T23+T24+T25+T26+T28): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.2 map (agent-facing QOL + bullet primitives, two open tickets after T23+T24+T25+T26+T27+T28): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ## What it exposes
 
-Nine tools and one resource template:
+Ten tools and one resource template:
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
@@ -22,6 +22,7 @@ Nine tools and one resource template:
 - `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the destination's T23 ack envelope (the same-name no-op returns the source's)
 - `delete_page(name, if_match?)` — hard delete; returns `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo timestamps / size per SB's contract)
 - `list_pages(prefix?)` — returns `[{name, etag, size_bytes, last_modified_ms, created_ms}][]` (T28 widened the per-row shape from the v1.1 `[{name, etag}]` to the same envelope family the read/write tools use; sends `X-Sync-Mode: 1` so SB 2.x returns JSON from `GET /.fs` instead of 307-redirecting to the SPA). On this SB build the list payload omits the `etag` field, so etags are `null` unless the operator opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` (one GET per row; partial failures leave the affected row's etag as `null` rather than failing the whole call).
+- `diff_pages(name, other_name?, other_body?)` — line-based unified diff between two pages (or a page and a literal string); returns `{diff, name, other?}`. The wire shape: `diff` is a `difflib.unified_diff` between the two bodies (empty string for a no-op diff), `name` is the read-side envelope for the first page (`{name, body, etag, size_bytes, last_modified_ms}`), and `other` is the same envelope for the second page (only present when `other_name` was given; `None` when `other_body` was given). Read-only — never writes. Pass exactly one of `other_name` / `other_body`; passing neither or both is `ToolError("pass exactly one of other_name or other_body")` upfront, no wasted read.
 - `silverbullet://page/{name}` — JSON envelope `{body, etag, size_bytes, last_modified_ms}` (same shape as `read_page`); MIME type is `application/json` in T24 (was `text/markdown` in v1.1)
 
 Every write tool honors `if_match` (`"*"` to require existence,
@@ -227,10 +228,10 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's nine tools — `read_page`,
+`/reload` in Pi and the bridge's ten tools — `read_page`,
 `page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
-`patch_page_replace`, `move_page`, `delete_page`, `list_pages` —
-register as direct Pi tools.
+`patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
+`diff_pages` — register as direct Pi tools.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so

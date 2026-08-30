@@ -86,6 +86,12 @@ async def _delete_marker(sb_url: str, sb_token: str) -> None:
             await client.delete(f"/.fs/{MARKER}")
         with suppress(httpx.HTTPError):
             await client.delete(f"/.fs/{MARKER}-moved")
+        with suppress(httpx.HTTPError):
+            # T27's diff_pages round-trip may leave a copy page
+            # behind if the test crashes between the diff and its
+            # cleanup. Best-effort delete so the live space stays
+            # clean.
+            await client.delete(f"/.fs/{MARKER}-diff")
 
 
 @pytest.mark.asyncio
@@ -402,6 +408,73 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     payload = listed.structured_content or {}
                     names = {item["name"] for item in payload.get("result", [])}
                     assert MARKER in names
+
+                    # ``diff_pages`` (T27) round-trip against live SB:
+                    # diff ``MARKER`` against a literal string
+                    # (``other_body``) so the wire shape with
+                    # ``other=None`` is exercised; the literal string
+                    # has to differ from the page body so the diff is
+                    # non-empty. We don't assert on the exact diff
+                    # text — ``difflib.unified_diff``'s header format
+                    # is the caller's responsibility, and the Layer-1
+                    # tests already lock the structural pieces. We do
+                    # assert the envelope carries the first-page
+                    # ``name`` envelope and ``other=None`` for the
+                    # literal-string case.
+                    diffed = await session.call_tool(
+                        "diff_pages",
+                        {
+                            "name": MARKER,
+                            "other_body": "hello from T7 live e2e\nNOT-APPENDED\n",
+                        },
+                    )
+                    assert diffed.is_error is False, diffed
+                    dpayload = diffed.structured_content or {}
+                    assert dpayload.get("other") is None
+                    assert dpayload.get("name", {}).get("body") == body
+                    assert "-appended\n" in dpayload.get("diff", "")
+                    assert "+NOT-APPENDED\n" in dpayload.get("diff", "")
+
+                    # ``diff_pages`` against a second page
+                    # (``other_name``) — write a copy of ``MARKER``
+                    # to a fresh name, diff them, then clean up.
+                    # Same-name diffs surface as ``diff=""`` per the
+                    # Layer-1 contract; the Layer-3 path we want to
+                    # verify here is the round-trip envelope shape
+                    # (``name`` and ``other`` both populated) plus
+                    # the prefix-filter-irrelevant two-read shape
+                    # against live SB.
+                    diff_target = f"{MARKER}-diff"
+                    await session.call_tool(
+                        "write_page",
+                        {"name": diff_target, "content": body + "appended\n"},
+                    )
+                    diffed_pages = await session.call_tool(
+                        "diff_pages",
+                        {"name": MARKER, "other_name": diff_target},
+                    )
+                    assert diffed_pages.is_error is False, diffed_pages
+                    dp2 = diffed_pages.structured_content or {}
+                    assert dp2.get("name", {}).get("body") == body
+                    assert dp2.get("other", {}).get("body") == body + "appended\n"
+                    # No-op diff is the case the agent will hit when
+                    # ``MARKER`` and ``diff_target`` end up identical
+                    # (e.g. after the dry-run block above didn't
+                    # actually write); the contract is ``diff=""``.
+                    # Both envelopes still surface so the caller has
+                    # the etag from either side for an ``if_match``
+                    # round-trip.
+                    same_diff = await session.call_tool(
+                        "diff_pages",
+                        {"name": MARKER, "other_name": MARKER},
+                    )
+                    assert same_diff.is_error is False, same_diff
+                    assert (same_diff.structured_content or {}).get("diff") == ""
+                    # Cleanup the diff target so the precondition
+                    # block above isn't affected.
+                    await session.call_tool(
+                        "delete_page", {"name": diff_target}
+                    )
     finally:
         server_task.cancel()
         with suppress(asyncio.CancelledError):

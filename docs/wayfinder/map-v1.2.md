@@ -505,6 +505,175 @@ resolution below -->
   new in-memory dry-run tests; live e2e skipped on this dev
   box). `nix flake check` not run (no Nix in this env).
 
+- **T27. `diff_pages(name, other_name?, other_body?)`.** (commit pending):
+  The bridge gained a tenth `/.fs`-backed tool: a line-based
+  unified diff between two pages or a page and a literal
+  string. `diff_pages` requires *exactly one* of `other_name`
+  (a page to diff against) or `other_body` (a literal markdown
+  string); passing neither or both is rejected upfront with
+  `ToolError("pass exactly one of other_name or other_body")`
+  so a confused input shape never wastes a read round trip.
+
+  **Wire shape**:
+  ``{diff: str, name: {name, body, etag, size_bytes,
+  last_modified_ms}, other: same envelope | None}``. `diff` is
+  a `difflib.unified_diff` between the two bodies (empty
+  string for a no-op diff). `name` is the read-side envelope
+  for the first page (with `name` re-added so the shape is
+  parallel with `other`); `other` is the same envelope for
+  the second page when `other_name` was given, or `None` when
+  `other_body` was given. The new
+  :func:`_diff_page_envelope` helper in `server.py` subsets
+  `PageMeta` to this per-page wire shape; reusing the helper
+  (rather than inlining the dict in the handler) keeps the
+  field subset in one place — a future change to the diff
+  envelope's fields is a single-line edit.
+
+  **Read-only contract**: the handler tracks every request
+  method and asserts only `GET`s were issued. A future
+  refactor that accidentally threads a write into the diff
+  flow (e.g. caching the diff server-side) would surface as
+  test failure rather than a silent SB mutation. The
+  `test_diff_pages_does_not_issue_writes` Layer-1 test pins
+  this down.
+
+  **Per-side error wording**: each read sits in its own
+  `_translate_sb_errors(name)` block — the second read is
+  keyed on `other_name`, so a 404 on either side surfaces as
+  `ToolError("page not found: <that page's name>")`. The
+  agent can tell which side failed from the wording's `name`
+  field without inspecting the call (the Layer-1
+  `test_diff_pages_first_page_missing_returns_404_with_name_in_wording`
+  and `test_diff_pages_second_page_missing_returns_404_with_other_name_in_wording`
+  tests pin this down so a future refactor that drops the
+  per-side wording surfaces as a confusing "page not found:"
+  on the wrong side rather than as test pass).
+
+  **Line-based, no token-level diff**: T27 standing
+  preference; matches T26's `difflib.unified_diff` plumbing.
+  `difflib.unified_diff` is called with `lineterm=""` and a
+  post-process `line + "\n"` join so the concatenated diff
+  is well-formed regardless of the inputs' trailing-newline
+  shape (same trick `_dry_run_payload` uses for the T26
+  dry-run envelope's `diff` field). The diff's `tofile`
+  header carries the literal `<literal>` for the
+  `other_body` case so the agent can tell which side came
+  from a page and which from a literal string without
+  inspecting the call.
+
+  **Files touched**: `src/mcp_silverbullet/server.py`
+  (new `_diff_page_envelope` helper mirroring `_read_meta_to_payload`
+  with `name` re-added; new `@mcp.tool("Diff pages")` handler
+  with `other_name: str | None = None` and `other_body: str |
+  None = None` parameters and a return type of `dict[str,
+  object]`; module docstring bumped "T23/T24/T25/T26/T28 done;
+  T29 next" → "T23/T24/T25/T26/T27/T28 done; T29 next" and
+  the tool-list paragraph grew a T27 sentence; the
+  `instructions` string's tool list bumped "nine" → "ten"
+  and grew a `diff_pages` sentence; the
+  `_translate_sb_errors` docstring gained a paragraph
+  documenting `diff_pages`'s two-keyed-error translation
+  contract), `tests/test_tools_in_memory.py` (10 new tests
+  grouped under a `# --- diff_pages (T27) ---` section
+  header — page-vs-page diff, page-vs-literal diff, identical
+  bodies yield empty diff, neither flag errors upfront, both
+  flags error upfront, first-page 404 with name in wording,
+  second-page 404 with other_name in wording, 5xx on first
+  read, timeout on first read, no writes issued — the module
+  docstring's coverage list bumped "nine" → "ten"),
+  `tests/test_journal_gate.py` (`SB_TOOL_NAMES` gained
+  `diff_pages` — the journal gate's set-shape assert on the
+  nine pre-existing SB tools now expects ten),
+  `tests/test_http_auth.py` (the `list_tools` round-trip on
+  the Layer-2 ASGI server now expects ten entries),
+  `tests/test_e2e_live_sb.py` (a `diff_pages` round-trip block
+  added to the existing live-SB test that previews a
+  page-vs-literal diff via `diff_pages(name, other_body=...)`,
+  asserts on the envelope's `name` field and the
+  `other=None` shape, then runs a page-vs-page diff via
+  `diff_pages(name, other_name=...)` and asserts on both
+  envelopes' bodies, plus a no-op same-page diff that
+  asserts `diff=""`; cleanup best-effort in `_delete_marker`
+  for `{MARKER}-diff` so a crashing test doesn't leave a
+  stray page in the live space; env-gated per the v1 T7
+  carry-forward), `README.md` (the "What it exposes" tool
+  list bumped "Nine tools" → "Ten tools", grew a `diff_pages`
+  bullet with the wire shape and the
+  neither/both-flags-rejected-upfront contract; the
+  Pi-MCP wiring paragraph's "nine tools" → "ten tools" with
+  the tool list including `diff_pages`; the v1.2 map's intro
+  status line "three open tickets" → "two open tickets after
+  T23+T24+T25+T26+T27+T28"), `CHANGELOG.md` (a T27 entry
+  under Unreleased's `### Added` with the wire shape and the
+  page-vs-page / page-vs-literal variants; the entry
+  documents the `other=None` shape for the literal-string
+  case and the per-side 404 wording; no migration note
+  because the tool is additive), `docs/design.md` (§ Tools
+  prose bumped to mention T27 alongside T25 / T26 / T28; the
+  Tools table grew a `diff_pages` row with the wire shape;
+  the § Tools prose bumped "Nine tools, one resource
+  template" → "Ten tools, one resource template"; the
+  "What this is" prose and the "Goals, non-goals" list were
+  bumped to include `diff_pages`; the status-code mapping
+  table's 404 row gained a `diff_pages` callout so the
+  per-side wording is documented at the design-doc level; the
+  412 row gained a `diff_pages` callout noting that
+  preconditions are unusual on a GET).
+
+  **Bonus improvements visible while doing it**: the
+  `_diff_page_envelope` helper deliberately mirrors the
+  T24 `_read_meta_to_payload` shape with `name` re-added,
+  and the docstring explains why `name` is included on both
+  envelopes (the agent needs the second page's name to know
+  which page the diff's right side came from; the first
+  page's name is a harmless echo for log readability); the
+  `_translate_sb_errors` docstring's tool list bumped
+  ``nine`` → ``ten`` and gained a paragraph on the
+  ``diff_pages`` two-keyed-error contract so the next reader
+  doesn't have to chase the per-side wording through the
+  handler; the module docstring's "T29 next" status line is
+  honest about T27 / T28 being done (prior wording would
+  have been a confusing lie after this commit); the
+  `instructions` string's tool list and ``Ten tools``
+  counter are consistent with the rest of the module; the
+  `test_diff_pages_does_not_issue_writes` Layer-1 test
+  tracks every method the bridge issues and asserts only
+  `GET`s appeared, so a future refactor that introduces a
+  write into the diff flow surfaces as test failure rather
+  than a silent SB mutation; the
+  `test_diff_pages_neither_other_name_nor_other_body_errors`
+  and `test_diff_pages_both_other_name_and_other_body_errors`
+  tests pin the exact wording upfront — a future refactor
+  that lets the read-modify-write continue on either shape
+  (or that uses a different wording) shows up as test
+  failure rather than as a "wording drifted" surprise for
+  the agent; the read-side envelope's existing
+  `_read_meta_to_payload` helper wasn't reused because T27
+  needs `name` on the wire (where T24 deliberately drops
+  it), so the new `_diff_page_envelope` is a focused sibling
+  rather than a parameter on the existing helper; the
+  `fromfile` / `tofile` arguments to `difflib.unified_diff`
+  are set to the page names (or `<literal>` for the
+  literal-string variant) so the diff's header lines name
+  the two sides without the agent having to thread names
+  through the wire shape; the existing `register_tools`
+  docstring's "nine ``/.fs``-backed tools" was bumped to
+  "ten" so the docstring matches the actual registration.
+
+  **Unblocks**: none. T29 (`list_tasks`) and T30
+  (`check_task`) are the bullet primitives; they don't
+  need a diff capability, but the bridge now ships a
+  tool set that lets an agent "preview the patch → confirm
+  via dry_run → commit → re-diff to verify" without
+  composing read-modify-write against `patch_page_replace`
+  and a client-side `difflib` — T27 is the third leg of
+  that round-trip.
+
+  Test count: 261 pass + 2 skip (was 241 pass + 2 skip;
+  +10 new in-memory diff_pages tests). Live e2e not run
+  on this dev box (no live SB env). `nix flake check`
+  not run (no Nix in this env).
+
 - **T28. `list_pages` metadata shape + etag round-trip
   fallback.** (commit pending): The bridge's ninth
   `/.fs`-backed tool widens from the v1.1
@@ -874,11 +1043,12 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T27. `diff_pages(name, other_name?, other_body?)`
+### T27. `diff_pages(name, other_name?, other_body?)` ✅
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Assignee**: `minimax-m3` (claimed 2026-08-30, resolved same day)
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: How does the bridge expose a diff between two pages
 > (or a page and a literal string)?
 >
@@ -908,6 +1078,37 @@ file; "blocking" is rendered by ticket ordering and an explicit
 >
 > **Blocks on**: T24 (so the page-shape return is consistent).
 > **Unblocks**: none.
+
+> **Resolution**: see Decisions so far above. The
+> implementation shipped a tenth ``/.fs``-backed tool
+> (``diff_pages``) that takes ``name`` plus exactly one of
+> ``other_name`` (a page) or ``other_body`` (a literal string)
+> and returns the unified-diff string alongside the
+> read-side envelopes for each page. The wire shape
+> ``{diff, name, other?}`` includes ``name`` on both
+> per-page envelopes (parallel shape; the second page's
+> ``name`` is what the agent reads to know which page the
+> diff's right side came from) — the new
+> :func:`_diff_page_envelope` helper in ``server.py`` is the
+> per-page projection (mirrors T24's ``_read_meta_to_payload``
+> with ``name`` re-added). Per-side error wording is
+> preserved by threading each read through its own
+> ``_translate_sb_errors(name)`` block — a 404 on the first
+> read surfaces as ``page not found: <first name>``; a 404
+> on the second surfaces as ``page not found: <other_name>``
+> so the agent can tell which side failed. Line-based by
+> default (T27 standing preference; matches T26's
+> ``difflib.unified_diff`` plumbing in ``_dry_run_payload``).
+> Layer-1 test coverage is 10 new tests under a ``# ---
+> diff_pages (T27) ---`` section header — page-vs-page diff,
+> page-vs-literal diff, identical-bodies-no-op, neither-flag
+> errors, both-flag errors, first-page-404, second-page-404,
+> 5xx on first read, timeout on first read, no-writes-issued.
+> Live e2e (T7-shaped) covers both variants against a real
+> SB when the operator sets the live-env vars on a future
+> run — the diff envelope's shape is structurally identical
+> to the read-tool envelope plus a ``diff`` field, so the
+> existing live-SB plumbing covers it.
 
 ---
 

@@ -283,6 +283,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                     assert tool_names == [
                         "append_to_page",
                         "delete_page",
+                        "diff_pages",
                         "list_pages",
                         "move_page",
                         "page_exists",

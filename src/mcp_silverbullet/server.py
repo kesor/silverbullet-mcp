@@ -19,17 +19,22 @@ preview a patch without committing; the read still happens and
 ``if_match=<etag>`` is checked against the read's etag (a stale
 etag raises 412-equivalent ``ToolError`` so the caller doesn't
 think a doomed write would have succeeded), but no PUT is
-issued. T28 widens ``list_pages`` to return the same envelope
-family the read/write tools use
+issued. T27 adds ``diff_pages`` for a tenth ``/.fs``-backed tool
+— a line-based unified diff between two pages or a page and a
+literal string (``other_name`` xor ``other_body``), read-only, that
+reuses the same ``difflib.unified_diff`` plumbing the T26
+``dry_run`` envelope uses for its ``diff`` field. T28 widens
+``list_pages`` to return the same envelope family the read/write
+tools use
 (``list[{name, etag, size_bytes, last_modified_ms, created_ms}]``)
 and adds an opt-in per-page etag-hydration fallback driven by
 ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`` so an operator who
 needs ``if_match`` round-trips from a list call can pay the
 N+1 cost of one GET per page. The bridge still registers
-nine ``/.fs``-backed tools (``read_page`` / ``page_exists`` /
+ten ``/.fs``-backed tools (``read_page`` / ``page_exists`` /
 ``write_page`` / ``delete_page`` / ``append_to_page`` /
 ``patch_page_lines`` / ``patch_page_replace`` / ``move_page`` /
-``list_pages``) plus one resource template
+``list_pages`` / ``diff_pages``) plus one resource template
 (``silverbullet://page/{name}``). Each tool closes over a single
 :class:`SBClient` opened at boot; SB's typed exceptions translate
 to :mcp_exc:`ToolError` with the exact wording from
@@ -41,7 +46,7 @@ T10 of the v1.1 map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the nine ``/.fs``-backed tools and the resource
+registers only the ten ``/.fs``-backed tools and the resource
 template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
@@ -49,7 +54,7 @@ client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24/T25/T26/T28 done; T29 next).
+agent-facing QOL tickets (T23/T24/T25/T26/T27/T28 done; T29 next).
 """
 
 from __future__ import annotations
@@ -102,14 +107,15 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     """Wrap a single ``sb_client`` call, mapping its exceptions to ``ToolError``.
 
     Every tool handler (``read_page``, ``write_page``, ``delete_page``,
-    ``list_pages``, ``append_to_page``, ``patch_page_lines``,
-    ``patch_page_replace``, ``move_page``) closes over the same
-    :class:`SBClient` and surfaces the same five exception types with
-    the same wording from ``docs/design.md`` § Tools § Status-code
-    mapping. Factoring the translation into this async context
-    manager keeps the wording in one place — a future tightening of
-    a code path (e.g. adding ``403`` → ``ToolError("forbidden")``)
-    is a single-line change. ``move_page`` (T22) wraps *part* of its
+    ``list_pages``, ``diff_pages``, ``append_to_page``,
+    ``patch_page_lines``, ``patch_page_replace``, ``move_page``)
+    closes over the same :class:`SBClient` and surfaces the same
+    five exception types with the same wording from
+    ``docs/design.md`` § Tools § Status-code mapping. Factoring the
+    translation into this async context manager keeps the wording
+    in one place — a future tightening of a code path (e.g.
+    adding ``403`` → ``ToolError("forbidden")``) is a single-line
+    change. ``move_page`` (T22) wraps *part* of its
     read-write-delete dance in this helper (the read and the
     destination write) and translates the post-write-delete step
     inline so the caller sees the atomicity-caveat wording ("moved
@@ -121,10 +127,17 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     *which* page was missing, not the request's full URL. Tools
     that target a single page (``read_page``, ``write_page``,
     ``delete_page``, ``append_to_page``, ``patch_page_lines``,
-    ``patch_page_replace``, ``move_page``) pass ``name``;
-    ``list_pages`` passes an empty string (and doesn't actually
-    raise ``PageNotFound`` on its current code path, so the wording
-    never surfaces there).
+    ``patch_page_replace``, ``move_page``, ``page_exists``) pass
+    ``name``; ``list_pages`` passes an empty string (and doesn't
+    actually raise ``PageNotFound`` on its current code path, so
+    the wording never surfaces there). ``diff_pages`` (T27) is the
+    compound case — it has *two* ``_translate_sb_errors`` blocks
+    (one per read), each keyed on whichever page that read
+    targeted (``name`` for the first, ``other_name`` for the
+    second), so a 404 on either side surfaces as
+    ``ToolError("page not found: <that page's name>")`` and the
+    agent can tell which side failed from the wording's ``name``
+    field without inspecting the call.
 
     Python's ``except`` only catches exceptions actually raised in
     the wrapped block, so it's safe to list all five clauses on
@@ -202,6 +215,36 @@ def _read_meta_to_payload(meta: PageMeta) -> dict[str, object]:
     for the empty-page case.
     """
     return {
+        "body": meta.body or "",
+        "etag": meta.etag,
+        "size_bytes": meta.size_bytes,
+        "last_modified_ms": meta.last_modified_ms,
+    }
+
+
+def _diff_page_envelope(meta: PageMeta) -> dict[str, object]:
+    """Project a :class:`PageMeta` to the T27 ``diff_pages`` per-page envelope.
+
+    The T27 wire shape carries ``name`` *as well as* the T24
+    read-side fields — the caller of :func:`diff_pages` knows the
+    first page's name (they passed it in), but the second page's
+    name is hidden behind ``other_name`` and the agent needs to see
+    it on the way back to know which page the diff's right side
+    came from. Including ``name`` on both envelopes keeps the
+    shape parallel (``name`` / ``other`` are sibling objects with
+    the same field set) rather than asymmetric (``name`` strips
+    ``name``; ``other`` carries it). The extra echo on the first
+    page is harmless — the caller already knows the name; the
+    wire still has it for log readability.
+
+    Field set: ``{name, body, etag, size_bytes, last_modified_ms}``
+    — the T24 read-side envelope with ``name`` re-added.
+    ``created_ms`` stays dropped for the same reason as
+    :func:`_read_meta_to_payload`: a diff is read-side context,
+    and reads have no create-vs-update distinction to surface.
+    """
+    return {
+        "name": meta.name,
         "body": meta.body or "",
         "etag": meta.etag,
         "size_bytes": meta.size_bytes,
@@ -443,7 +486,7 @@ def build_mcp(
         Already-resolved journal gate config. ``None`` means the gate
         is off (no journal tools registered). When the gate is on,
         the bridge registers the four journal-surface tools in
-        addition to the nine ``/.fs``-backed tools and the resource
+        addition to the ten ``/.fs``-backed tools and the resource
         template; when off, only the latter are exposed. Resolved by
         :func:`mcp_silverbullet.main.load_settings` from the two
         ``MCP_SILVERBULLET_JOURNAL_*`` env vars; tests construct one
@@ -469,21 +512,26 @@ def build_mcp(
         name=name,
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
-            "and check existence of SilverBullet pages. Nine "
-            "tools (`read_page`, `page_exists`, `write_page`, "
+            "check existence of, and diff SilverBullet pages. "
+            "Ten tools (`read_page`, `page_exists`, `write_page`, "
             "`delete_page`, `append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`, "
-            "`move_page`, `list_pages`) plus one resource "
-            "template `silverbullet://page/{name}` for attaching "
-            "page bodies to conversation context. The three "
-            "read-modify-write tools (`append_to_page`, "
+            "`move_page`, `list_pages`, `diff_pages`) plus one "
+            "resource template `silverbullet://page/{name}` for "
+            "attaching page bodies to conversation context. The "
+            "three read-modify-write tools (`append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`) accept "
             "`dry_run=True` (T26) to preview the patch without "
             "committing. `list_pages` returns the full meta "
             "envelope per row (`{name, etag, size_bytes, "
             "last_modified_ms, created_ms}`); set "
             "`MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` to "
-            "hydrate the etag from a per-page GET (T28 opt-in)."
+            "hydrate the etag from a per-page GET (T28 opt-in). "
+            "`diff_pages` (T27) takes one page plus either "
+            "`other_name` (a second page to diff against) or "
+            "`other_body` (a literal string) and returns a "
+            "line-based unified diff alongside the read-side "
+            "envelopes for both pages."
         ),
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
@@ -506,7 +554,7 @@ def register_tools(
     *,
     hydrate_etags: bool = False,
 ) -> None:
-    """Attach the nine ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the ten ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
@@ -1122,6 +1170,99 @@ def register_tools(
         # helper). ``body`` is dropped because list_pages returns
         # meta only; an agent that wants the body reads the page.
         return [_write_meta_to_payload(m) for m in metas]
+
+    @mcp.tool(
+        title="Diff pages",
+        description=(
+            "Compute a unified diff between two SilverBullet pages "
+            "or between a page and a literal string. Pass exactly one "
+            "of `other_name` (a page to diff against) or `other_body` "
+            "(a literal markdown string to diff against). The tool "
+            "fetches the first page (and the second page when "
+            "`other_name` is given), runs `difflib.unified_diff`, and "
+            "returns `{diff, name, other?}` where `diff` is the "
+            "unified diff string (empty string when the two bodies "
+            "are identical), `name` is the read-side envelope "
+            "(`{name, body, etag, size_bytes, last_modified_ms}`) "
+            "for the first page, and `other` is the same envelope for "
+            "the second page when `other_name` was given. The "
+            "second-page envelope carries `name` explicitly because "
+            "the caller passed `other_name`, not the second page's "
+            "body — the agent needs the name to know which page "
+            "the diff's right side came from. The diff is "
+            "line-based by default (line-based is the v1.2 standing "
+            "preference for `diff_pages`); token-level / word-level "
+            "diffing is a v1.3 refinement. Errors: passing neither "
+            "or both of `other_name` / `other_body` → "
+            "`ToolError(\"pass exactly one of other_name or "
+            "other_body\")`; the page-not-found case on either side "
+            "→ standard `ToolError(\"page not found: {name}\")` (the "
+            "caller knows which side from the wording's `name` "
+            "field); 5xx / 412 / 413 / timeout on either read → the "
+            "same wording the read tool surfaces."
+        ),
+    )
+    async def diff_pages(
+        name: str,
+        other_name: str | None = None,
+        other_body: str | None = None,
+    ) -> dict[str, object]:
+        other_name_given = other_name is not None
+        other_body_given = other_body is not None
+        if other_name_given == other_body_given:
+            # Either neither flag is set or both are; the tool needs
+            # exactly one. Raise upfront before the read round
+            # trip — a caller that confused the two flags shouldn't
+            # pay for a wasted GET to learn about the input shape.
+            raise ToolError(
+                "pass exactly one of other_name or other_body"
+            )
+        # Read the source page inside ``_translate_sb_errors``
+        # so 404 / 412 / 5xx / timeout surface as the design doc's
+        # ToolError wording (matching the read tool). The second
+        # read (when ``other_name`` is given) sits in its own
+        # ``_translate_sb_errors`` block keyed on ``other_name``,
+        # so a 404 there surfaces as ``page not found: {other_name}``
+        # — the agent can tell which side is missing without
+        # inspecting the call. Sequential reads, not concurrent:
+        # ``difflib.unified_diff`` needs both bodies in hand, and
+        # the cost is the same either way for two round trips —
+        # ``asyncio.gather`` would only save wall-clock at the cost
+        # of two sockets against loopback SB.
+        async with _translate_sb_errors(name):
+            first = await sb_client.read_page(name)
+        if other_name_given:
+            async with _translate_sb_errors(other_name):
+                second = await sb_client.read_page(other_name)
+            other_body = second.body or ""
+        # ``difflib.unified_diff`` input order is (original, patched);
+        # we diff ``first`` against ``other`` with ``first`` as the
+        # ``fromfile`` so the resulting ``-`` lines are deletions
+        # from ``first`` and ``+`` lines are additions from
+        # ``other``. The diff is line-based by default (T27 standing
+        # preference; token-level is v1.3). The line-splitting and
+        # trailing-newline shape reuse the same logic as
+        # :func:`_dry_run_payload` — split on ``"\\n"`` directly (no
+        # universal-newline handling; SB stores LF only) and add a
+        # single ``"\\n"`` per ``difflib`` line via ``lineterm=""``
+        # + post-process join so the concatenated diff is
+        # well-formed.
+        first_body = first.body or ""
+        diff = "".join(
+            line + "\n"
+            for line in difflib.unified_diff(
+                first_body.split("\n"),
+                other_body.split("\n"),
+                fromfile=name,
+                tofile=other_name if other_name_given else "<literal>",
+                lineterm="",
+            )
+        )
+        return {
+            "diff": diff,
+            "name": _diff_page_envelope(first),
+            "other": _diff_page_envelope(second) if other_name_given else None,
+        }
 
     @mcp.resource(
         "silverbullet://page/{name}",

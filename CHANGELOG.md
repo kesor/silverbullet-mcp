@@ -126,6 +126,46 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ### Added
 
+- **`diff_pages(name, other_name?, other_body?)`** — line-based
+  unified diff between two pages or a page and a literal
+  markdown string (T27). Pass exactly one of `other_name` (a
+  page to diff against) or `other_body` (a literal string);
+  passing neither or both is rejected upfront with
+  `ToolError("pass exactly one of other_name or other_body")`
+  so the read round trip isn't wasted on a confused input
+  shape. The wire shape is:
+
+  ```jsonc
+  {
+    "diff": "--- first\n+++ second\n@@ -1 +1 @@\n-beta\n+BETA\n",
+    // unified diff from ``difflib.unified_diff``; "" when the two bodies are identical
+    "name": {                  // read-side envelope for the first page (caller passed)
+      "name": "first",        // name is included so the shape is parallel with "other"
+      "body": "alpha\nbeta\ngamma\n",
+      "etag": "\"abc123\"",   // string with quotes; null if SB stripped it
+      "size_bytes": 17,       // UTF-8 byte count; null if SB stripped X-Content-Length
+      "last_modified_ms": 1700000000123  // epoch ms; null if SB stripped X-Last-Modified
+    },
+    "other": {                 // same envelope for the second page when other_name was given
+      "name": "second",
+      "body": "...",
+      ...
+    }                          // null when other_body (literal string) was given instead
+  }
+  ```
+
+  Read-only — never writes. The diff is line-based by default
+  (the v1.2 standing preference; token-level / word-level
+  diffing is a v1.3 refinement). The 404 on either side
+  surfaces as `ToolError("page not found: {name}")` with
+  `name` set to whichever page was missing (the first read's
+  404 short-circuits before the second; if the second read
+  404s the wording's `name` field carries `other_name` so the
+  agent can tell which side failed). 5xx / 412 / timeout on
+  either read surface with the same wording as the read tool.
+
+  Migration: none at the call-site — the tool is additive.
+
 - **`page_exists(name)`** — cheap existence check (T25); issues
   `GET /.fs/{name}`, returns `bool`: `True` on 200, `False` on 404,
   `ToolError("silverbullet error: {status}")` on 5xx. The body

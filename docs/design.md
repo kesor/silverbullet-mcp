@@ -8,7 +8,7 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes nine MCP **tools** —
+file API on `/.fs/…`). The bridge exposes ten MCP **tools** —
 `read_page`, `page_exists`, `write_page`, `append_to_page`,
 `patch_page_lines`, `patch_page_replace`, `move_page`, `delete_page`,
 `list_pages` —
@@ -24,8 +24,9 @@ only the bridge is on the tunnel, and only Grok has the token.
 
 - **Goal**: Grok on the web can `read_page`, `write_page`,
   `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-  `move_page`, `delete_page`, and `list_pages` against SilverBullet,
-  behind the user's existing Cloudflare tunnel, with one bearer token.
+  `move_page`, `delete_page`, `list_pages`, `page_exists`, and
+  `diff_pages` against SilverBullet, behind the user's existing
+  Cloudflare tunnel, with one bearer token.
 - **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search,
   multi-user, mutating silver bullet's source, hosting the bridge
   for other people.
@@ -229,7 +230,13 @@ tools use (`{name, etag, size_bytes, last_modified_ms, created_ms}`)
 and adds an opt-in per-page etag-hydration fallback
 (`MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) so an operator who
 needs `if_match` round-trips from a list call can pay the N+1
-cost of one GET per page. **Nine tools, one resource template.**
+cost of one GET per page. T27 adds `diff_pages(name, other_name?,
+other_body?)` — a tenth tool that takes one page plus either a
+second page (`other_name`) or a literal markdown string
+(`other_body`) and returns a `difflib.unified_diff` between the
+two bodies alongside the read-side envelopes for each page; the
+shape is line-based by default (token-level / word-level diff is
+a v1.3 refinement). **Ten tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
@@ -242,6 +249,7 @@ cost of one GET per page. **Nine tools, one resource template.**
 | `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | `{name=destination, etag, size_bytes, last_modified_ms, created_ms}` (same-name no-op returns the source's envelope) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo `X-*` per the SB contract) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python (filter happens *before* hydration so the prefix reduces the per-page round-trip count) | `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` (T28 widened from the v1.1 minimal subset; ``etag`` is `None` for every row on this SB build because the list payload omits the field — an operator who needs ``if_match`` round-trips opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) | none |
+| `diff_pages` | `name: str, other_name: Optional[str] = None, other_body: Optional[str] = None` (exactly one of `other_name` / `other_body`) | `GET /.fs/{name}` (and `GET /.fs/{other_name}` when `other_name` is given; one read per page, sequential, no writes) | `{diff: str, name: {name, body, etag, size_bytes, last_modified_ms}, other: same envelope or None}` (T27; line-based unified diff via `difflib.unified_diff`; `diff=""` when the two bodies are identical; `other=None` for the literal-string variant) | none (read-only — the tool tracks every request method and asserts only GETs were issued) |
 
 Resource template:
 
@@ -278,8 +286,8 @@ we are.
 | SB response | Tool behavior |
 |---|---|
 | `200 OK` | success — return body / `PageMeta` (read, write, list row) / `bool` |
-| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
-| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). |
+| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). `diff_pages` (T27) returns the same wording with `name` set to whichever page was missing (the first read's 404 short-circuits before the second; if the second read 404s the wording's `name` field is `other_name` so the agent can tell which side failed). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
+| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). `diff_pages` (T27) has no precondition surface; a 412 on one of its reads is highly unusual (a GET normally doesn't carry `If-Match`) but surfaces as the same wording if a proxy / SB misconfig triggers one. |
 | `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
 | `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions". A 5xx on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (transient SB hiccup, not an agent error). |
 | timeout | `ToolError("silverbullet request timed out")` — including the `list_pages` hydration walker (T28), which swallows per-page timeouts and leaves the row's `etag` as `null` rather than failing the whole call. |
