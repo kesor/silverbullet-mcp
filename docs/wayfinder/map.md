@@ -161,6 +161,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
+> **Assignee**: claude (claimed 2026-08-27, resolving now)
 > **Question**: Implement the `StaticTokenVerifier` (10-line
 > `hmac.compare_digest` against `MCP_SILVERBULLET_TOKEN`) and the
 > `MCPServer` with three `@mcp.tool(...)` registrations

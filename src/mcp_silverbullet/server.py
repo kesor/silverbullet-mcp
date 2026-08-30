@@ -1,0 +1,214 @@
+"""MCP server wiring for the bridge.
+
+Locked at T4 of the prior map: three tools (``read_page``,
+``write_page``, ``list_pages``) and one resource template
+(``silverbullet://page/{name}``). Each tool closes over a single
+:class:`SBClient` opened at boot; SB's typed exceptions translate to
+:mcp_exc:`ToolError` with the exact wording from
+``docs/design.md`` § Tools § Status-code mapping.
+
+See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
+client contract for the SB-side status codes, and ``docs/wayfinder/map.md``
+for the T3/T4 decisions this implements.
+"""
+
+from __future__ import annotations
+
+import httpx2 as httpx
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver.exceptions import (
+    ResourceError,
+    ResourceNotFoundError,
+    ToolError,
+)
+from mcp.server.mcpserver.server import MCPServer
+
+from mcp_silverbullet.sb_client import (
+    BodyTooLarge,
+    FileMeta,
+    PageNotFound,
+    PreconditionFailed,
+    SBClient,
+    SBError,
+    ServerError,
+)
+from mcp_silverbullet.verifier import StaticTokenVerifier
+
+
+# Where the bridge thinks it lives. ``resource_server_url`` is the
+# URL Grok is talking to (drives ``WWW-Authenticate: Bearer
+# resource_metadata=…`` and the discovery doc); ``issuer_url`` is what
+# shows up under ``authorization_servers`` in the same doc. v1 has no
+# separate authz server (T2 of the prior map: static bearer, no
+# dance), so the bridge is its own issuer — honest about what we are.
+_DEFAULT_RESOURCE_URL = "http://127.0.0.1:8000/mcp"
+
+# Body limit printed verbatim into the ToolError; matches the SDK's
+# ``DEFAULT_MAX_REQUEST_BODY_SIZE`` (4 MiB) and ``sb_client._BODY_LIMIT_BYTES``.
+_BODY_LIMIT_MIB = 4
+
+
+def build_mcp(
+    sb_client: SBClient,
+    *,
+    token: str,
+    resource_url: str = _DEFAULT_RESOURCE_URL,
+    name: str = "mcp-silverbullet",
+) -> MCPServer:
+    """Build the configured :class:`MCPServer`.
+
+    Parameters
+    ----------
+    sb_client
+        The outbound ``SBClient`` opened at boot. Held by closure; the
+        server doesn't reopen it. v1 has no per-request token refresh,
+        so a single client for the process lifetime is correct.
+    token
+        The shared bearer secret. Same value as ``MCP_SILVERBULLET_TOKEN``
+        and ``SB_AUTH_TOKEN``. Compared constant-time against the
+        inbound ``Authorization: Bearer …`` header.
+    resource_url
+        The URL Grok reaches the bridge at. Used for the
+        ``WWW-Authenticate`` header and the discovery document. v1
+        default is the loopback default; the operator overrides when
+        the bridge sits behind a tunnel (``MCP_SILVERBULLET_RESOURCE_URL``
+        is the planned env var, T6 will set the exact contract).
+    name
+        Server name advertised on the wire.
+
+    The ``AuthSettings`` constructor requires both ``issuer_url`` and
+    ``resource_server_url`` to enable the bearer-auth middleware; we
+    point both at ``resource_url`` because v1 has no separate authz
+    server. The SDK uses these to mount
+    ``/.well-known/oauth-protected-resource/mcp`` and to stamp
+    ``WWW-Authenticate`` on 401s; T5 verifies the rendered document.
+    """
+    mcp = MCPServer(
+        name=name,
+        instructions=(
+            "Read, write, and list SilverBullet pages. Three tools "
+            "(`read_page`, `write_page`, `list_pages`) plus one "
+            "resource template `silverbullet://page/{name}` for "
+            "attaching page bodies to conversation context."
+        ),
+        token_verifier=StaticTokenVerifier(token),
+        auth=AuthSettings(
+            issuer_url=resource_url,  # type: ignore[arg-type]
+            resource_server_url=resource_url,  # type: ignore[arg-type]
+        ),
+    )
+
+    register_tools(mcp, sb_client)
+    return mcp
+
+
+def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
+    """Attach the three tools and one resource template to ``mcp``.
+
+    Pulled out of :func:`build_mcp` so tests can build a server and
+    call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
+    are decorators that take the function; we wrap each handler in a
+    ``try/except`` that maps SB exceptions to :exc:`ToolError` per the
+    design doc's status-code mapping.
+    """
+
+    @mcp.tool(
+        title="Read page",
+        description=(
+            "Read the raw markdown body of a SilverBullet page. "
+            "Returns 404-equivalent ToolError if the page is missing."
+        ),
+    )
+    async def read_page(name: str) -> str:
+        try:
+            return await sb_client.read_page(name)
+        except PageNotFound as exc:
+            raise ToolError(f"page not found: {name}") from exc
+        except ServerError as exc:
+            raise ToolError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError("silverbullet request timed out") from exc
+
+    @mcp.tool(
+        title="Write page",
+        description=(
+            "Create or update a SilverBullet page. `if_match=\"*\"` "
+            "requires the page to exist; `if_match=<etag>` requires "
+            "the body hash to match. Returns 412-equivalent ToolError "
+            "on precondition failure, 413 on body > 4 MiB."
+        ),
+    )
+    async def write_page(
+        name: str,
+        content: str,
+        if_match: str | None = None,
+    ) -> str:
+        try:
+            etag = await sb_client.write_page(
+                name, content, if_match=if_match
+            )
+        except PageNotFound as exc:
+            raise ToolError(f"page not found: {name}") from exc
+        except PreconditionFailed as exc:
+            raise ToolError("precondition failed; X-Client-Id seen") from exc
+        except BodyTooLarge as exc:
+            raise ToolError(
+                f"body too large: limit is {_BODY_LIMIT_MIB} MiB"
+            ) from exc
+        except ServerError as exc:
+            raise ToolError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError("silverbullet request timed out") from exc
+        return etag
+
+    @mcp.tool(
+        title="List pages",
+        description=(
+            "List pages in the SilverBullet space, optionally filtered "
+            "by prefix. v1 does the filter client-side (server-side "
+            "Space Lua search is out of scope per T4 of the prior map)."
+        ),
+    )
+    async def list_pages(prefix: str = "") -> list[dict[str, str | None]]:
+        try:
+            metas = await sb_client.list_pages()
+        except ServerError as exc:
+            raise ToolError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError("silverbullet request timed out") from exc
+        result: list[dict[str, str | None]] = [
+            {"name": m.name, "etag": m.etag} for m in metas
+        ]
+        if prefix:
+            result = [m for m in result if m["name"].startswith(prefix)]
+        return result
+
+    @mcp.resource(
+        "silverbullet://page/{name}",
+        name="silverbullet_page",
+        title="SilverBullet page",
+        description=(
+            "Raw markdown body of a SilverBullet page, for attaching "
+            "to conversation context."
+        ),
+        mime_type="text/markdown",
+    )
+    async def silverbullet_page(name: str) -> str:
+        try:
+            return await sb_client.read_page(name)
+        except PageNotFound as exc:
+            # 404 is a ResourceNotFoundError per the SDK's two-shape
+            # split: ``-32602 invalid params`` for "doesn't exist"
+            # (SEP-2164), ``-32603 internal error`` for everything
+            # else. ToolError would be wrong here — tools use it to
+            # set ``is_error=True`` on a successful call, but
+            # ``resources/read`` errors come back as JSON-RPC errors
+            # and Grok's connector treats both shapes identically.
+            raise ResourceNotFoundError(f"page not found: {name}") from exc
+        except ServerError as exc:
+            raise ResourceError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ResourceError("silverbullet request timed out") from exc
+
+
+__all__ = ["build_mcp", "register_tools", "FileMeta", "SBError"]
