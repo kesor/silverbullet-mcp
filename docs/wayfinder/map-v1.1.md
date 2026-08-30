@@ -38,6 +38,9 @@ three tools to eight:
 - new: `delete_page`, `append_to_page`, `patch_page_lines`,
   `patch_page_replace`, `move_page`
 
+After T21 (this session) the bridge ships seven of the eight.
+`move_page` (T22) remains the only ticket ahead.
+
 Each new tool wraps the `/.fs` HTTP primitives (GET / PUT /
 DELETE) with `if_match` plumbing so the agent can edit a page
 across multiple tool calls without a lost-update window. The
@@ -45,19 +48,22 @@ journal surface (T10–T13) is unchanged.
 
 ### Status
 
-T18 (commit `d9c07`) and T19 (commit `aa369`) resolved; the
-bridge now exposes five `/.fs`-backed tools — `read_page`,
-`write_page`, `delete_page`, `append_to_page`, `list_pages` —
-plus the resource template. With T19 closed, T20 (`patch_page_lines`)
-and T21 (`patch_page_replace`) are now takeable: both build on
-T19's read-modify-write boilerplate (the inner two
-`sb_client` calls wrapped in `_translate_sb_errors`). T22
-(`move_page`) remains blocked on T19 only by the same
-read-modify-write pattern (it also needs `delete_page`, which
-T18 already delivered). Pick up T20 next: it locks the
-line-splitting semantics that T21 also builds on (both patch
-tools split on `\n`). T14–T17 from the original "tunnel-ready
-v1.1" chart remain demoted to **Out of scope**.
+T18 (commit `d9c07`), T19 (commit `aa369`), T20 (commit pending),
+and T21 (commit pending) resolved; the bridge now exposes seven
+`/.fs`-backed tools — `read_page`, `write_page`, `delete_page`,
+`append_to_page`, `patch_page_lines`, `patch_page_replace`,
+`list_pages` — plus the resource template. T20 was the line-range
+patch ticket (1-indexed inclusive ranges, trailing-newline
+preservation, out-of-range pre-read validation); T21 is the
+literal-substring find-and-replace counterpart (the
+read-modify-write shape T19 introduced, no line-splitting code
+shared). **T22 (`move_page`) is the only ticket remaining**;
+it's now unblocked (T18 delivered `delete_page`, T19 delivered
+the read-modify-write shape, T21 showed the inline-handler
+pattern composes cleanly — T22 builds a `read → write_new →
+delete_old` dance on the same primitives). T14–T17 from the
+original "tunnel-ready v1.1" chart remain demoted to **Out of
+scope**.
 
 ## Notes
 
@@ -242,6 +248,8 @@ v1.1" chart remain demoted to **Out of scope**.
   the design doc still listed it as out-of-scope-for-v1
   — cleaned up alongside T19). Test count: 127 pass + 2
   skip (+14). `nix flake check` green.
+- **T20. `patch_page_lines(name, start_line, end_line, new_content, if_match?)`** (commit pending): sixth `/.fs`-backed tool, the line-range patch companion to `append_to_page`. New module-level helpers `_split_body_lines` and `_apply_line_patch` in `server.py` (line splitting + range replacement, factored out so future patch tools and tests can target them directly). Five design calls baked in: (a) split on `\n` (single newline, not `str.splitlines()`) — SB stores LF and `splitlines()` would silently strip `\r` from a stray CRLF body; the universal-newline test pins this down; (b) drop a trailing empty element from the split so line counts match an editor's "go to end" (`"a\nb\n"` is 2 lines, not 3); (c) preserve the page's trailing newline iff the body had one and the patched result is non-empty (an empty patched body has no trailing newline either way — mirrors editor semantics); (d) `start_line < 1`, `end_line < start_line` are pre-read validation errors (terse wording, no page-line-count known yet); (e) `end_line > line_count` is post-read validation with the page's line count in the wording — the ticket's recommended `"line range {start}..{end} out of bounds for page with {N} lines"` shape. Empty `new_content` deletes the range (standing preference: no separate `delete_lines` tool). `if_match="*"` and `<stale_etag>` semantics match `append_to_page` and `write_page` (forwarded to the write, not the read; 412 surfaces the unified wording). Type guards reject `bool` instances (Python's `bool` is a subclass of `int`, so `True`/`False` would otherwise sneak through as `1`/`0` line numbers). New `@mcp.tool("Patch page (lines)")` handler in `register_tools`; the 6-tool inventory assertions in `tests/test_journal_gate.py` (`SB_TOOL_NAMES`) and `tests/test_http_auth.py` (sorted `list_tools()` shape) carry forward. Drive-by: tightened `append_to_page`'s tool description (the prior wording claimed the tool's separator behavior "so callers that pass leading newlines get exactly one separator", which was misleading — the test `does_not_double_separator` documents the actual two-newline result when the caller does pass a leading `\n`). Live e2e round-trip: `patch_page_lines(name, 1, 1, "patched\n")` against body `"hello from T7 live e2e\nappended\n"` yields `"patched\nappended\n"` (the trailing `\n` from the original body is preserved). 21 new Layer-1 tests in `tests/test_tools_in_memory.py` cover: happy path, replace first/middle/last/all lines, empty `new_content` deletes range, trailing-newline preservation (both branches), `new_content` trailing-newline no-double-up, empty-body edge case (every range is out-of-bounds), single-line page, CRLF body (no `splitlines()` normalization), `if_match` plumbing (forwarded to write, not read), stale `if_match` 412, 404, 413, 5xx, no-ETag `None` round-trip, four out-of-range validation paths (`start=0`, `start=-1`, `end<start`, `end>line_count`). Test count: 148 pass + 2 skip (+21). `nix flake check` not run from this session; `pytest` runs in `.venv/` are green.
+- **T21. `patch_page_replace(name, find, new_string, replace_all=False, if_match?)`** (commit pending): seventh `/.fs`-backed tool, the literal-substring find-and-replace counterpart to T20. New `@mcp.tool("Patch page (replace)")` handler in `register_tools`; lives inline in `server.py` because `str.replace` is the only logic (no line-splitting code to share with T20, no separate `_patch.py` needed). Five design calls baked in: (a) **`find` treated as a literal substring** — `str.replace`, no regex/glob/fuzzy semantics; agents that want regex match `rg` or Python `re` client-side first, then call this tool with the literal result (a regex mode would invite "I forgot to escape" disasters; the literal-vs-regex test pins this down with `find="\\d"` against body `"the \\d placeholder"` — replaces the literal backslash+d, not "any digit"); (b) **`replace_all=False` by default** — the standing preference from the map: the find string should be unique unless the caller says otherwise. Multi-match + `replace_all=False` → `ToolError("find matched N times; pass replace_all=True or narrow find")` carrying the count; (c) **`find` not in body → `ToolError("find not found in body")`** — a silent no-op would mask a typo in the find string and look like success; (d) **empty `find` rejected upfront** → `ToolError("find must not be empty")` *before* the read (`str.replace("","X","abc")` is `"XaXbXcX"`, almost never what the caller wanted; mirrors `append_to_page`'s empty-text guard); (e) **`if_match` forwarded to the write, not the read** — same contract as T19/T20; `if_match="*"` semantics carry forward. Wire shape `str | None` (the new ETag, or `None` if SB's response didn't carry one — same contract as every other write tool). 18 new Layer-1 tests in `tests/test_tools_in_memory.py` cover: happy-path roundtrip with read-then-write ordering, default `replace_all=False` replaces the unique match, multi-match + default errors (carries count), multi-match + explicit `False` errors (same wording as default), `replace_all=True` replaces every match, `find` not found (errors even with `replace_all=True`), empty `find` errors upfront (no GET, no PUT), `find` not found vs `replace_all=True` independence, literal-vs-regex (replaces `\\d` literally), empty `new_string` deletes occurrences, `find` spanning newlines, `if_match` plumbing (forwarded to write, not read), `if_match="*"` semantics, stale `if_match` 412, 404, 413, 5xx, no-ETag `None` round-trip. Carry-forwards: `tests/test_journal_gate.py` `SB_TOOL_NAMES` extended from 6 to 7 elements; `tests/test_http_auth.py` sorted tool-names assertion updated; `tests/test_e2e_live_sb.py` grew a 15-line `patch_page_replace` roundtrip in the existing live flow (body `"patched\nappended\n"` → replace `patched` with `hello` → `"hello\nappended\n"`). Drive-by: `server.py` module docstring updated from "six `/.fs`-backed tools" to "seven"; `MCPServer.instructions` reworded to list all seven tool names; `register_tools` docstring updated from "five `/.fs`-backed tools" to "seven"; `README.md` tool list grew by `patch_page_replace` (with the safe-default explanation) and the Pi-MCP wiring paragraph now says "seven tools"; `docs/design.md` § Goals updated (mentions the seven verbs), § Tools table grew by `patch_page_replace` row with the literal-substring + safe-default note, and the "What we are not doing" list dropped the `patch_page_replace — not built yet` line. Test count: 166 pass + 2 skip (+18). `nix flake check` not run from this session; `pytest` runs in `.venv/` and `nix develop` are both green.
 
 ## Tickets
 
@@ -449,8 +457,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: _(unclaimed)_
-> **Status**: open
+> **Assignee**: `minimax-m3` (claimed and resolved same session)
+> **Status**: ✅ resolved (commit pending; see Decision above)
 > **Question**: How does the bridge expose line-range edits?
 > **Context**: `patch_page_lines(name, start_line, end_line,
 > new_content, if_match?)` replaces lines `start_line..end_line`
@@ -486,6 +494,41 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Blocks on**: T19 (the read-modify-write boilerplate).
 >
 > **Unblocks**: none directly; T21 has its own shape.
+>
+> **Resolution**: helpers `_split_body_lines` (returns
+> `(lines, had_trailing_newline)`) and `_apply_line_patch`
+> (replaces the 1-indexed inclusive range) live at module level
+> in `server.py` — not in a separate `_patch.py`, because T21
+> (`patch_page_replace`) is the only other potential consumer
+> and it doesn't need line splitting (it's a literal substring
+> swap). New `@mcp.tool("Patch page (lines)")` handler in
+> :func:`register_tools` does the read-modify-write inline,
+> matching the T19 / T18 shape. Type guards reject `bool`
+> inputs (Python's `bool` is a subclass of `int`; without the
+> guard, `True`/`False` would silently become `1`/`0` line
+> numbers). Pre-read validation errors (`start_line < 1`,
+> `end_line < start_line`) use terse wordings without the page
+> line count (it isn't known yet); the post-read
+> `end_line > line_count` error carries the count, matching
+> the ticket's recommended wording verbatim. The trailing-
+> newline preservation is a small editor-style courtesy: the
+> split+rejoin cycle drops the body's trailing `\n`, so the
+> tool re-attaches it iff the body had one and the result is
+> non-empty. Drive-by: tightened :func:`append_to_page`'s tool
+> description (the prior wording claimed the separator
+> behavior "so callers that pass leading newlines get exactly
+> one separator", which contradicts the
+> `does_not_double_separator` test — the new wording is
+> precise). 21 new Layer-1 tests in
+> `tests/test_tools_in_memory.py` cover every case listed in
+> the ticket's "Done when" plus the CRLF, empty-page, and
+> single-line edge cases, the `bool` type guard, the
+> null-ETag round-trip, and the four out-of-range validation
+> paths. `tests/test_journal_gate.py` (`SB_TOOL_NAMES`) and
+> `tests/test_http_auth.py` (sorted `list_tools()` shape) carry
+> forward with the new tool name. Test count: 148 pass + 2
+> skip (+21). `nix flake check` not run from this session; the
+> `.venv/` pytest run is green.
 
 ---
 
@@ -493,8 +536,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: _(unclaimed)_
-> **Status**: open
+> **Assignee**: `minimax-m3` (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved (commit pending; see Decision above)
 > **Question**: How does the bridge expose literal find-and-
 > replace patches?
 > **Context**: `patch_page_replace(name, find, new_string,
@@ -529,6 +572,104 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > memory.py`.
 >
 > **Blocks on**: T19 (the read-modify-write boilerplate).
+>
+> **Resolution**: New `@mcp.tool("Patch page (replace)")`
+> handler in :func:`register_tools` does the read-modify-write
+> inline — no new ``sb_client`` method, no separate ``_patch.py``
+> (T20's helpers are line-splitting-specific; ``str.replace`` is
+> the only logic here). Five design calls baked into the
+> implementation, all aligned with the standing preferences and
+> the ticket body:
+>
+> - **Empty ``find`` rejected upfront.**
+>   ``patch_page_replace(name, "", "X")`` raises
+>   ``ToolError("find must not be empty")`` *before* the inner
+>   ``_translate_sb_errors`` block — no GET, no PUT. Same pattern
+>   as :func:`append_to_page`'s empty-text guard. Pinning the
+>   behavior down keeps the safe default unambiguous: ``""``
+>   matches between every character (``"abc".replace("", "X")``
+>   is ``"XaXbXcX"``), which is almost never what the caller
+>   wanted.
+>
+> - **Literal substring, no regex.** ``body.replace(find,
+>   new_string, count)`` — Python's ``str.replace`` is
+>   substring-based, no escaping required. The literal-vs-regex
+>   test pins this down with ``find="\\d"`` against body
+>   ``"the \\d placeholder"``: the literal two-character
+>   substring gets replaced, not the regex character class.
+>   Agents that want regex match ``rg`` or Python ``re``
+>   client-side first, then call this tool with the literal
+>   result (a regex mode in the bridge would invite "I forgot to
+>   escape" disasters, per the standing preference).
+>
+> - **Safe default: ``replace_all=False``.** When the find
+>   matches more than once, the tool raises
+>   ``ToolError("find matched N times; pass replace_all=True or
+>   narrow find")`` carrying the match count, *before* the
+>   write. The read still happens (we needed it to count
+>   matches); the write is skipped. This is the standing
+>   preference ("the find string should be unique unless the
+>   caller says otherwise") and keeps a typo from silently
+>   mass-editing — the caller sees the count and chooses to
+>   narrow ``find`` or opt in.
+>
+> - **``find`` not in body → ``ToolError("find not found in
+>   body")``.** A silent no-op would mask a typo in the find
+>   string and look like success. The error fires *before* the
+>   replace_all branch — so a caller who blindly flips
+>   ``replace_all=True`` hoping to recover from a typo gets the
+>   same loud failure they would have gotten with the default.
+>
+> - **``if_match`` forwarded to the write, not the read.** Same
+>   contract as :func:`append_to_page` and
+>   :func:`patch_page_lines`. ``if_match="*"` requires the page
+>   to exist (the write layer checks; the read happens
+>   unconditionally, which is correct because the read is
+>   counting matches, not guarding).
+>
+> Wire shape: ``str | None`` (the new ETag for the body, or
+> ``None`` if SB's response didn't carry one — same
+> ``str | None`` contract as the other write tools).
+> ``{"result": null}`` for the no-etag case,
+> ``{"result": "<etag>"}`` for the happy path.
+>
+> Bonus edge case tested: ``find`` substrings that span ``\n``
+> work (``str.replace` is substring-based; the body is a flat
+> string from the bridge's perspective — no line-splitting
+> semantics, intentionally distinct from T20's line-indexed
+> shape). Empty ``new_string`` deletes the occurrences (same
+> standing-preference rule as T20's empty ``new_content``
+> deletes the line range).
+>
+> 18 new Layer-1 tests in ``tests/test_tools_in_memory.py``
+> cover every case listed in the ticket's "Done when" plus the
+> literal-vs-regex, empty-``new_string``-deletes, and
+> find-spans-newlines edges, the ``replace_all=True`` +
+> not-found independence, and the null-ETag round-trip.
+> ``tests/test_journal_gate.py`` ``SB_TOOL_NAMES`` extended
+> from 6 to 7 entries; ``tests/test_http_auth.py`` sorted
+> tool-names assertion updated. Drive-by live e2e:
+> ``tests/test_e2e_live_sb.py`` grew a 15-line
+> ``patch_page_replace`` roundtrip in the existing live flow
+> (body ``"patched\nappended\n"`` → replace ``patched`` with
+> ``hello`` → ``"hello\nappended\n"``).
+>
+> Drive-bys that landed in this session: ``server.py`` module
+> docstring updated from "six ``/.fs``-backed tools" to
+> "seven"; ``MCPServer.instructions`` reworded to list all
+> seven tool names; ``register_tools`` docstring updated from
+> "five ``/.fs``-backed tools" to "seven"; ``README.md`` tool
+> list grew by ``patch_page_replace`` (with the safe-default
+> explanation in plain English) and the Pi-MCP wiring
+> paragraph now says "seven tools"; ``docs/design.md`` §
+> Goals updated (mentions the seven verbs), § Tools table
+> grew by ``patch_page_replace`` row with the
+> literal-substring + safe-default note, and the "What we are
+> not doing" list dropped the ``patch_page_replace — not
+> built yet`` line. Test count: 166 pass + 2 skip (+18).
+> ``nix flake check`` not run from this session;
+> ``pytest .venv/`` and ``pytest`` under ``nix develop`` are
+> both green.
 
 ---
 
@@ -537,7 +678,9 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
 > **Assignee**: _(unclaimed)_
-> **Status**: open
+> **Status**: open (now unblocked: T18 delivered `delete_page`,
+> T19 delivered the read-modify-write shape, T21 showed the
+> inline-handler pattern composes cleanly)
 > **Question**: How does the bridge expose page rename?
 > **Context**: SB has no native move; the bridge does
 > `read_page(name) → write_page(new_name, body, if_match=None) →

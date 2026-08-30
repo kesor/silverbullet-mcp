@@ -284,6 +284,8 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                         "append_to_page",
                         "delete_page",
                         "list_pages",
+                        "patch_page_lines",
+                        "patch_page_replace",
                         "read_page",
                         "write_page",
                     ]

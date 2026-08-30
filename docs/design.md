@@ -8,10 +8,12 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes three MCP **tools** —
-`read_page`, `write_page`, `list_pages` — and one MCP **resource
-template** — `silverbullet://page/{name}` — letting Grok read and write
-your SilverBullet pages as conversation context or as tool calls.
+file API on `/.fs/…`). The bridge exposes seven MCP **tools** —
+`read_page`, `write_page`, `append_to_page`, `patch_page_lines`,
+`patch_page_replace`, `delete_page`, `list_pages` — and one MCP
+**resource template** — `silverbullet://page/{name}` — letting Grok
+read and write your SilverBullet pages as conversation context or as
+tool calls.
 
 The bridge is meant to be **run behind the user's existing Cloudflare
 tunnel** alongside SilverBullet. Neither service is exposed directly;
@@ -19,12 +21,13 @@ only the bridge is on the tunnel, and only Grok has the token.
 
 ## Goals, non-goals
 
-- **Goal**: Grok on the web can `read_page` and `write_page` against
-  SilverBullet, behind the user's existing Cloudflare tunnel, with one
-  bearer token.
-- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search, delete,
-  move, multi-user, mutating silver bullet's source, hosting the
-  bridge for other people.
+- **Goal**: Grok on the web can `read_page`, `write_page`,
+  `append_to_page`, `patch_page_lines`, `patch_page_replace`,
+  `delete_page`, and `list_pages` against SilverBullet, behind the
+  user's existing Cloudflare tunnel, with one bearer token.
+- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search, move,
+  multi-user, mutating silver bullet's source, hosting the bridge
+  for other people.
 
 ## Architecture at a glance
 
@@ -208,15 +211,18 @@ dev = [
 
 ## § Tools
 
-v1 locked three tools at T4; v1.1 grew the surface to five (T18 added
-`delete_page`, T19 added `append_to_page`). **Five tools, one
-resource template.**
+v1 locked three tools at T4; v1.1 grew the surface to seven (T18
+added `delete_page`, T19 added `append_to_page`, T20 added
+`patch_page_lines`, T21 added `patch_page_replace`). **Seven tools,
+one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Side effects |
 |---|---|---|---|
 | `read_page` | `name: str` | `GET /.fs/{name}` | none |
 | `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | may create / overwrite / refuse on `412` |
 | `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | may append / refuse on `412` (concurrent-write protection) |
+| `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
+| `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront) | may patch / refuse on `412` |
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | none |
 

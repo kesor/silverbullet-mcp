@@ -144,6 +144,64 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     # separator is inserted between the two halves.
                     assert after_append.content[0].text == body + "appended\n"
 
+                    # ``patch_page_lines`` is the v1.1 T20 read-
+                    # modify-write tool; round-trip the middle line
+                    # replacement against the live SB so the line
+                    # splitting + rejoin shape is verified end-to-
+                    # end, not just under ``MockTransport``. The
+                    # marker body is now ``hello from T7 live e2e\n
+                    # appended\n`` (two lines, ends in ``\n``);
+                    # replacing line 1 with ``patched`` yields
+                    # ``patched\nappended\n``.
+                    patched = await session.call_tool(
+                        "patch_page_lines",
+                        {
+                            "name": MARKER,
+                            "start_line": 1,
+                            "end_line": 1,
+                            "new_content": "patched\n",
+                        },
+                    )
+                    assert patched.is_error is False, patched
+
+                    after_patch = await session.call_tool(
+                        "read_page", {"name": MARKER}
+                    )
+                    assert after_patch.is_error is False, after_patch
+                    assert after_patch.content[0].text == "patched\nappended\n"
+
+                    # ``patch_page_replace`` is the v1.1 T21 read-
+                    # modify-write tool; round-trip the literal
+                    # find-and-replace against the live SB so the
+                    # substring match + body write is verified end-
+                    # to-end, not just under ``MockTransport``. Body
+                    # is currently ``patched\nappended\n``; replace
+                    # the unique ``patched`` substring with ``hello``
+                    # → ``hello\nappended\n``.
+                    replaced = await session.call_tool(
+                        "patch_page_replace",
+                        {
+                            "name": MARKER,
+                            "find": "patched",
+                            "new_string": "hello",
+                        },
+                    )
+                    assert replaced.is_error is False, replaced
+
+                    after_replace = await session.call_tool(
+                        "read_page", {"name": MARKER}
+                    )
+                    assert after_replace.is_error is False, after_replace
+                    assert after_replace.content[0].text == "hello\nappended\n"
+
+                    # Reset the body for the precondition block
+                    # below (which writes ``body`` and expects to
+                    # find it on read-back).
+                    reset = await session.call_tool(
+                        "write_page", {"name": MARKER, "content": body}
+                    )
+                    assert reset.is_error is False, reset
+
                     # Ticket asked for 412 on If-Match. HTTP If-Match: *
                     # requires the page to exist (should 200 here).
                     # A stale etag should 412 — this live SB ignores

@@ -58,6 +58,8 @@ SB_TOOL_NAMES = {
     "delete_page",
     "list_pages",
     "append_to_page",
+    "patch_page_lines",
+    "patch_page_replace",
 }
 
 

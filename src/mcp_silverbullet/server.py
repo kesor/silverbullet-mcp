@@ -1,14 +1,15 @@
 """MCP server wiring for the bridge.
 
 Locked at T4 of the prior map (three ``/.fs``-backed tools) and grown
-by v1.1: T18 added ``delete_page``, T19 added ``append_to_page``.
-Today the bridge registers five ``/.fs``-backed tools
+by v1.1: T18 added ``delete_page``, T19 added ``append_to_page``,
+T20 added ``patch_page_lines``, T21 added ``patch_page_replace``.
+Today the bridge registers seven ``/.fs``-backed tools
 (``read_page`` / ``write_page`` / ``delete_page`` / ``append_to_page``
-/ ``list_pages``) plus one resource template
-(``silverbullet://page/{name}``). Each tool closes over a single
-:class:`SBClient` opened at boot; SB's typed exceptions translate to
-:mcp_exc:`ToolError` with the exact wording from
-``docs/design.md`` § Tools § Status-code mapping, all funneled
+/ ``patch_page_lines`` / ``patch_page_replace`` / ``list_pages``) plus
+one resource template (``silverbullet://page/{name}``). Each tool
+closes over a single :class:`SBClient` opened at boot; SB's typed
+exceptions translate to :mcp_exc:`ToolError` with the exact wording
+from ``docs/design.md`` § Tools § Status-code mapping, all funneled
 through :func:`_translate_sb_errors`.
 
 T10 of the current map adds an optional, gated journal surface
@@ -16,13 +17,13 @@ T10 of the current map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the five ``/.fs``-backed tools and the resource
+registers only the seven ``/.fs``-backed tools and the resource
 template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md`` (v1) / ``docs/wayfinder/map-v1.1.md`` (v1.1)
-for the T3/T4/T10/T18/T19 decisions this implements.
+for the T3/T4/T10/T18/T19/T20/T21 decisions this implements.
 """
 
 from __future__ import annotations
@@ -109,6 +110,58 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
         raise ToolError("silverbullet request timed out") from exc
 
 
+def _split_body_lines(body: str) -> tuple[list[str], bool]:
+    """Split ``body`` into editor-shaped lines, plus a trailing-newline flag.
+
+    Returns ``(lines, had_trailing_newline)``. SB stores text as LF
+    (no CRLF); we split on ``"\\n"`` directly, not
+    :py:meth:`str.splitlines` (which would also normalise ``\\r\\n``
+    and friends — and SB never emits those).
+
+    A trailing empty element is dropped: a final ``\\n`` means "the
+    last real line ended with a newline", not "there's one more
+    empty line after the last real line". The drop makes the line
+    count match what an editor displays: ``"a\\nb\\n"`` is two lines
+    (``a``, ``b``), not three; ``"a\\nb"`` is also two.
+
+    The ``had_trailing_newline`` flag lets callers (T20's
+    :func:`patch_page_lines` in particular) round-trip the file's
+    newline-at-end shape: ``"a\\nb\\n"`` → ``(["a", "b"], True)``,
+    ``"a\\nb"`` → ``(["a", "b"], False)``. A truly empty body is
+    ``([], False)``; a body that's just ``"\\n"`` is ``([""], True)``
+    — there's exactly one editor-visible line, which is empty, and
+    the file ends with a newline.
+    """
+    had_trailing_newline = bool(body) and body.endswith("\n")
+    lines = body.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines, had_trailing_newline
+
+
+def _apply_line_patch(
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    new_content: str,
+) -> str:
+    """Replace ``lines[start_line-1:end_line]`` with ``new_content``.
+
+    1-indexed, inclusive: ``start_line=1, end_line=2`` replaces
+    ``lines[0:2]``. The replacement is split on ``\\n`` and a
+    trailing empty element dropped (same shape as the body), then
+    ``\\n``.join'd with the surrounding lines. The result has no
+    trailing newline; callers that want to preserve the page's
+    trailing newline shape re-attach it themselves (T20 does so
+    using the flag :func:`_split_body_lines` returned).
+    """
+    new_lines = new_content.split("\n") if new_content else []
+    if new_lines and new_lines[-1] == "":
+        new_lines.pop()
+    patched = lines[: start_line - 1] + new_lines + lines[end_line:]
+    return "\n".join(patched)
+
+
 def build_mcp(
     sb_client: SBClient,
     *,
@@ -157,11 +210,13 @@ def build_mcp(
     mcp = MCPServer(
         name=name,
         instructions=(
-            "Read, write, append to, delete, and list SilverBullet "
-            "pages. Five tools (`read_page`, `write_page`, "
-            "`append_to_page`, `delete_page`, `list_pages`) plus one "
-            "resource template `silverbullet://page/{name}` for "
-            "attaching page bodies to conversation context."
+            "Read, write, append to, patch, delete, and list "
+            "SilverBullet pages. Seven tools (`read_page`, "
+            "`write_page`, `append_to_page`, `patch_page_lines`, "
+            "`patch_page_replace`, `delete_page`, `list_pages`) "
+            "plus one resource template "
+            "`silverbullet://page/{name}` for attaching page "
+            "bodies to conversation context."
         ),
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
@@ -177,7 +232,7 @@ def build_mcp(
 
 
 def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
-    """Attach the five ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the seven ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
@@ -248,15 +303,20 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
     @mcp.tool(
         title="Append to page",
         description=(
-            "Append text to the end of a SilverBullet page, separated "
-            "from the existing body by a single newline (skipped when "
-            "the body already ends in a newline, so callers that pass "
-            "leading newlines get exactly one separator). The tool "
-            "returns the new ETag so the caller can chain edits "
-            "without re-reading. `if_match=\"*\"` requires the page "
-            "to exist; `if_match=<etag>` requires the body hash to "
-            "match (protects against concurrent appends landing out "
-            "of order). 404-equivalent ToolError if the page is "
+            "Append text to the end of a SilverBullet page. The tool "
+            "inserts a single newline between the existing body and "
+            "the new text when the body doesn't already end in one; "
+            "if it does, the new text is concatenated verbatim. The "
+            "tool adds exactly one separator in either case — a "
+            "caller-supplied leading newline is preserved unchanged, "
+            "so `append_to_page(name, \"\\nworld\")` against a body "
+            "of `\"hello\"` produces `\"hello\\n\\nworld\"` (one "
+            "separator from the tool, one from the caller). Returns "
+            "the new ETag so the caller can chain edits without "
+            "re-reading. `if_match=\"*\"` requires the page to exist; "
+            "`if_match=<etag>` requires the body hash to match "
+            "(protects against concurrent appends landing out of "
+            "order). 404-equivalent ToolError if the page is "
             "missing; 412 if the precondition fails; 413 if the "
             "combined body exceeds 4 MiB."
         ),
@@ -280,6 +340,145 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
                 body + "\n" + text
                 if body and not body.endswith("\n")
                 else body + text
+            )
+            return await sb_client.write_page(
+                name, new_body, if_match=if_match
+            )
+
+    @mcp.tool(
+        title="Patch page (lines)",
+        description=(
+            "Replace lines `start_line..end_line` (1-indexed, "
+            "inclusive) of a SilverBullet page with `new_content`. "
+            "Line splitting: the body is split on `\\n` (single "
+            "newline, matching how SB stores text — no universal-"
+            "newline handling) and a trailing empty element is "
+            "dropped, so `\"a\\nb\\n\"` is two lines (`a`, `b`), "
+            "not three. Pass `new_content=\"\"` to delete the range "
+            "without adding a replacement. The page's trailing "
+            "newline is preserved iff the body had one and the "
+            "patched result is non-empty (editor-style: deleting "
+            "lines doesn't strip the file's final `\\n`). "
+            "`if_match=\"*\"` requires the page to exist; "
+            "`if_match=<etag>` requires the body hash to match "
+            "(the same read-modify-write contract as "
+            "`append_to_page`). Returns the new ETag. "
+            "`start_line < 1`, `end_line < start_line`, and "
+            "`end_line` past the last line all raise `ToolError` "
+            "with the page's line count; 404 if the page is "
+            "missing; 412 if the precondition fails; 413 if the "
+            "patched body exceeds 4 MiB."
+        ),
+    )
+    async def patch_page_lines(
+        name: str,
+        start_line: int,
+        end_line: int,
+        new_content: str,
+        if_match: str | None = None,
+    ) -> str | None:
+        # Cheap, no-read input validation first: a non-positive
+        # start_line or an inverted range can't be helped by reading
+        # the page (line_count is undefined until then), so the
+        # out-of-bounds wording in the ticket doesn't apply. Keep
+        # these pre-read errors terse and let the post-read error
+        # carry the page's line count.
+        if not isinstance(start_line, int) or isinstance(start_line, bool):
+            raise ToolError(
+                f"start_line must be an int, got {type(start_line).__name__}"
+            )
+        if not isinstance(end_line, int) or isinstance(end_line, bool):
+            raise ToolError(
+                f"end_line must be an int, got {type(end_line).__name__}"
+            )
+        if start_line < 1:
+            raise ToolError(f"start_line must be >= 1, got {start_line}")
+        if end_line < start_line:
+            raise ToolError(
+                f"end_line ({end_line}) must be >= start_line ({start_line})"
+            )
+        async with _translate_sb_errors(name):
+            body = await sb_client.read_page(name)
+            lines, had_trailing_newline = _split_body_lines(body)
+            line_count = len(lines)
+            if end_line > line_count:
+                raise ToolError(
+                    f"line range {start_line}..{end_line} out of bounds "
+                    f"for page with {line_count} lines"
+                )
+            new_body = _apply_line_patch(
+                lines, start_line, end_line, new_content
+            )
+            # Preserve the page's trailing newline the way an editor
+            # would: ``splitlines``/``join`` above drops it as a side
+            # effect, so re-attach it iff the body had one and the
+            # result is non-empty. An empty patched body has no
+            # trailing newline either way.
+            if had_trailing_newline and new_body:
+                new_body += "\n"
+            return await sb_client.write_page(
+                name, new_body, if_match=if_match
+            )
+
+    @mcp.tool(
+        title="Patch page (replace)",
+        description=(
+            "Replace literal occurrences of `find` with `new_string` "
+            "in a SilverBullet page. `find` is matched as a plain "
+            "substring — no regex, no glob, no fuzzy matching (an "
+            "agent that wants regex uses `rg` or Python's `re` "
+            "client-side, then calls this tool with the literal "
+            "result). `replace_all=False` (the default) errors "
+            "instead of silently mass-editing when `find` matches "
+            "more than once: `ToolError(\"find matched N times; pass "
+            "replace_all=True or narrow find\")`. `replace_all=True` "
+            "replaces every occurrence. `find` not in body → "
+            "`ToolError(\"find not found in body\")` — a typo in the "
+            "find string should not look like success. Empty `find` "
+            "is rejected upfront (would match between every "
+            "character): `ToolError(\"find must not be empty\")`. "
+            "`if_match=\"*\"` requires the page to exist; "
+            "`if_match=<etag>` requires the body hash to match "
+            "(same read-modify-write contract as "
+            "`append_to_page` and `patch_page_lines`). Returns the "
+            "new ETag. 404 if the page is missing; 412 if the "
+            "precondition fails; 413 if the patched body exceeds "
+            "4 MiB."
+        ),
+    )
+    async def patch_page_replace(
+        name: str,
+        find: str,
+        new_string: str,
+        replace_all: bool = False,
+        if_match: str | None = None,
+    ) -> str | None:
+        # Cheap, no-read input validation first. ``find == ""`` would
+        # match between every character (``"abc".replace("", "X")``
+        # is ``"XaXbXcX"``) — almost certainly a caller bug, not
+        # the edit they wanted. Surface it loudly upfront so the
+        # read-modify-write round trip isn't wasted and the bug is
+        # pinned at the call site. Same pattern as
+        # :func:`append_to_page`'s ``text must not be empty``.
+        if not find:
+            raise ToolError("find must not be empty")
+        async with _translate_sb_errors(name):
+            body = await sb_client.read_page(name)
+            occurrences = body.count(find)
+            if occurrences == 0:
+                raise ToolError("find not found in body")
+            if not replace_all and occurrences > 1:
+                raise ToolError(
+                    f"find matched {occurrences} times; "
+                    f"pass replace_all=True or narrow find"
+                )
+            # ``str.replace`` handles the literal-substring case
+            # without escaping: no regex, no fuzzy match, no escape
+            # to forget. The ``count`` parameter threads the
+            # ``replace_all`` knob (None = replace all, 1 = first
+            # only — same shape as Python's ``str.replace``).
+            new_body = body.replace(
+                find, new_string, -1 if replace_all else 1
             )
             return await sb_client.write_page(
                 name, new_body, if_match=if_match
