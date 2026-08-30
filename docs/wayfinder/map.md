@@ -10,7 +10,10 @@ The skill this file follows: mattpocock/skills@wayfinder.
 Prior map (the design doc) reached destination `docs/design.md` and is
 preserved in git history at commit `542f1`. This map's destination is
 **building the bridge the design doc describes** — code, flake, tests,
-README — not the design itself.
+README — not the design itself. Subsequent maps: the v1.1 build
+(`map-v1.1.md`, full CRUD + editing, destination reached) and the v1.2
+build (`map-v1.2.md`, agent-facing QOL + bullet primitives, eight open
+tickets).
 -->
 
 ## Destination
