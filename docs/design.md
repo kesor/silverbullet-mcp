@@ -247,7 +247,7 @@ we are.
 |---|---|
 | `200 OK` | success — return body / `FileMeta` |
 | `404 Not Found` | `read_page` returns `ToolError("page not found: {name}")` (handler-level error → `isError=True`) |
-| `412 Precondition Failed` | `write_page` returns `ToolError("precondition failed; X-Client-Id seen")` |
+| `412 Precondition Failed` | `write_page` returns `ToolError("precondition failed; check if_match/if_none_match")` |
 | `413 Body Too Large` | `write_page` returns `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
 | `5xx` | `ToolError("silverbullet error: <status>")` |
 | timeout | `ToolError("silverbullet request timed out")` |

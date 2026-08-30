@@ -108,8 +108,12 @@ class SBClient:
         Shared bearer secret; same value as ``MCP_SILVERBULLET_TOKEN``
         and ``SB_AUTH_TOKEN``.
     timeout
-        Read / write timeouts in seconds. Matches the values used by
-        the prior map's reference implementation.
+        Read / write timeouts in seconds. ``None`` (default) selects
+        a 10 s read / write timeout with a 3 s connect timeout — long
+        enough for a sleepy SB that's also serving the SPA shell over
+        the same loopback, short enough that a hung SB surfaces as a
+        tool error rather than a stuck agent turn. Operators that
+        need different values pass an :class:`httpx.Timeout` directly.
     """
 
     def __init__(
@@ -155,7 +159,7 @@ class SBClient:
         *,
         if_match: str | None = None,
         if_none_match: bool = False,
-    ) -> str:
+    ) -> str | None:
         """Create or update ``/.fs/{name}``.
 
         Parameters
@@ -172,8 +176,12 @@ class SBClient:
 
         Returns
         -------
-        str
-            The new ETag for the body, taken from the response header.
+        str | None
+            The new ETag for the body, taken from the response
+            ``ETag`` header, or ``None`` if the response didn't carry
+            one. SB always emits ``ETag`` on a successful write, so
+            ``None`` is a contract drift worth logging about (older
+            or misconfigured SB proxies may strip the header).
 
         Raises
         ------
@@ -204,8 +212,7 @@ class SBClient:
             headers=headers,
         )
         _raise_for_status(response)
-        etag = response.headers.get("ETag")
-        return etag if etag is not None else ""
+        return response.headers.get("ETag")
 
     async def list_pages(self) -> list[FileMeta]:
         """Return ``FileMeta`` for every page in the space.
@@ -260,7 +267,7 @@ def _raise_for_status(response: httpx.Response) -> None:
         raise PageNotFound(f"page not found: {response.request.url}")
     if status == 412:
         raise PreconditionFailed(
-            f"precondition failed (X-Client-Id seen by SB): {response.request.url}"
+            f"precondition failed: {response.request.url}"
         )
     if status == 413:
         raise BodyTooLarge(

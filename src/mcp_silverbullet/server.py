@@ -167,7 +167,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         name: str,
         content: str,
         if_match: str | None = None,
-    ) -> str:
+    ) -> str | None:
         try:
             etag = await sb_client.write_page(
                 name, content, if_match=if_match
@@ -175,7 +175,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         except PageNotFound as exc:
             raise ToolError(f"page not found: {name}") from exc
         except PreconditionFailed as exc:
-            raise ToolError("precondition failed; X-Client-Id seen") from exc
+            raise ToolError("precondition failed; check if_match/if_none_match") from exc
         except BodyTooLarge as exc:
             raise ToolError(
                 f"body too large: limit is {_BODY_LIMIT_MIB} MiB"
@@ -184,6 +184,9 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             raise ToolError(str(exc)) from exc
         except httpx.TimeoutException as exc:
             raise ToolError("silverbullet request timed out") from exc
+        # ``write_page`` returns ``None`` when the SB response didn't
+        # carry an ETag (older or proxy-stripped); surface that as the
+        # JSON ``null`` rather than mangling the type.
         return etag
 
     @mcp.tool(

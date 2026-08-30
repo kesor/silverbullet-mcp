@@ -18,9 +18,9 @@ Coverage:
 - ``list_pages`` filters by prefix client-side.
 - Each SB exception maps to ``is_error=True`` with the design doc's
   exact ToolError message: 404 → "page not found: <name>"; 412 →
-  "precondition failed; X-Client-Id seen"; 413 → "body too large: limit
-  is 4 MiB"; 5xx → "silverbullet error: <status>"; timeout → "silverbullet
-  request timed out".
+  "precondition failed; check if_match/if_none_match"; 413 →
+  "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
+  timeout → "silverbullet request timed out".
 - The resource template returns the same body for the happy path and
   surfaces ``ToolError`` for a missing page (v1 keeps one error shape
   for both surfaces; T4 carry-forward note in the map).
@@ -136,6 +136,29 @@ async def test_write_page_returns_etag_on_200() -> None:
 
 
 @pytest.mark.asyncio
+async def test_write_page_returns_null_when_etag_header_missing() -> None:
+    """A 200 with no ETag header (older SB / proxy-stripped) → ``None``.
+
+    Guard against a future refactor that drops the ``None`` fallback
+    and instead returns ``""`` (a different and confusing wire shape).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "# new body"},
+        )
+
+    assert result.is_error is False
+    # ``str | None`` returns are wrapped in ``{"result": ...}`` by the
+    # SDK; missing ETag becomes JSON ``null``.
+    assert result.structured_content == {"result": None}
+
+
+@pytest.mark.asyncio
 async def test_write_page_forwards_if_match() -> None:
     """The MCP tool passes ``if_match`` straight to ``sb_client.write_page``.
 
@@ -189,7 +212,7 @@ async def test_write_page_412_returns_tool_error_with_design_doc_wording() -> No
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool write_page: precondition failed; X-Client-Id seen"
+    assert _text(result) == "Error executing tool write_page: precondition failed; check if_match/if_none_match"
 
 
 @pytest.mark.asyncio
