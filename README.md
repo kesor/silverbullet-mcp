@@ -442,9 +442,16 @@ try to connect until the first tool call.
 ### Cloudflare Access boot example
 
 ```bash
-export MCP_SILVERBULLET_JWT_ISSUER=https://kabarnit.cloudflareaccess.com
-export MCP_SILVERBULLET_JWT_AUDIENCE=<the-AUD-tag-from-the-CF-dashboard>
-export MCP_SILVERBULLET_JWT_JWKS_URL=https://kabarnit.cloudflareaccess.com/cdn-cgi/access/certs
+# Replace ``<your-org>`` with the slug of your Cloudflare
+# Zero Trust organization (visible in the URL bar of the
+# Zero Trust dashboard — it's the ``<org>`` in
+# ``https://<org>.cloudflareaccess.com``).
+export MCP_SILVERBULLET_JWT_ISSUER=https://<your-org>.cloudflareaccess.com
+# Replace ``<AUD-tag>`` with the Application Audience (AUD)
+# Tag from your Access application's edit page in the
+# Cloudflare Zero Trust dashboard.
+export MCP_SILVERBULLET_JWT_AUDIENCE=<AUD-tag>
+export MCP_SILVERBULLET_JWT_JWKS_URL=https://<your-org>.cloudflareaccess.com/cdn-cgi/access/certs
 export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:3000
 # MCP_SILVERBULLET_TOKEN is unset in JWT mode (the bridge logs
 # "ignored in JWT mode" at boot if it's still present from a v1.x
