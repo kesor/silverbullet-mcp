@@ -28,9 +28,9 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
 ### 🏁 Status: in flight.
 
-Four of eight tickets resolved (T1, T2, T3, T4). Frontier is T5
-(HTTP integration tests), T6 (operator smoke run + README), T7
-(live-SB end-to-end test), T8 (write-envelope fog).
+Five of eight tickets resolved (T1–T5). Frontier is T6 (operator
+smoke run + README), T7 (live-SB end-to-end test), T8 (write-envelope
+fog).
 
 ## Notes
 
@@ -89,6 +89,7 @@ Four of eight tickets resolved (T1, T2, T3, T4). Frontier is T5
 - [T2. `flake.nix` (uv2nix + pinned commits)](#t2-flakenix-uv2nix--pinned-commits) (commit `9aabc`): `flake.nix` consumes `uv.lock` via `pyproject-nix/build-system-pkgs` + `uv2nix` (the actual API, NOT the design doc's pseudocode — see resolution); four inputs pinned via `flake.lock` to known commits (nixpkgs `56c02bc...`, pyproject.nix `1b14855...`, uv2nix `4b59ab...`, build-system-pkgs `90ffde...`, all 2026-08). Python interpreter pinned to `pkgs.python313` (3.13.15) so the runtime venv and `uv.lock` agree on wheels (nixpkgs's `pkgs.python3` had drifted to 3.14). `packages.${system}.default` builds `mcp-silverbullet-env` from `workspace.deps.default` (no pytest/editables); `devShells.${system}.default` uses `mkEditablePyprojectOverlay` + `workspace.deps.all` for live-source development; `checks.${system}.pytest` is the uv2nix `passthru.tests` pattern — overrides the `mcp-silverbullet` package to add a derivation that runs `pytest` against `lib.cleanSource ./.` (whole repo minus .venv). Runtime venv smoke (`mcp==2.1.1`, `httpx2==2.12.0`, `python -m mcp_silverbullet` → "hello from mcp-silverbullet") and `nix flake check` both green on `x86_64-linux`. The devShell required two `pyproject.toml` carry-forwards: a `dev` dependency-group containing `editables` (so `mkEditablePyprojectOverlay` includes it in `workspace.deps.all`), and `editables` listed in `[build-system] requires` (so hatchling's `build_editable` finds it at build time, not just at install time). 16 Layer-3 tests pass in both `nix flake check` and `nix develop`.
 - [T3. `sb_client.py` (httpx adapter for /.fs)](#t3-sb_clientpy-httpx-adapter-for-fs) (commit `de944`): outbound bridge half — `SBClient` with `read_page`/`write_page`/`list_pages` against SB's `/.fs/...`, typed exceptions (`PageNotFound`, `PreconditionFailed`, `BodyTooLarge`, `ServerError`) per the § Tools status-code table, `FileMeta` dataclass (name + etag only), `write_page` PUT carries `X-Source: external` + `X-Permission: rw` + explicit `Content-Type: text/markdown` (httpx2 doesn't auto-set it for `content=str`); `If-Match` / `If-None-Match: *` both wired, `if_match` wins if both are passed. 16 Layer-3 tests under `httpx.MockTransport` (no real SB), all green in 0.07s; T1 smoke unbroken. Write-envelope fog (T8) deliberately not resolved here — `write_page` only sends the two headers the design doc requires, the real-write attempt is what decides the rest.
 - [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
+- [T5. HTTP integration tests (auth + discovery doc)](#t5-http-integration-tests-auth--discovery-doc) (commit `53ae8`): 5 Layer-2 tests in `tests/test_http_auth.py` exercising the bridge as a real ASGI app via `httpx.ASGITransport(app=streamable_http_app(host="bridge.test"))` + `app.router.lifespan_context(app)` (drives the SDK's `StreamableHTTPSessionManager.run()` since `ASGITransport` doesn't speak Starlette's lifespan protocol). Covers: POST `/mcp` no-token → 401 + `WWW-Authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://bridge.test/.well-known/oauth-protected-resource/mcp"`; POST `/mcp` wrong-token → identical shape (no header-vs-token probe leak); GET `/.well-known/oauth-protected-resource/mcp` (no auth) → 200 + RFC 9728 doc with `resource=<resource_url>`, `authorization_servers=[<resource_url>]` (v1 has no separate authz server), `bearer_methods_supported=["header"]`, `scopes_supported` omitted (`AuthSettings.required_scopes=None`, stripped by `PydanticJSONResponse.render`); POST `/mcp` with auth but `Accept: text/plain` → 406 ("Not Acceptable: Client must accept both application/json and text/event-stream"); end-to-end `streamable_http_client` + `ClientSession` initialize → list_tools (`['list_pages', 'read_page', 'write_page']`) → `call_tool read_page` roundtrip against a mocked SB. ASGI transport vs the ticket's literal "uvicorn on a free port": same wire path (every middleware, header, status code, body shape) minus the TCP stack — fast, deterministic, no port flake. The real-port path is exercised at T7 against the live SilverBullet. 5 new tests in 0.94s; 36 tests total green; `nix flake check` green.
 
 ## Tickets
 
@@ -195,8 +196,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: claude (claimed 2026-08-27, in progress)
-> **Status**: 🚧 in progress
+> **Assignee**: claude (claimed 2026-08-27, resolved same day)
+> **Status**: ✅ resolved (commit `53ae8`)
 > **Question**: Stand the bridge up on a free port via
 > `mcp.streamable_http_app()` + uvicorn, point `Client(url)` at it,
 > and verify: bearer auth happy path; missing-token → `401` +
@@ -211,6 +212,35 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > in the matrix in `docs/design.md` § Test catalog (v1).
 > **Blocks on**: T2, T4.
 > **Unblocks**: T7 (live-SB end-to-end).
+> **Resolution**: see commit `53ae8`. Five Layer-2 tests in
+> `tests/test_http_auth.py` (~290 lines, 0.94s). The bridge runs as a
+> real ASGI app on a real wire path via `httpx.ASGITransport(app=...)
+> + app.router.lifespan_context(app)`; the SDK's auto-enabled
+> DNS-rebinding protection is bypassed by passing
+> `host="bridge.test"` to `streamable_http_app` (anything other than
+> 127.0.0.1/localhost/::1 turns the protection off; the loopback
+> case is the production default and T6 will thread
+> `MCP_SILVERBULLET_ALLOWED_HOSTS` through it). ASGITransport does
+> not speak Starlette's lifespan protocol, so we drive
+> `app.router.lifespan_context(app)` manually to enter the SDK's
+> `StreamableHTTPSessionManager.run()` before any request — without
+> that, every `/mcp` POST crashes at
+> `"Task group is not initialized. Make sure to use run()."` Three
+> SDK shape facts the resolution locked down for future HTTP work:
+> (1) `PydanticJSONResponse.render` calls
+> `model_dump_json(exclude_none=True)`, so any `None` field on
+> `ProtectedResourceMetadata` is stripped from the response body —
+> `scopes_supported` is omitted because `AuthSettings.required_scopes`
+> is unset; if we want scopes advertised, T6 wires
+> `AuthSettings(required_scopes=[...])` or a later map adds it.
+> (2) The 401 path returns JSON body
+> `{"error":"invalid_token","error_description":"Authentication required"}`
+> (the SDK shape, not RFC 6750 §3's `error="invalid_token", error_description="..."` parameters — those go in the `WWW-Authenticate`
+> header); a future Grok connector that parses the body expects this
+> shape. (3) `Accept: text/plain` (with valid auth) returns 406 only
+> because the auth middleware sits in front of the streamable handler;
+> a wrong Accept without auth would still 401 — the test exercises
+> the inner branch deliberately.
 
 ---
 
@@ -289,6 +319,22 @@ file; "blocking" is rendered by ticket ordering and an explicit
   range. Punt to a future map.
 - PR to nixpkgs upgrading `python3Packages.mcp` to v2.x and adding
   `mcp-types`. Nice-to-have; not blocking; punt to a future map.
+- Whether the discovery doc should advertise `scopes_supported`
+  (`["notes:read", "notes:write"]`, matching what `StaticTokenVerifier`
+  grants). T5 confirms the field is currently omitted because
+  `AuthSettings.required_scopes` is unset; one-line change to
+  publish. Specifiable when a Grok-side client actually parses it.
+- `json_response=True` mode for the streamable handler — collapses
+  SSE to plain JSON responses, saves a streaming round-trip when the
+  client doesn't need event-stream multiplexing. v1 keeps the SSE
+  default; specifiable if a measured client needs the JSON path.
+- Promoting `TransportSecuritySettings` configuration from the
+  loopback auto-default to an explicit operator-tunable shape
+  (allowed_hosts / allowed_origins lists) for tunnel-fronted
+  deployments. Standing-preference note in the map already mentions
+  `MCP_SILVERBULLET_ALLOWED_HOSTS`; the parameter to expose lives
+  inside `build_mcp` (or a new `bridge_config()` factory that T6
+  could grow into). Specifiable when the operator needs it.
 
 ## Out of scope
 
