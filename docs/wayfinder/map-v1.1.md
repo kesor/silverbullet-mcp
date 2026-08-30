@@ -10,7 +10,7 @@ This map's destination was originally "tunnel-ready v1.1"
 mid-chart: the real editing gap is CRUD verbs, not polish. The
 bridge today exposes create-or-overwrite (`write_page`), read
 (`read_page` + the resource template), and list (`list_pages`).
-Missing: `delete_page`, `append_page`, line-range patch, string
+Missing: `delete_page`, `append_to_page`, line-range patch, string
 find-and-replace patch, and (debatable) `move_page`. The map
 re-draws around that gap.
 
@@ -35,7 +35,7 @@ three tools to eight:
 
 - existing: `read_page`, `write_page`, `list_pages`
   + resource template `silverbullet://page/{name}`
-- new: `delete_page`, `append_page`, `patch_page_lines`,
+- new: `delete_page`, `append_to_page`, `patch_page_lines`,
   `patch_page_replace`, `move_page`
 
 Each new tool wraps the `/.fs` HTTP primitives (GET / PUT /
@@ -45,18 +45,19 @@ journal surface (T10–T13) is unchanged.
 
 ### Status
 
-T18 resolved (commit `d9c07`). Per the ticket-by-ticket
-blocking notes, T19 (`append_page`) and T22 (`move_page`)
-were the tickets that explicitly cited T18 as a blocker
-(T19 — shares the 404 ToolError shape; T22 — `delete_page`
-is the last step of move). With T18 closed, both are now
-takeable: the 404 wording convention is landed, and `sb_client
-.delete_page` is wired through to SB's `DELETE /.fs/...`.
-Pick up T19 next: it produces the read-modify-write
-boilerplate that T20 and T21 also build on. T20 and T21
-remain blocked on T19 (not on T18). T14–T17 from the
-original "tunnel-ready v1.1" chart remain demoted to
-**Out of scope**.
+T18 (commit `d9c07`) and T19 (commit `aa369`) resolved; the
+bridge now exposes five `/.fs`-backed tools — `read_page`,
+`write_page`, `delete_page`, `append_to_page`, `list_pages` —
+plus the resource template. With T19 closed, T20 (`patch_page_lines`)
+and T21 (`patch_page_replace`) are now takeable: both build on
+T19's read-modify-write boilerplate (the inner two
+`sb_client` calls wrapped in `_translate_sb_errors`). T22
+(`move_page`) remains blocked on T19 only by the same
+read-modify-write pattern (it also needs `delete_page`, which
+T18 already delivered). Pick up T20 next: it locks the
+line-splitting semantics that T21 also builds on (both patch
+tools split on `\n`). T14–T17 from the original "tunnel-ready
+v1.1" chart remain demoted to **Out of scope**.
 
 ## Notes
 
@@ -181,6 +182,66 @@ original "tunnel-ready v1.1" chart remain demoted to
   caller's read-then-write-thread-etag pattern is the
   real contract. Test count: 113 pass + 2 skip (+16).
   `nix flake check` green.
+- **Drive-by: `_translate_sb_errors` helper (commit `21517`).**
+  Pure refactor of `server.py`: the four existing tool handlers
+  (`read_page`, `write_page`, `delete_page`, `list_pages`)
+  each repeated the same `try/except` chain mapping SB
+  exceptions to `ToolError` with the design doc's exact
+  wording. T19 was about to add a fifth copy, so factored
+  the translation into an async context manager
+  `:func:`_translate_sb_errors`. The 404 wording still needs
+  `name` (the page the caller asked for), so each handler
+  passes its `name` through; `list_pages` passes an empty
+  string (it doesn't actually raise `PageNotFound` on its
+  current code path, so the wording never surfaces there).
+  Pure refactor: 113 pass + 2 skip, no behavior change on
+  the wire. `nix flake check` green.
+- **T19. `append_to_page(name, text, if_match?)`** (commit
+  `aa369`): fifth `/.fs`-backed tool, the read-modify-write
+  pattern T20 and T21 build on. Renamed from the ticket's
+  original `append_page` to `append_to_page` (the verb
+  reads naturally as "append <text> to <page>" rather than
+  "append a page" — the latter could read as "create a new
+  page"). Three design calls baked into the implementation:
+  (a) empty `text` rejected upfront with
+  `ToolError("text must not be empty")` *before* the inner
+  `sb_client` calls, saving the round trip and surfacing the
+  likely caller bug at the call site; (b) one newline
+  separator when the body doesn't end in one (empty body →
+  `text` verbatim, body ending in `\n` → no double
+  separator, body without trailing newline → exactly one
+  separator) — locked down by four independent separator
+  tests; (c) `if_match="*"` is a *must-exist* precondition,
+  not a *create* (the read happens unconditionally and a
+  missing page surfaces as the standard 404 ToolError; the
+  create semantic lives on
+  `write_page(name, content, if_match="*")` — keeping the
+  two semantics distinct avoids the conflation the
+  ticket's "treat missing as empty body" alternative
+  would invite). `if_match` is forwarded to the *write*,
+  not the read (the read carries no precondition); wire
+  shape is `str | None` (the new ETag or `None` if SB's
+  response didn't carry one), same contract as
+  `write_page` / `delete_page`. 14 new Layer-1 tests in
+  `tests/test_tools_in_memory.py` cover the happy-path
+  roundtrip with read-then-write ordering, the separator
+  rule, empty-text rejection (no GET, no PUT), `if_match`
+  threading, `if_match="*"` semantics, and the 404 / 412 /
+  413 / 5xx / no-ETag wire shapes. Two carry-forwards:
+  `tests/test_journal_gate.py` `SB_TOOL_NAMES` extended
+  from 4 to 5 elements; `tests/test_http_auth.py` sorted
+  tool-names assertion updated. Drive-by live e2e:
+  `tests/test_e2e_live_sb.py` grew a 20-line
+  `append_to_page` roundtrip assertion in the existing
+  live write/read/precondition/list_pages flow; the
+  marker body's `\n` ending exercises the
+  no-extra-separator branch against real SB. README tool
+  list and Pi-MCP wiring paragraph now say "five tools";
+  `docs/design.md` § Tools table grew by `append_to_page`
+  and `delete_page` (the latter was already shipped but
+  the design doc still listed it as out-of-scope-for-v1
+  — cleaned up alongside T19). Test count: 127 pass + 2
+  skip (+14). `nix flake check` green.
 
 ## Tickets
 
@@ -257,12 +318,12 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T19. `append_page(name, text, if_match?)`
+### T19. `append_to_page(name, text, if_match?)`
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: _(unclaimed)_
-> **Status**: open
+> **Assignee**: `minimax-m3` (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved (commit `aa369`)
 > **Question**: How does the bridge expose "append text to a
 > page"?
 > **Context**: SB has no native append semantics; the bridge
@@ -278,7 +339,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Edge case — `if_match="*"`**: caller wants "create if
 > absent". `read_page` 404s; the tool must therefore treat
 > `if_match="*"` differently: it's a *create*, not an append.
-> Either reject the combination (`ToolError("append_page with
+> Either reject the combination (`ToolError("append_to_page with
 > if_match='*' is a create; use write_page")`) or treat
 > missing page as an empty body and append (effectively a
 > create). T19 picks one.
@@ -307,6 +368,80 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > helper).
 > **Unblocks**: T20 (the patch tools build on append's
 > read-modify-write pattern).
+>
+> **Resolution**: New `@mcp.tool("Append to page")` handler in
+> :func:`register_tools` does the read-modify-write inline —
+> no new ``sb_client`` method, no new layer. Three design
+> calls baked into the implementation (the ticket offered
+> recommendations for two and punted the third):
+>
+> - **Empty ``text`` rejected upfront.**
+>   ``append_to_page(name, '')`` raises
+>   ``ToolError("text must not be empty")`` *before* the inner
+>   ``_translate_sb_errors`` block; no GET, no PUT. An empty
+>   append is almost certainly a caller bug; surfacing it
+>   loudly saves the round trip and pinpoints the bug.
+>
+> - **Separator rule:** ``body = ''`` → ``new_body = text``;
+>   ``body.endswith('\\n')`` → ``new_body = body + text``;
+>   otherwise → ``new_body = body + '\\n' + text``. Exactly
+>   one separator in all cases, never two. The four
+>   separator-related Layer-1 tests pin this down
+>   independently of the read/write plumbing.
+>
+> - **``if_match='*'`` is a *must-exist* precondition**, not a
+>   create. The read happens unconditionally; a missing
+>   page surfaces as the standard 404 ``ToolError``. The
+>   *create* semantic lives on ``write_page(name, content,
+>   if_match='*')`` — keeping the two semantics distinct
+>   avoids the conflation the ticket's "treat missing as
+>   empty body" alternative would invite. The
+>   ``if_match='*'`` test pins this: the read sees an
+>   existing page, the write carries ``If-Match: *``, both
+>   succeed.
+>
+> Wire shape: ``str | None`` (the new ETag for the body, or
+> ``None`` if SB's response didn't carry one — same
+> ``str | None`` contract as ``write_page`` / ``delete_page``).
+> ``{"result": null}`` for the no-etag case,
+> ``{"result": "<etag>"}`` for the happy path. The
+> ``if_match`` is forwarded to the *write*, not the read;
+> the read carries no precondition.
+>
+> Drive-by that landed in the commit immediately before
+> T19: :func:`_translate_sb_errors` — an async context
+> manager that maps SB exceptions to ``ToolError`` with
+> the design doc's wording. The tool handler wraps both
+> inner ``sb_client`` calls in this helper, so 404 / 412 /
+> 413 / 5xx / timeout all surface with the same wording as
+> the four existing tools. The refactor was committed as a
+> drive-by because T19 made the duplication a fifth copy;
+> 113 tests stayed green across the refactor.
+>
+> New Layer-1 coverage in ``tests/test_tools_in_memory.py``
+> (14 new tests): happy-path roundtrip with read-then-write
+> ordering, separator rule (insert when body lacks newline,
+> no double separator, multiple trailing newlines, empty
+> body, text with leading newline), empty-text rejection
+> upfront (no GET, no PUT), ``if_match`` threaded to the
+> write (not the read), ``if_match='*'`` semantics, 404 /
+> 412 / 413 / 5xx / no-ETag wire shapes.
+>
+> Test count: 127 pass + 2 skip (the two env-gated live
+> tests); up from 113 + 2 skip (+14 new Layer-1 tests).
+> Drive-by live e2e: ``tests/test_e2e_live_sb.py`` grew a
+> 20-line ``append_to_page`` roundtrip assertion in the
+> existing live write/read/precondition/list_pages flow;
+> the marker body's ``\\n`` ending exercises the
+> no-extra-separator branch against real SB.
+>
+> Rename note: the user renamed the tool from ``append_page``
+> (the ticket's original name) to ``append_to_page`` because
+> the verb reads naturally as "append <text> to <page>"
+> rather than "append a page" (which could read as "create
+> a new page"). Map heading, code, tests, README, and
+> design-doc table all carry the new name; the *standing*
+> preferences block refers to "append_to_page" verbatim.
 
 ---
 
@@ -482,7 +617,7 @@ is for *scope* boundaries. -->
   - `T17` placeholder — dissolved.
 - **New write tools beyond CRUD** — `create_page` as a
   distinct verb (use `write_page(name, content, if_match="*")`
-  instead), `append_page_many`, `patch_many`. Punt.
+  instead), `append_to_page_many`, `patch_many`. Punt.
 - **OAuth 2.1, dynamic-client registration, multi-user.**
   Locked out at T2 of the prior map.
 - **Server-pushed notifications / `subscriptions/listen`.**
