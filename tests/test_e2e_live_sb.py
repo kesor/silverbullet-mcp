@@ -224,10 +224,10 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     )
                     assert patched.is_error is False, patched
                     # T23 envelope: patched body is
-                    # ``patched\nappended\n`` = 16 bytes.
+                    # ``patched\nappended\n`` = 17 bytes (UTF-8).
                     assert (patched.structured_content or {}).get(
                         "size_bytes"
-                    ) == 16
+                    ) == 17
 
                     after_patch = await session.call_tool(
                         "read_page", {"name": MARKER}

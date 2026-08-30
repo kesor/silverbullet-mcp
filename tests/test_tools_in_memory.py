@@ -8,12 +8,12 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All twelve tools — the eleven ``/.fs``-backed tools
-  (``read_page``, ``page_exists``, ``write_page``,
-  ``delete_page``, ``append_to_page``, ``patch_page_lines``,
-  ``patch_page_replace``, ``move_page``, ``list_pages``,
-  ``diff_pages``, ``check_task``) plus the always-on bullet
-  enumerator (``list_tasks``) — on the 200 happy path;
+- All fourteen tools — the thirteen ``/.fs``-backed tools
+  (``read_page``, ``page_exists``, ``write_page``, ``create_page``,
+  ``delete_page``, ``append_to_page``, ``prepend_to_page``,
+  ``patch_page_lines``, ``patch_page_replace``, ``move_page``,
+  ``list_pages``, ``diff_pages``, ``check_task``) plus the always-on
+  bullet enumerator (``list_tasks``) — on the 200 happy path;
   ``write_page`` / ``delete_page`` / ``append_to_page`` /
   ``patch_page_lines`` / ``patch_page_replace`` / ``move_page``
   / ``check_task`` return the T23 write acknowledgement, the
@@ -35,8 +35,8 @@ Coverage:
   exact ToolError message: 404 → "page not found: <name>"; 412 →
   "precondition failed; check if_match/if_none_match"; 413 →
   "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
-  timeout → "silverbullet request timed out". Nine of the twelve
-  tools share the translation through :func:`server._translate_sb_errors`;
+  timeout → "silverbullet request timed out". Eleven of the
+  fourteen tools share the translation through :func:`server._translate_sb_errors`;
   ``page_exists`` (T25) translates 5xx and timeout inline because
   404 is the *answer* (not an error) for the existence question
   — a different exception-translation contract on the ninth tool.
@@ -6691,3 +6691,130 @@ def test_t36_check_body_size_uses_utf8_byte_count_not_codepoint_count() -> None:
     with pytest.raises(ToolError) as excinfo:
         _check_body_size(over)
     assert "body too large" in str(excinfo.value)
+
+
+# --- v1.3 build-map invariants ----------------------------------------
+# These tests pin the v1.3 destination against docstring drift. The
+# ``MCPServer.instructions`` string is what the MCP client sees on
+# ``initialize`` — a regression that drops a v1.3 tool name from the
+# instructions while leaving the tool registered would be a
+# silent-experience regression the agent would notice ("the tool
+# is in the schema but not mentioned in the description? weird").
+# Locking both shapes in a test prevents the drift.
+
+
+@pytest.mark.asyncio
+async def test_v1_3_instructions_advertise_fourteen_always_on_tools() -> None:
+    """``instructions`` lists the 14 v1.3 always-on tools by name.
+
+    v1.3 destination: the bridge exposes 14 ``/.fs``-backed +
+    bullet-primitive tools (``read_page`` / ``page_exists`` /
+    ``write_page`` / ``create_page`` / ``delete_page`` /
+    ``append_to_page`` / ``prepend_to_page`` /
+    ``patch_page_lines`` / ``patch_page_replace`` / ``move_page``
+    / ``list_pages`` / ``diff_pages`` / ``check_task`` /
+    ``list_tasks``) plus one resource template. A regression
+    that drops a name from the instructions text (without
+    dropping the corresponding tool) surfaces here as a
+    failed ``assertIn``.
+
+    The in-memory ``Client(mcp)`` doesn't expose ``initialize()``,
+    so we read the ``MCPServer.instructions`` property directly —
+    that's the same string the MCP SDK would send on the wire
+    during a real ``initialize`` handshake (T5 of the prior map
+    pins that round-trip).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    text = server.instructions
+    assert text is not None
+    for tool_name in (
+        "read_page",
+        "page_exists",
+        "write_page",
+        "create_page",
+        "delete_page",
+        "append_to_page",
+        "prepend_to_page",
+        "patch_page_lines",
+        "patch_page_replace",
+        "move_page",
+        "list_pages",
+        "diff_pages",
+        "check_task",
+        "list_tasks",
+    ):
+        assert tool_name in text, (
+            f"v1.3 instructions missing tool name {tool_name!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_v1_3_instructions_advertise_six_journal_tools() -> None:
+    """``instructions`` lists all 6 journal tools (T10–T12, T34, T35).
+
+    v1.3 destination: the journal surface is 6 tools
+    (``journal_histogram`` / ``tag_summary`` / ``recent_pages``
+    / ``pages_touching_topic`` / ``search_pages`` /
+    ``find_backlinks``). A regression that drops ``find_backlinks``
+    from the instructions (without dropping the tool) surfaces
+    here.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    text = server.instructions
+    assert text is not None
+    for journal_tool in (
+        "journal_histogram",
+        "tag_summary",
+        "recent_pages",
+        "pages_touching_topic",
+        "search_pages",
+        "find_backlinks",
+    ):
+        assert journal_tool in text, (
+            f"v1.3 instructions missing journal tool {journal_tool!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_v1_3_list_tools_returns_fourteen_always_on_tools() -> None:
+    """``list_tools`` returns the 14 v1.3 always-on tools by name.
+
+    Mirror of the ``instructions`` test, but against the live
+    tool inventory. A regression that removes a v1.3 tool
+    from the registration (without dropping it from the
+    ``instructions`` text) surfaces here — the agent would
+    see a tool promised in the instructions but absent from
+    the schema.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        names = {t.name for t in tools.tools}
+        expected = {
+            "read_page",
+            "page_exists",
+            "write_page",
+            "create_page",
+            "delete_page",
+            "append_to_page",
+            "prepend_to_page",
+            "patch_page_lines",
+            "patch_page_replace",
+            "move_page",
+            "list_pages",
+            "diff_pages",
+            "check_task",
+            "list_tasks",
+        }
+        assert expected.issubset(names), (
+            f"v1.3 missing tools: {expected - names}"
+        )

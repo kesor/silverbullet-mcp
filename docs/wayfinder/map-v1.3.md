@@ -4,8 +4,12 @@
 Local-markdown tracker, like the prior build maps (`map.md` for v1,
 `map-v1.1.md`, `map-v1.2.md`). The v1.2 destination was "agent-facing
 QOL + bullet primitives" and reached it when T30 closed — the bridge
-now exposes twelve tools plus one resource template (see
-`docs/wayfinder/map-v1.2.md` ## Status). This map is the next effort.
+then exposed twelve tools plus one resource template (see
+`docs/wayfinder/map-v1.2.md` ## Status). v1.3 builds on that with
+T31–T36 (six new tickets T32–T36, plus the T31/T31a/T31b concurrency
+chain that surfaced during T31's verification) and now exposes
+fourteen tools plus one resource template. This map is the next
+effort.
 
 Standing preferences from the prior maps continue to apply unless
 overridden here:
@@ -1516,21 +1520,21 @@ can't yet phrase precisely -->
   and posts results somewhere visible. Pick one and
   chart it.
 - **`patch_page_lines` byte-count drift** (drive-by from T31,
-  2026-08-30). The T7 live test
-  `test_live_sb_write_read_list_and_precondition` asserts
+  2026-08-30; **fixed**). The T7 live test
+  `test_live_sb_write_read_list_and_precondition` asserted
   `patched.size_bytes == 16` at the `patch_page_lines`
   block (line 1 of `hello from T7 live e2e\nappended\n`
   replaced with `patched\n`, expecting `patched\nappended\n`
   = 16 bytes). The actual response on this SB build returns
-  17. Predates T31 by some unknown number of map revisions.
-  Either the live SB started encoding `last_modified` /
-  `size` headers differently, or the test was authored
-  against a different SB version. Specifiable: dig into
-  the live SB PUT response for `X-Content-Length` and
-  figure out where the extra byte is coming from; then
-  either fix the assertion to match reality or fix the
-  bridge to return what the test expected. Not in T31's
-  scope.
+  17. Root cause: the assertion was mis-counted (``p``,
+  ``a``, ``t``, ``c``, ``h``, ``e``, ``d``, ``\n``, ``a``,
+  ``p``, ``p``, ``e``, ``n``, ``d``, ``e``, ``d``, ``\n`` =
+  17 bytes, not 16). The bridge returns the correct count;
+  the test was just off by one. Updated the assertion to
+  `== 17` and the inline comment to "``patched\nappended\n``
+  = 17 bytes (UTF-8)". Predates T31 by some unknown
+  number of map revisions; flagged for the v1.4
+  test-hygiene follow-up above.
 - **`read_pages(names[])` / `write_pages(updates[])` batched
   primitives** — specifiable when an agent's actual workflow pays
   for N round trips and a measured client (Grok on the web)

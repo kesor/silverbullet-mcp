@@ -43,15 +43,15 @@ state="done")`` reads the page, finds the unique bullet whose
 wikilink target equals ``ref``, flips the marker, and writes
 the body back via ``write_page(if_match=<read_etag>)`` so a
 concurrent edit fails 412 rather than silently clobbering the
-flip). The bridge registers eleven ``/.fs``-backed tools
+flip). The bridge registers thirteen ``/.fs``-backed tools
 (``read_page`` / ``page_exists`` / ``write_page`` /
-``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
-``patch_page_replace`` / ``move_page`` / ``list_pages`` /
-``diff_pages`` / ``check_task``) plus one bullet enumerator
-(``list_tasks``) plus one resource template
-(``silverbullet://page/{name}``). Each tool closes over a single
-:class:`SBClient` opened at boot; SB's typed exceptions translate
-to :mcp_exc:`ToolError` with the exact wording from
+``create_page`` / ``delete_page`` / ``append_to_page`` /
+``prepend_to_page`` / ``patch_page_lines`` / ``patch_page_replace`` /
+``move_page`` / ``list_pages`` / ``diff_pages`` / ``check_task``)
+plus one bullet enumerator (``list_tasks``) plus one resource
+template (``silverbullet://page/{name}``). Each tool closes over a
+single :class:`SBClient` opened at boot; SB's typed exceptions
+translate to :mcp_exc:`ToolError` with the exact wording from
 ``docs/design.md`` § Tools § Status-code mapping, all funneled
 through :func:`_translate_sb_errors`.
 
@@ -60,32 +60,32 @@ T10 of the v1.1 map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the eleven ``/.fs``-backed tools plus one bullet
-primitive (``list_tasks``) — twelve total —
+registers only the thirteen ``/.fs``-backed tools plus one bullet
+primitive (``list_tasks``) — fourteen total —
 and the resource template. See :mod:`mcp_silverbullet.journal` for
 the gate logic.
 
 T34 of v1.3 adds ``search_pages`` to the journal surface — a
 bounded wrapper over T12's machinery with a ``limit`` knob
-(default 20, hard cap 100). The gate behaviour is unchanged
-(off when the gate is off, on with the rest of the journal
-tools when it's on); the tool itself is the fifth journal
-entry alongside the existing four (T10–T12).
-
-T34 of v1.3 adds ``search_pages`` to the journal surface — a
-bounded wrapper over T12's machinery with a ``limit`` knob
-(default 20, hard cap 100). The gate behaviour is unchanged
-(off when the gate is off, on with the rest of the journal
-tools when it's on); the tool itself is a thirteenth ``/.fs``
-+ journal entry alongside the existing twelve.
+(default 20, hard cap 100). T35 adds ``find_backlinks`` — a
+wikilink-target backlink scan over the SB space directory.
+T32 adds ``create_page`` — a refuse-to-overwrite create tool
+distinct from ``write_page``'s overwrite-or-create default. T33
+adds ``prepend_to_page`` — a top-of-body insert with YAML
+frontmatter awareness. Together these bring the bridge to fourteen
+``/.fs``-backed + bullet-primitive tools, plus the resource
+template, and the journal surface to six tools
+(T10–T12, T34, T35). The v1.2 build map at
+``docs/wayfinder/map-v1.2.md` tracks the agent-facing QOL tickets
+(T23/T24/T25/T26/T27/T28/T29/T30 done; destination reached); the
+v1.3 build map at ``docs/wayfinder/map-v1.3.md` tracks the
+discovery + edit-hygiene tickets (T31/T31a/T31b/T32/T33/T34/T35/
+T36 done; destination reached).
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
-for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
-v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24/T25/T26/T27/T28/T29/T30 done;
-destination reached).
+for the T3/T4/T10/T18/T19/T20/T21 decisions this implements.
 """
 
 from __future__ import annotations
@@ -822,13 +822,15 @@ def build_mcp(
     journal
         Already-resolved journal gate config. ``None`` means the gate
         is off (no journal tools registered). When the gate is on,
-        the bridge registers the five journal-surface tools
+        the bridge registers the six journal-surface tools
         (``journal_histogram`` / ``tag_summary`` / ``recent_pages``
-        / ``pages_touching_topic`` / ``search_pages`` — the last
-        is T34, a bounded wrapper over T12 with a ``limit`` knob)
-        in addition to the twelve ``/.fs``-backed + bullet-primitive
-        tools (``read_page`` / ``page_exists`` / ``write_page`` /
-        ``delete_page`` / ``append_to_page`` /
+        / ``pages_touching_topic`` / ``search_pages`` / ``find_backlinks``
+        — ``search_pages`` is T34, a bounded wrapper over T12 with
+        a ``limit`` knob; ``find_backlinks`` is T35, a wikilink-
+        target backlink scan) in addition to the fourteen
+        ``/.fs``-backed + bullet-primitive tools (``read_page`` /
+        ``page_exists`` / ``write_page`` / ``create_page`` /
+        ``delete_page`` / ``append_to_page`` / ``prepend_to_page`` /
         ``patch_page_lines`` / ``patch_page_replace`` /
         ``move_page`` / ``list_pages`` / ``diff_pages`` /
         ``check_task`` / ``list_tasks``) and the resource template;
@@ -929,11 +931,11 @@ def register_tools(
     hydrate_etags: bool = False,
     journal_root: Path | None = None,
 ) -> None:
-    """Attach the eleven ``/.fs``-backed tools, the bullet primitive (``list_tasks``), and one resource template to ``mcp``.
+    """Attach the thirteen ``/.fs``-backed tools, the bullet primitive (``list_tasks``), and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
-    are decorators that take the function; nine of the twelve tool
+    are decorators that take the function; eleven of the fourteen tool
     handlers wrap their ``sb_client`` call in
     :func:`_translate_sb_errors`, which maps SB exceptions to
     :exc:`ToolError` per the design doc's status-code mapping.

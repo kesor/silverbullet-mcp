@@ -15,8 +15,10 @@ Subjective notes from that survey (judgment calls, predictions, what I considere
 ## What it exposes
 
 Fourteen tools and one resource template (v1.3 closed on
-2026-08-30 — all six chartered tickets shipped; see
-[§ v1.3 roadmap](#v13-roadmap)); the count below is the
+2026-08-30 — all six chartered tickets shipped, plus the
+T31a + T31b follow-ups that surfaced from T31's negative
+resolution; see [§ v1.3 roadmap](#v13-roadmap)); the count below
+is the
 always-on `/.fs`-backed + bullet-primitive surface, the
 optional journal surface is listed under
 [§ Optional: journal surface](#optional-journal-surface-t10t12-t34-t35)
@@ -92,7 +94,7 @@ second v1.3 discovery tool alongside T34). **T36 shipped
   2026-08-30**. Substring content search delegating to the
   existing journal machinery; journal-gated like
   `list_tasks`'s space-walk form. **Unaffected by T31.**
-  See [§ Optional: journal surface](#optional-journal-surface-t10t12-t34)
+  See [§ Optional: journal surface](#optional-journal-surface-t10t12-t34-t35)
   for the full description.
 - **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
   wikilink-target backlinks for the rename-pre-flight workflow;

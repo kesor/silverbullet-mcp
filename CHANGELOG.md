@@ -11,11 +11,12 @@ tickets; this file records what's already shipped.
 ## [Unreleased] — v1.3 (agent-grade discovery + edit hygiene)
 
 Build map: [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
-**Status: T31a / T31b / T32 / T33 / T34 / T35 / T36 shipped
-(2026-08-30); v1.3 destination reached** — T31 closed
-**negatively** on
-2026-08-30, prompting the T31a + T31b follow-ups that are
-now landed. T33 / T36 are unblocked.
+**Status: T31 / T31a / T31b / T32 / T33 / T34 / T35 / T36
+shipped (2026-08-30); v1.3 destination reached** — T31 closed
+**negatively** on 2026-08-30, prompting the T31a + T31b follow-ups
+that are now landed. All eight v1.3 tickets are closed; the
+bridge exposes fourteen tools plus one resource template (the
+v1.2 baseline of twelve plus `create_page` and `prepend_to_page`).
 
 The live SB on this dev box (`127.0.0.1:63000`, the build v1
 T6 / v1.1 T22 / v1.2 T7 / T30 all ran against) does NOT
