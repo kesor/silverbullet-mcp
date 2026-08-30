@@ -26,11 +26,14 @@ The artefact is **this repo, runnable end-to-end**. No new design
 decisions to lock — those were settled in the prior map; the input here
 is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
-### 🏁 Status: destination reached.
+### 🏁 Status: destination shifted.
 
-All eight tickets resolved (T1–T8). The bridge runs end-to-end:
-code, flake, tests, README, and a live-SB end-to-end test (env-gated)
-all in place.
+T1–T8 resolved (a runnable bridge end-to-end). The user asked
+for a `search_pages` tool (by name and/or by content), which is
+out of v1 scope per T4 of the prior map; ticket T9 added to
+settle the trade-offs. The new destination is **the bridge +
+search_pages, with the implementation picked by the operator
+on T9**.
 
 ## Notes
 
@@ -360,6 +363,64 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > `last_modified`-honors / `created`-ignores split. New test
 > `test_write_page_x_content_length_matches_utf8_byte_count` guards
 > the codepoint-vs-byte bug class. 41 tests pass + 1 skipped.
+
+---
+
+### T9. Add a `search_pages` tool (client-side filter vs Space Lua)
+
+> **Labels**: `wayfinder:grilling`
+> **Type**: HITL (operator picks the implementation)
+> **Status**: open
+> **Question**: How does the bridge expose search — by name and/or by
+> content — given the prior map ruled out both naive approaches?
+> **Context**: The bridge surface is locked at T4 of the prior map to
+> three tools (`read_page` / `write_page` / `list_pages`) plus one
+> resource template. `list_pages` only does client-side prefix
+> filtering over whatever `GET /.fs` returns — it doesn't search by
+> content. The design doc § Tools § "What we are not doing (v1)"
+> explicitly rules out two paths to a real search tool:
+>
+> - **Client-side filter** over `list_pages` requires `list_pages` to
+>   work, which it doesn't on every SB version. On this dev box,
+>   `GET /.fs` 307s to `/` (T7 resolution; still open as the
+>   "Not yet specified" item about the actual list-directory
+>   endpoint for this SB version). When the list endpoint is found
+>   or fixed, client-side search becomes: read every name, read
+>   every body (or stream them), grep, return hits. Cheap on a small
+>   space; quadratic on a large one.
+> - **Server-side search via Space Lua** means hitting `/.shell`
+>   from the bridge with a query that runs `space.readFile` +
+>   string-match inside SB's Lua runtime. Fast even on big spaces;
+>   indexes if SB builds them. But the prior map called `/.shell`
+>   "a rich and dangerous axis" and locked it out for v1.
+>
+> Two open design questions to settle on a grilling round before
+> implementation:
+>
+> 1. **Client-side vs Space Lua.** Pick one. Client-side is what the
+>    prior map's `search_pages` ban was actually protecting against
+>    (it requires a working list endpoint), so unlocking it is a
+>    narrower scope change than opening Space Lua. Space Lua opens
+>    arbitrary SB-side scripting surface and re-decides T4 of the
+>    prior map.
+> 2. **What does a hit look like?** `name` + line/offset range?
+>    `name` + matched snippet (Markdown-shaped)? Just `name`? The
+>    shape drives how Grok consumes the result and whether the
+>    bridge can use the resource-template pattern (`silverbullet://page/{name}`)
+>    as the natural follow-on read.
+>
+> **Resolution will land on**: a new `@mcp.tool()` named
+> `search_pages`, with one parameter (`query: str`, plain string,
+> case-insensitive substring) and one return shape (decided by the
+> operator). Implementation either in `sb_client.py` (client-side,
+> blocking until the list endpoint is fixed) or as a new module
+> that hits `/.shell` (Space Lua, requires re-deciding T4 of the
+> prior map). Layer-1 + Layer-2 tests on the chosen path.
+> **Done when**: the operator has chosen (1) and (2); the chosen
+> shape is implementable end-to-end; tests cover the success +
+> empty-result + 404-from-SB paths.
+> **Blocks on**: (none — destination milestone shifted by operator
+> request).
 
 ## Not yet specified
 
