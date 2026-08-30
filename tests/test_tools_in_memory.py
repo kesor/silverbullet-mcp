@@ -27,11 +27,14 @@ Coverage:
   exact ToolError message: 404 → "page not found: <name>"; 412 →
   "precondition failed; check if_match/if_none_match"; 413 →
   "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
-  timeout → "silverbullet request timed out". The eight tools share
-  the translation through :func:`server._translate_sb_errors`;
+  timeout → "silverbullet request timed out". Eight of the ten
+  tools share the translation through :func:`server._translate_sb_errors`;
   ``page_exists`` (T25) translates 5xx and timeout inline because
   404 is the *answer* (not an error) for the existence question
   — a different exception-translation contract on the ninth tool.
+  ``diff_pages`` (T27) threads two ``_translate_sb_errors`` blocks
+  (one per read, keyed on the read's target page name) so a 404 on
+  either side surfaces with the right page's name in the wording.
 - The resource template returns the same body for the happy path and
   surfaces ``ToolError`` for a missing page (v1 keeps one error shape
   for both surfaces; T4 carry-forward note in the map).

@@ -558,18 +558,29 @@ def register_tools(
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
-    are decorators that take the function; each tool handler wraps
-    its ``sb_client`` call in :func:`_translate_sb_errors`, which
-    maps SB exceptions to :exc:`ToolError` per the design doc's
-    status-code mapping. ``move_page`` (T22) is the exception:
-    the post-write-delete sequence surfaces a partial-failure
-    ``ToolError`` directly from the handler so the caller can see
-    "moved body to {new} but failed to delete {old}; both now
-    exist" rather than the unified 412 wording — the source and
-    destination are distinct pages and the caller needs to know
-    which side refused. The resource template uses the SDK's
-    separate ``ResourceError`` shapes (JSON-RPC protocol errors vs
-    tool-handler ``is_error=True``) and keeps its own translation.
+    are decorators that take the function; eight of the ten tool
+    handlers wrap their ``sb_client`` call in
+    :func:`_translate_sb_errors`, which maps SB exceptions to
+    :exc:`ToolError` per the design doc's status-code mapping.
+    ``move_page`` (T22) is one exception: the post-write-delete
+    sequence surfaces a partial-failure ``ToolError`` directly
+    from the handler so the caller can see "moved body to {new}
+    but failed to delete {old}; both now exist" rather than the
+    unified 412 wording — the source and destination are distinct
+    pages and the caller needs to know which side refused.
+    ``page_exists`` (T25) is the other exception: it doesn't go
+    through ``_translate_sb_errors`` because 404 is the *answer*
+    (not an error) for the existence question, so the handler
+    catches the non-404 SB exceptions inline and surfaces them
+    with the same wording as the read tool. ``diff_pages`` (T27)
+    is the compound case: it has *two* ``_translate_sb_errors``
+    blocks (one per read), each keyed on whichever page that
+    read targeted (``name`` for the first, ``other_name`` for
+    the second), so a 404 on either side surfaces as
+    ``ToolError("page not found: <that page's name>")``. The
+    resource template uses the SDK's separate ``ResourceError``
+    shapes (JSON-RPC protocol errors vs tool-handler
+    ``is_error=True``) and keeps its own translation.
 
     ``hydrate_etags`` is the v1.2 T28 opt-in: when ``True``, the
     ``list_pages`` tool issues one GET per row (N+1) to hydrate
