@@ -119,9 +119,10 @@ gated journal surface** (T10–T13).
 - [T3. `sb_client.py` (httpx adapter for /.fs)](#t3-sb_clientpy-httpx-adapter-for-fs) (commit `de944`): outbound bridge half — `SBClient` with `read_page`/`write_page`/`list_pages` against SB's `/.fs/...`, typed exceptions (`PageNotFound`, `PreconditionFailed`, `BodyTooLarge`, `ServerError`) per the § Tools status-code table, `FileMeta` dataclass (name + etag only), `write_page` PUT carries `X-Source: external` + `X-Permission: rw` + explicit `Content-Type: text/markdown` (httpx2 doesn't auto-set it for `content=str`); `If-Match` / `If-None-Match: *` both wired, `if_match` wins if both are passed. 16 Layer-3 tests under `httpx.MockTransport` (no real SB), all green in 0.07s; T1 smoke unbroken. Write-envelope fog (T8) deliberately not resolved here — `write_page` only sends the two headers the design doc requires, the real-write attempt is what decides the rest.
 - [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
 - [T5. HTTP integration tests (auth + discovery doc)](#t5-http-integration-tests-auth--discovery-doc) (commit `53ae8`): 5 Layer-2 tests in `tests/test_http_auth.py` exercising the bridge as a real ASGI app via `httpx.ASGITransport(app=streamable_http_app(host="bridge.test"))` + `app.router.lifespan_context(app)` (drives the SDK's `StreamableHTTPSessionManager.run()` since `ASGITransport` doesn't speak Starlette's lifespan protocol). Covers: POST `/mcp` no-token → 401 + `WWW-Authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://bridge.test/.well-known/oauth-protected-resource/mcp"`; POST `/mcp` wrong-token → identical shape (no header-vs-token probe leak); GET `/.well-known/oauth-protected-resource/mcp` (no auth) → 200 + RFC 9728 doc with `resource=<resource_url>`, `authorization_servers=[<resource_url>]` (v1 has no separate authz server), `bearer_methods_supported=["header"]`, `scopes_supported` omitted (`AuthSettings.required_scopes=None`, stripped by `PydanticJSONResponse.render`); POST `/mcp` with auth but `Accept: text/plain` → 406 ("Not Acceptable: Client must accept both application/json and text/event-stream"); end-to-end `streamable_http_client` + `ClientSession` initialize → list_tools (`['list_pages', 'read_page', 'write_page']`) → `call_tool read_page` roundtrip against a mocked SB. ASGI transport vs the ticket's literal "uvicorn on a free port": same wire path (every middleware, header, status code, body shape) minus the TCP stack — fast, deterministic, no port flake. The real-port path is exercised at T7 against the live SilverBullet. 5 new tests in 0.94s; 36 tests total green; `nix flake check` green.
-- [T6. Operator smoke run + README](#t6-operator-smoke-run--readme): `main.py` boots `SBClient` + `build_mcp` + `run_streamable_http_async`; `flake.nix` exposes `apps.mcp-silverbullet`; README documents boot order. Live smoke against SB `127.0.0.1:63000` (no SB auth): write_page + read_page roundtrip OK; list_pages → ToolError `silverbullet error: 307` because `GET /.fs` redirects to `/` on this SB. `mcp` CLI extra not installed; walkthrough used `ClientSession` + `streamable_http_client` instead of `mcp dev`.
-- [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated) (commit `7025d`): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env. File was untracked at the time T7 was marked resolved on the map; commit `7025d` retroactively stages the file with no changes.
+- [T6. Operator smoke run + README](#t6-operator-smoke-run--readme): `main.py` boots `SBClient` + `build_mcp` + `run_streamable_http_async`; `flake.nix` exposes `apps.mcp-silverbullet`; README documents boot order. Live smoke against SB `127.0.0.1:63000` (no SB auth): write_page + read_page roundtrip OK; list_pages → ToolError `silverbullet error: 307` because `GET /.fs` redirects to `/` on this SB. `mcp` CLI extra not installed; walkthrough used `ClientSession` + `streamable_http_client` instead of `mcp dev`. *(T10 fix: `sb_client.list_pages` now sends `X-Sync-Mode: 1` so this no longer 307s on real SB.)*
+- [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated) (commit `7025d`): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env. File was untracked at the time T7 was marked resolved on the map; commit `7025d` retroactively stages the file with no changes. *(T10 promoted the `X-Sync-Mode` fix and updated this test to assert the marker appears in the structured payload instead of treating the 307 as expected behavior.)*
 - [T8. Write-envelope fog (X-* headers on PUT)](#t8-write-envelope-fog-x--headers-on-put) (commit `9275c`): full design-doc envelope — `write_page` sends every X-* header `docs/design.md` § SilverBullet client contract calls out for PUT, on top of the static `X-Source: external` + `X-Permission: rw` + `Content-Type: text/markdown`. New per-call fields: `X-Created = X-Last-Modified = int(time.time_ns() / 1_000_000)` (epoch ms, the unit SB's `header_i64` parses); `X-Content-Length = len(content.encode("utf-8"))` (UTF-8 byte count, matching SB's `meta.size`). Static fields stay in `_WRITE_HEADERS`; new `_epoch_ms()` helper isolates the timestamp computation. Operator chose this path on the basis that the design doc calls for the full envelope and SB's PUT handler reads (but mostly ignores) these from the request — `server-common/src/space/disk.rs::write_file` honors `meta.last_modified > 0` (stamps file mtime) but ignores `meta.created / meta.size / meta.perm`. Live PUT against the dev-box SB on `127.0.0.1:63000` succeeded with the new envelope; response carried `X-Last-Modified` matching our value (file mtime honored) and `X-Created` a few ms later (file btime, since the disk impl ignores request `created`). Bridge doesn't observe either side. 41 passed + 1 skipped.
+- [T10. Journal-tools config gate (foundation)](#t10-journal-tools-config-gate-foundation) (commit `46d81`): new module `src/mcp_silverbullet/journal.py` (gate + four skeleton tools); `Settings.journal` resolved by `load_settings`; `build_mcp(..., journal=...)` calls `register_journal_tools` only when `JournalConfig.enabled`. Three-gate check (truthy opt-in / non-empty path / readable) → INFO log on open, WARN on requested-but-unusable, silent on off. Skeleton tools raise `ToolError("journal tool not implemented yet; landing in T11/T12")` so a stray call surfaces loudly. Drive-by: `sb_client.list_pages` now sends `X-Sync-Mode: 1` so SB 2.x's `handle_fs_list` returns JSON instead of 307-redirecting to the SPA (prior map's T3 mock-only coverage missed it; T6 smoke parked it as "effectively moot" once the journal surface replaced the original search tool). New `tests/test_journal_gate.py` (11 cases). 54 passed (with live env) / 53 passed + 1 skipped (without); `nix flake check` green.
 
 ## Tickets
 
@@ -414,7 +415,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: open
+> **Assignee**: pi (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved (commit `46d81`)
 > **Question**: How does the bridge decide whether to register the
 > journal tools?
 > **Context**: The journal surface (T11, T12) reads the SB space
@@ -449,6 +451,44 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > tools *on* and `space_path` readable (skeleton journal tools
 > registered), the bridge boots cleanly with the tools *on* but
 > `space_path` not readable (warning + tools not registered).
+> **Resolution**: new module `src/mcp_silverbullet/journal.py`
+> exposes `resolve_journal_config(environ) -> JournalConfig(enabled,
+> space_path)` + `register_journal_tools(mcp, config)`. Three-gate
+> check at resolve time: (1) `MCP_SILVERBULLET_JOURNAL_TOOLS`
+> truthy (`1`/`true`/`yes`/`on`); (2)
+> `MCP_SILVERBULLET_SPACE_PATH` non-empty; (3) `os.access(path, os.R_OK)`.
+> Failure of any emits a single INFO/WARN line and the gate closes.
+> `Settings.journal` is resolved by `load_settings` and threaded
+> into `build_mcp(..., journal=...)`; `build_mcp` calls
+> `register_journal_tools` only when the gate is on. Four skeleton
+> tools (`journal_histogram`, `tag_summary`, `recent_pages`,
+> `pages_touching_topic`) raise `ToolError("journal tool not
+> implemented yet; landing in T11/T12")` on call; T11/T12 replace
+> the bodies. `logging.basicConfig(level=INFO, ...)` at the top of
+> `serve` so the gate-open log reaches the operator's terminal
+> (without it the root logger discards INFO and the line is
+> invisible — discovered by the live smoke, not the unit tests).
+> New tests `tests/test_journal_gate.py` (11 cases) cover every
+> gate branch (off, on-but-unreadable, on), `build_mcp` integration
+> per branch, skeleton tool error shape, and the disabled-config
+> no-op. Layer-1 + Layer-2 + T7 live e2e all green (54 pass + 0
+> skip with live SB env, 53 pass + 1 skip without); `nix flake
+> check` green.
+> **Drive-by bug fix**: `sb_client.list_pages` now sends
+> `X-Sync-Mode: 1` on `GET /.fs`. SB's
+> `server/src/handlers/fs.rs::handle_fs_list` only returns JSON
+> when this header is set; without it, SB 307-redirects to the SPA
+> UI — the bridge saw a 307 and surfaced
+> `ToolError('silverbullet error: 307')` against every real SB.
+> T3 mock-only coverage never caught it (respx doesn't run the
+> handler logic); T6 recorded the 307 in the smoke run and parked
+> the fix in the map's fog as "effectively moot" once the journal
+> surface replaced the original search tool. Promoting the fix in
+> T10 because the existing `/.fs`-backed `list_pages` tool still
+> ships in v1 and deserved the same fix; new test
+> `test_list_pages_sends_x_sync_mode` guards the header. T7 live
+> e2e now asserts the marker is in the structured payload instead
+> of treating the 307 as expected behavior.
 
 ---
 
@@ -459,12 +499,14 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Status**: open
 > **Question**: What three pure-Python read tools does the
 > journal surface expose?
-> **Context**: With T10's gate in place, expose three tools that
-> are *purely* filesystem reads — no subprocess, no `rg`, no
-> external deps. All three accept an optional `prefix: str = ""`
-> parameter (validated: no `..`, no leading `/`, treated as a
-> path-segment substring against file names; if non-empty, restricts
-> the inventory to files whose relative path contains the segment).
+> **Context**: With T10's gate in place and the four skeleton
+> tools registered, T11 replaces three of them with real
+> implementations that are *purely* filesystem reads — no
+> subprocess, no `rg`, no external deps. All three accept an
+> optional `prefix: str = ""` parameter (validated: no `..`, no
+> leading `/`, treated as a path-segment substring against file
+> names; if non-empty, restricts the inventory to files whose
+> relative path contains the segment).
 >
 > - **`journal_histogram(prefix: str = "") -> dict[str, int]`** —
 >   walk `*.md` under `space_path` (filtered by `prefix`),
@@ -484,17 +526,21 @@ file; "blocking" is rendered by ticket ordering and an explicit
 >   plus `mtime_iso`.
 >
 > **Files when resolved**: `src/mcp_silverbullet/journal.py`
-> (the implementations), `src/mcp_silverbullet/server.py` (the
-> `@mcp.tool()` registrations, gated by `journal_tools_enabled`).
-> **Tests when resolved**: Layer-1 tests against a tmpdir
-> fixture populated with synthetic `*.md` files (one with
-> frontmatter, one without; one matching `^\d{4}-\d{2}-\d{2}`,
-> one not). Asserts on the three return shapes for empty
-> space, prefix-restricted space, mixed-content space.
+> (replacing the three T10 skeleton bodies), no other module
+> changes. **Tests when resolved**: Layer-1 tests against a
+> tmpdir fixture populated with synthetic `*.md` files (one
+> with frontmatter, one without; one matching
+> `^\d{4}-\d{2}-\d{2}`, one not). Asserts on the three return
+> shapes for empty space, prefix-restricted space,
+> mixed-content space. Skeleton-error tests in
+> `test_journal_gate.py` get dropped (or inverted: assert
+> real behavior, not placeholder errors).
+> **Blocks on**: T10.
 > **Unblocks**: T13.
 > **Done when**: the three tools round-trip a tmpdir fixture in
-> Layer-1; the bridge stays silent in `tools/list` when the
-> gate is off; tool descriptions match what the agent sees.
+> Layer-1; the four `tool … not implemented yet` errors are
+> gone for these three; tool descriptions match what the agent
+> sees.
 
 ---
 
@@ -505,16 +551,17 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Status**: open
 > **Question**: How does the bridge expose name+content search
 > without `rg` as a hard dep?
-> **Context**: This is the implementation that resolves the
-> original T9 search-by-name-and-content ask. Two-step search:
-> (1) walk `*.md` files under `space_path` (optionally filtered
-> by `prefix`); (2) for each file, check the basename (case-
+> **Context**: This replaces the T10 skeleton body for the
+> fourth journal tool and resolves the original T9
+> search-by-name-and-content ask. Two-step search: (1) walk
+> `*.md` files under `space_path` (optionally filtered by
+> `prefix`); (2) for each file, check the basename (case-
 > insensitive substring) AND the body (case-insensitive
 > substring) for the query. Returns
 > `{name, match: "name"|"content"|"both", snippet: str}[]`,
 > where `snippet` is the first ~80-char Markdown-shaped window
-> around the content match (or a short body excerpt for name-only
-> matches).
+> around the content match (or a short body excerpt for
+> name-only matches).
 >
 > Two implementation strategies: (a) `rg` if available on PATH
 > (`shutil.which("rg") is not None`), called via subprocess with
@@ -523,19 +570,21 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > fallback otherwise. Either path returns the same shape.
 >
 > **Files when resolved**: `src/mcp_silverbullet/journal.py`
-> (the implementation), `src/mcp_silverbullet/server.py` (the
-> `@mcp.tool()` registration). New dep: none on Python side
-> (`rg` is optional). The flake env should *optionally* include
-> `ripgrep` so the dev shell has it; runtime doesn't depend on it.
-> **Tests when resolved**: Layer-1 tests with the Python fallback
-> path (force `rg` unavailable in fixture). Layer-2 test against
-> the live `/var/lib/silverbullet/` (env-gated, like the T7
-> live-SB test).
+> (replacing the T10 skeleton body for `pages_touching_topic`).
+> New dep: none on Python side (`rg` is optional). The flake
+> env should *optionally* include `ripgrep` so the dev shell
+> has it; runtime doesn't depend on it.
+> **Tests when resolved**: Layer-1 tests with the Python
+> fallback path (force `rg` unavailable in fixture). Layer-2
+> test against the live `/var/lib/silverbullet/` (env-gated,
+> like the T7 live-SB test).
+> **Blocks on**: T10.
 > **Unblocks**: T13.
 > **Done when**: the inverted-style `query="DAILY"` finds every
 > `Daily/*.md` (name match) plus any page whose body mentions
-> "DAILY"; the empty-result case returns `[]`; the malformed-
-> frontmatter case in `tag_summary` doesn't crash.
+> "DAILY"; the empty-result case returns `[]`; the
+> `tool … not implemented yet` skeleton error is gone for
+> this tool.
 
 ---
 
@@ -544,6 +593,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
 > **Status**: open
+> **Blocks on**: T11, T12.
 > **Question**: How do we exercise the journal tools against
 > the live space at `/var/lib/silverbullet/`?
 > **Context**: T7's env-gated live-SB test exercises the
@@ -597,14 +647,21 @@ file; "blocking" is rendered by ticket ordering and an explicit
   deployments. T6 wired `MCP_SILVERBULLET_ALLOWED_HOSTS`; remaining
   fog is allowed_origins / disabling DNS-rebinding entirely.
 - `GET /.fs` (no path) on the live SilverBullet (`127.0.0.1:63000`)
-  returns **307 to `/`**, so `list_pages` cannot use the design-doc
-  list URL as written. `GET`/`PUT`/`DELETE /.fs/{name}` work.
-  Probed 11 candidate list endpoints (`/.fs.json`, `/index.json`,
-  `/api/v1/pages`, `/api/fs`, etc.) — all `200`s are HTML (the SB
-  SPA), no JSON list. **Effectively moot now** that T11/T12 give
-  the bridge a direct-FS read path; the SB-side list-endpoint fix
-  is still worth doing for users without FS access, but it's no
-  longer blocking the journal surface.
+  returns the JSON list when `X-Sync-Mode` is set (T10 fix); without
+  it SB 307-redirects to the SPA UI. The JSON payload on this SB
+  returns `created` / `lastModified` / `contentType` / `size` /
+  `perm` per file but **no `etag`** field (only the JSON-list path
+  lacks it; `GET /.fs/{name}` returns a proper `ETag` header). The
+  bridge's `list_pages` therefore surfaces `etag=None` for every
+  page even when the page has a current ETag. Consequence:
+  `write_page(..., if_match=<etag>)` has no round-trip path through
+  `list_pages` — a tool consumer cannot enumerate pages and then
+  issue a conditional update without first calling `read_page` to
+  get the ETag. Worth a follow-up ticket (SB-side: emit `etag` in
+  the list payload; or bridge-side: fall back to `read_page` for
+  ETag lookup). Not blocking v1 (operators can call `read_page` for
+  the etag when they need one), but the API is half-broken until
+  it's resolved.
 
 ## Out of scope
 

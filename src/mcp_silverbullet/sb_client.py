@@ -210,18 +210,32 @@ class SBClient:
     async def list_pages(self) -> list[FileMeta]:
         """Return ``FileMeta`` for every page in the space.
 
-        SB returns a JSON array of ``FileMeta`` objects. v1 only
-        threads ``name`` and ``etag`` through to MCP; the rest is
-        ignored (avoids a Pydantic model we'd have to keep in sync
-        with the upstream server).
+        SB returns a JSON array of ``FileMeta`` objects (**only** when
+        the request carries ``X-Sync-Mode`` — without it, SB
+        307-redirects ``GET /.fs`` to the SPA UI). v1 only threads
+        ``name`` and ``etag`` through to MCP; the rest is ignored
+        (avoids a Pydantic model we'd have to keep in sync with the
+        upstream server).
         """
-        response = await self._client.get("/.fs")
+        response = await self._client.get(
+            "/.fs", headers={"X-Sync-Mode": "1"}
+        )
         _raise_for_status(response)
         data = response.json()
         if not isinstance(data, list):
             # SB contract is "array of FileMeta"; anything else is a
             # server-side bug we'd want to know about loudly.
             raise ServerError(f"unexpected /.fs response: {type(data).__name__}")
+        # The space's ``/.fs`` list payload actually carries
+        # ``created`` / ``lastModified`` / ``contentType`` / ``size``
+        # / ``perm`` per ``server/src/handlers/fs.rs`` — v1 only
+        # surfaces ``name`` and ``etag``, so the rest is dropped
+        # here. ``etag`` is ``None`` on this SB build (it isn't
+        # included in the sync-mode list payload), which means
+        # ``write_page(..., if_match=<etag>)`` has no round-trip path
+        # until SB starts emitting an ``etag`` field; the
+        # ``list_pages`` tool still surfaces every name, which is
+        # what the tool consumer wants in v1.
         return [
             FileMeta(name=item["name"], etag=item.get("etag"))
             for item in data

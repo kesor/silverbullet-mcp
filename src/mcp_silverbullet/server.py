@@ -7,9 +7,17 @@ Locked at T4 of the prior map: three tools (``read_page``,
 :mcp_exc:`ToolError` with the exact wording from
 ``docs/design.md`` § Tools § Status-code mapping.
 
+T10 of the current map adds an optional, gated journal surface
+(``journal_histogram`` / ``tag_summary`` / ``recent_pages`` /
+``pages_touching_topic``) that reads the SB space directory directly.
+The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
+space_path=...))`` adds the four journal tools; otherwise the bridge
+registers only the three ``/.fs``-backed tools and the resource
+template. See :mod:`mcp_silverbullet.journal` for the gate logic.
+
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and ``docs/wayfinder/map.md``
-for the T3/T4 decisions this implements.
+for the T3/T4/T10 decisions this implements.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from mcp.server.mcpserver.exceptions import (
 )
 from mcp.server.mcpserver.server import MCPServer
 
+from mcp_silverbullet.journal import JournalConfig, register_journal_tools
 from mcp_silverbullet.sb_client import (
     BodyTooLarge,
     FileMeta,
@@ -54,6 +63,7 @@ def build_mcp(
     token: str,
     resource_url: str = _DEFAULT_RESOURCE_URL,
     name: str = "mcp-silverbullet",
+    journal: JournalConfig | None = None,
 ) -> MCPServer:
     """Build the configured :class:`MCPServer`.
 
@@ -75,6 +85,15 @@ def build_mcp(
         is the planned env var, T6 will set the exact contract).
     name
         Server name advertised on the wire.
+    journal
+        Already-resolved journal gate config. ``None`` means the gate
+        is off (no journal tools registered). When the gate is on,
+        the bridge registers the four journal-surface tools in
+        addition to the three ``/.fs``-backed tools and the resource
+        template; when off, only the latter are exposed. Resolved by
+        :func:`mcp_silverbullet.main.load_settings` from the two
+        ``MCP_SILVERBULLET_JOURNAL_*`` env vars; tests construct one
+        directly.
 
     The ``AuthSettings`` constructor requires both ``issuer_url`` and
     ``resource_server_url`` to enable the bearer-auth middleware; we
@@ -99,17 +118,23 @@ def build_mcp(
     )
 
     register_tools(mcp, sb_client)
+    if journal is not None:
+        register_journal_tools(mcp, journal)
     return mcp
 
 
 def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
-    """Attach the three tools and one resource template to ``mcp``.
+    """Attach the three ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
     are decorators that take the function; we wrap each handler in a
     ``try/except`` that maps SB exceptions to :exc:`ToolError` per the
     design doc's status-code mapping.
+
+    The journal surface (T11/T12) is gated separately — see
+    :func:`mcp_silverbullet.journal.register_journal_tools`, called by
+    :func:`build_mcp` only when the journal config says the gate is on.
     """
 
     @mcp.tool(
@@ -211,4 +236,4 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             raise ResourceError("silverbullet request timed out") from exc
 
 
-__all__ = ["build_mcp", "register_tools", "FileMeta", "SBError"]
+__all__ = ["build_mcp", "register_tools", "FileMeta", "SBError", "JournalConfig"]

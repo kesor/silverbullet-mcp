@@ -9,10 +9,14 @@ The test boots the real bridge on a free TCP port (uvicorn via
 and hits the live ``/.fs`` API. Cleanup of the marker page is
 best-effort in ``finally`` (``DELETE /.fs/{name}``).
 
-``list_pages`` is exercised but not required to succeed: on this SB
-``GET /.fs`` returns 307 to ``/`` (T6 smoke, map fog). When that
-happens the tool error is asserted and the filter check is skipped;
-when a real list payload appears, the marker name must be in it.
+``list_pages`` is exercised against the live SB and is required to
+succeed: the bridge sends ``X-Sync-Mode: 1`` on ``GET /.fs`` (T10's
+drive-by fix for a bug that was parked as 'effectively moot' once
+the journal surface replaced the original search tool — but the
+existing ``/.fs``-backed ``list_pages`` tool still needed it). Without
+that header, SB 2.9.0 307-redirects to the SPA UI. The assertion
+checks that the freshly-written marker appears in the structured
+``{"result": [...]}`` payload.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import pytest
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from mcp_silverbullet.journal import JournalConfig
 from mcp_silverbullet.main import Settings, serve
 
 MARKER = "e2e-mcp-silverbullet-marker.md"
@@ -90,6 +95,7 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
         host=host,
         port=port,
         allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
     )
     body = "hello from T7 live e2e\n"
     server_task = asyncio.create_task(serve(settings))
@@ -148,13 +154,16 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "list_pages",
                         {"prefix": "e2e-mcp-silverbullet-marker"},
                     )
-                    if listed.is_error:
-                        # GET /.fs → 307 / on this SB (map fog / T6).
-                        text = listed.content[0].text
-                        assert "silverbullet error" in text
-                    else:
-                        payload = listed.content[0].text
-                        assert MARKER in payload or "e2e-mcp-silverbullet-marker" in payload
+                    assert not listed.is_error, (
+                        f"list_pages against live SB: "
+                        f"{listed.content[0].text if listed.content else listed}"
+                    )
+                    # ``list_pages`` returns structured content
+                    # (``list[dict[str, str | None]]``); the wire shape
+                    # is ``{"result": [...]}`` per the Layer-1 test.
+                    payload = listed.structured_content or {}
+                    names = {item["name"] for item in payload.get("result", [])}
+                    assert MARKER in names
     finally:
         server_task.cancel()
         with suppress(asyncio.CancelledError):

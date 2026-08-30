@@ -250,6 +250,31 @@ async def test_write_page_raises_server_error_on_5xx() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_pages_sends_x_sync_mode() -> None:
+    """``GET /.fs`` returns JSON only when ``X-Sync-Mode`` is set.
+
+    Without the header, SB 2.9.0 307-redirects to the SPA UI and the
+    bridge sees an HTML body (and currently a redirect). The header
+    is the only thing distinguishing the JSON-response branch in
+    ``server/src/handlers/fs.rs::handle_fs_list``. v1 of the bridge
+    broke this by omitting the header (T3 mock-only coverage never
+    surfaced it); T10 fixes it as a drive-by bug since the prior map
+    parked it as 'effectively moot' once the journal surface landed
+    — but ``list_pages`` is still part of the v1 tool surface.
+    """
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.headers)
+        return httpx.Response(200, content=b"[]")
+
+    async with _client(handler) as sb:
+        await sb.list_pages()
+
+    assert seen["x-sync-mode"] == "1"
+
+
+@pytest.mark.asyncio
 async def test_list_pages_returns_file_metas() -> None:
     payload = [
         {"name": "index", "etag": '"a"', "size": 12},

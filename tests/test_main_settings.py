@@ -21,6 +21,10 @@ def test_defaults() -> None:
     assert s.port == 8000
     assert s.resource_url == "http://127.0.0.1:8000/mcp"
     assert s.allowed_hosts == ()
+    # T10: no ``MCP_SILVERBULLET_JOURNAL_TOOLS`` env → journal gate
+    # off; existing boot path is unchanged.
+    assert s.journal.enabled is False
+    assert s.journal.space_path is None
 
 
 def test_sb_token_may_be_empty_when_sb_has_no_auth() -> None:

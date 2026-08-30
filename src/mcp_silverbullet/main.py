@@ -8,12 +8,14 @@ uvicorn via ``MCPServer.run_streamable_http_async``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from dataclasses import dataclass
 
 from mcp.server.transport_security import TransportSecuritySettings
 
+from mcp_silverbullet.journal import JournalConfig, resolve_journal_config
 from mcp_silverbullet.sb_client import SBClient
 from mcp_silverbullet.server import build_mcp
 
@@ -33,6 +35,7 @@ class Settings:
     host: str
     port: int
     allowed_hosts: tuple[str, ...]
+    journal: JournalConfig
 
 
 def load_settings(environ: dict[str, str] | None = None) -> Settings:
@@ -70,6 +73,7 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         host=host,
         port=port,
         allowed_hosts=allowed,
+        journal=resolve_journal_config(env),
     )
 
 
@@ -89,12 +93,22 @@ def _transport_security(
 
 
 async def serve(settings: Settings | None = None) -> None:
+    # Configure root logging first so the journal gate's INFO/WARN
+    # lines (emitted from inside ``load_settings`` /
+    # ``resolve_journal_config``) actually reach the operator's
+    # terminal. Without this the root logger discards INFO by
+    # default and the gate's open / closed messages are invisible.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     settings = settings if settings is not None else load_settings()
     async with SBClient(settings.sb_url, settings.sb_token) as sb:
         mcp = build_mcp(
             sb,
             token=settings.token,
             resource_url=settings.resource_url,
+            journal=settings.journal,
         )
         print(
             f"mcp-silverbullet listening on http://{settings.host}:{settings.port}/mcp "

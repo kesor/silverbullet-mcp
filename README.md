@@ -13,10 +13,29 @@ Three tools and one resource template:
 
 - `read_page(name)` — markdown body
 - `write_page(name, content, if_match?)` — create/update
-- `list_pages(prefix?)` — names + etags (needs `GET /.fs` JSON; some SB builds 307 that URL — `read_page`/`write_page` still work)
+- `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA)
 - `silverbullet://page/{name}` — same body as `read_page`, for attaching context
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
+
+## Optional: journal surface (T10–T12)
+
+If the bridge process also has read access to the SB space directory
+(typical on the same machine that runs SilverBullet; rare behind a
+containerized split), four direct-FS read tools can be enabled:
+
+- `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`
+- `tag_summary(prefix?)` — count occurrences of every `tags:` value
+- `recent_pages(limit?, prefix?)` — newest pages by mtime
+- `pages_touching_topic(query, prefix?)` — name+content search
+
+They are strictly additive: the `/.fs`-backed tools above continue to
+work whether the journal surface is on or off. Set both
+`MCP_SILVERBULLET_SPACE_PATH` (absolute path to the space) and
+`MCP_SILVERBULLET_JOURNAL_TOOLS=1` (any truthy value) to opt in.
+Without one of them, the bridge boots cleanly without the journal
+tools and logs a single `INFO`/`WARN` line so the operator can see
+which branch ran.
 
 ## Requirements
 
@@ -119,6 +138,8 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_HOST` | `127.0.0.1` | Bind address |
 | `MCP_SILVERBULLET_PORT` | `8000` | Bind port |
 | `MCP_SILVERBULLET_ALLOWED_HOSTS` | *(unset → SDK loopback default)* | Extra `Host` values, comma-separated |
+| `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
+| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the four journal tools above; requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
 
 Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`
 (e.g. `http://127.0.0.1:63000`) and `MCP_SILVERBULLET_LIVE_SB_TOKEN`
