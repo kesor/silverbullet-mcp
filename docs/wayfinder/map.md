@@ -63,11 +63,18 @@ open ticket is closed and the map is done.
   - **Bearer auth on both hops, one shared secret** — locked at T2 of
     the prior map. `MCP_SILVERBULLET_TOKEN` (inbound) →
     `Authorization: Bearer <T>` (outbound).
-  - **Three tools + one resource template** — locked at T4. No
-    `delete_page`, no Space Lua templates (`silverbullet://lua/...`),
-    no MCP Apps. **`pages_touching_topic` (T12) is the
-    journal-surface search tool, not a `/.fs`-backed search tool**;
-    it lives behind the journal-tools gate (T10) and is read-only.
+  - **Eight `/.fs`-backed tools + one resource template + four
+    journal tools** — T4 locked the original three (`read_page`,
+    `write_page`, `list_pages`); the v1.1 map charted `delete_page`
+    (T18), `append_to_page` (T19), `patch_page_lines` (T20),
+    `patch_page_replace` (T21), and `move_page` (T22). No Space Lua
+    templates (`silverbullet://lua/...`), no MCP Apps. The journal
+    surface (T10–T12) is gated by config and adds `journal_histogram`,
+    `tag_summary`, `recent_pages`, `pages_touching_topic` as a
+    strictly-additive, read-only surface; `pages_touching_topic` is
+    the search tool, not a `/.fs`-backed one. See
+    `docs/wayfinder/map-v1.1.md` for the v1.1 decisions; this map
+    was last updated at T13 and reflects v1 surface only.
   - **Live-SB end-to-end test** is **env-gated** — both
     `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN`
     must be set, otherwise the test skips with a clear message.

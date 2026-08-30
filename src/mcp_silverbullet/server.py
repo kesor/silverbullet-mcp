@@ -576,9 +576,14 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
                 return None
         async with _translate_sb_errors(name):
             # 1. Read the source body. No precondition — the source's
-            # ``If-Match`` guard lives on the delete (step 3), using
-            # the etag from this read. A 404 here surfaces the
-            # standard ``page not found: {name}`` wording.
+            # ``If-Match`` guard lives on the delete (step 3) and is
+            # supplied by the *caller's* outer ``if_match`` argument,
+            # not by the etag from this read (which ``read_page``
+            # doesn't surface). A caller that wants the move to fail
+            # 412 on a concurrent edit must thread the etag in:
+            # ``read_page → move_page(name, new_name, if_match=<etag>)``.
+            # A 404 here surfaces the standard
+            # ``page not found: {name}`` wording.
             body = await sb_client.read_page(name)
             # 2. Write the body to ``new_name``. ``if_none_match=True``
             # makes SB send ``If-None-Match: *`` and refuse if the
