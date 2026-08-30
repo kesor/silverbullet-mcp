@@ -45,7 +45,7 @@ journal surface (T10–T13) is unchanged.
 
 ### Status
 
-T18 resolved (commit pending). Per the ticket-by-ticket
+T18 resolved (commit `d9c07`). Per the ticket-by-ticket
 blocking notes, T19 (`append_page`) and T22 (`move_page`)
 were the tickets that explicitly cited T18 as a blocker
 (T19 — shares the 404 ToolError shape; T22 — `delete_page`
@@ -135,7 +135,7 @@ original "tunnel-ready v1.1" chart remain demoted to
   matches the documentation). New Layer-1 test guards the
   null-ETag case so a future refactor doesn't regress it.
   Test count: 97 pass + 2 skip (1 new test).
-- **T18. `delete_page(name, if_match?)`** (commit pending):
+- **T18. `delete_page(name, if_match?)`** (commit `d9c07`):
   new MCP tool that wraps `DELETE /.fs/{name}` and brings the
   bridge to four `/.fs`-backed tools. `sb_client.delete_page`
   sends `X-Source: external` (the design-doc DELETE row's
@@ -199,7 +199,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
 > **Assignee**: `minimax-m3`
-> **Status**: ✅ resolved (commit pending; see Decision above)
+> **Status**: ✅ resolved (commit `d9c07`; see Decision above)
 > **Question**: How does the bridge expose `DELETE /.fs/{name}`?
 > **Context**: SB supports it directly; the bridge just doesn't
 > surface it. v1.1 adds the tool. Same `if_match` semantics as
