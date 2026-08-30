@@ -26,14 +26,17 @@ The artefact is **this repo, runnable end-to-end**. No new design
 decisions to lock — those were settled in the prior map; the input here
 is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
-### 🏁 Status: destination shifted.
+### 🏁 Status: destination shifted (again).
 
-T1–T8 resolved (a runnable bridge end-to-end). The user asked
-for a `search_pages` tool (by name and content); ticket T9
-opened, hit shape settled (name + match + snippet per hit;
-case-insensitive substring query), implementation path still
-to grill on. The new destination is **the bridge +
-search_pages**.
+T1–T8 resolved (runnable bridge). T9 closed as superseded:
+the operator redirected to a *direct-FS journal surface*
+instead of a single search tool, with the surface explicitly
+gated by configuration so deployments without FS access
+degrade gracefully. New tickets T10–T13 define the
+foundation (config gate), read tools (histogram / tag_summary
+/ recent_pages), search (`pages_touching_topic`), and a
+live-space test. The new destination is **the bridge +
+gated journal surface** (T10–T13).
 
 ## Notes
 
@@ -79,6 +82,26 @@ search_pages**.
     therefore advertise `authorization_servers=[<resource_url>]`.
     T5 will verify the rendered shape on a real HTTP socket.
   - **MIT license**, matches the upstream SDK (T8 of the prior map).
+  - **Journal tools are an optional, gated surface.** The bridge
+    may run on a host that does *not* have direct access to the SB
+    space directory (e.g., sidecar in a container without a volume
+    mount). T10–T13 require two new env vars
+    (`MCP_SILVERBULLET_SPACE_PATH` and `MCP_SILVERBULLET_JOURNAL_TOOLS`)
+    to expose the journal tools; missing or unreadable
+    `space_path` means the bridge boots cleanly without them and
+    the existing `/.fs`-backed tools continue to work unchanged.
+    This is a deliberate deployment-shape assumption the prior map
+    did not make; v1 was loopback-HTTP-only.
+  - **The journal tools are read-only.** No write-path through the
+    journal surface. Writes continue to flow through `write_page`
+    via `/.fs` so SB's own attribution log captures them.
+  - **The journal surface reads files SB itself owns.** On this
+    dev box that's `/var/lib/silverbullet/`, which contains
+    `.cache/` and `.git/` in addition to page markdown. The journal
+    tools restrict themselves to `*.md` files at the top level
+    and below; they do not enumerate hidden directories. The
+    `prefix` argument is validated (no `..`, no leading `/`) so
+    path traversal isn't possible.
 - **Operator environment on this dev box** (for the live-SB test):
   SilverBullet is on `127.0.0.1:63000` with no auth token in this
   session (per `ps` output). The live-SB test must point its env vars
@@ -366,72 +389,178 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T9. Add a `search_pages` tool (client-side filter vs Space Lua)
+### T9. **Superseded by T10–T13.**
 
-> **Labels**: `wayfinder:grilling`
-> **Type**: HITL (operator picks the implementation)
-> **Assignee**: pi (claimed 2026-08-28, partial resolution in flight)
+> **Labels**: `wayfinder:grilling` (replaced)
+> **Status**: closed as superseded; replaced by T10–T13 below.
+> **What happened**: After T9 settled the *shape* of search
+> (name + content, case-insensitive substring, `{name, match,
+> snippet}` hits) but stalled on the *implementation path* — the
+> `/.fs` list endpoint is broken on this SB build and Space Lua was
+> ruled out by T4 of the prior map — the operator redirected:
+> *“assume the MCP is running on the same machine as the
+> SilverBullet folder and has access to it, gate that behind a
+> configurable condition.”* The new direction is a *direct-FS
+> journal surface* (T10–T13) instead of a single search tool. The
+> name+content hit shape T9 settled carries forward into T12's
+> `pages_touching_topic`.
+
+---
+
+### T10. Journal-tools config gate (foundation)
+
+> **Labels**: `wayfinder:task`
+> **Type**: AFK
 > **Status**: open
-> **Question**: How does the bridge expose search — by name and/or by
-> content — given the prior map ruled out both naive approaches?
-> **Context**: The bridge surface is locked at T4 of the prior map to
-> three tools (`read_page` / `write_page` / `list_pages`) plus one
-> resource template. `list_pages` only does client-side prefix
-> filtering over whatever `GET /.fs` returns — it doesn't search by
-> content. The design doc § Tools § "What we are not doing (v1)"
-> explicitly rules out two paths to a real search tool:
+> **Question**: How does the bridge decide whether to register the
+> journal tools?
+> **Context**: The journal surface (T11, T12) reads the SB space
+> directory directly from disk — `/var/lib/silverbullet/` on this
+> dev box. That requires two new env vars: `MCP_SILVERBULLET_SPACE_PATH`
+> (absolute path to the space directory; required for journal
+> tools) and `MCP_SILVERBULLET_JOURNAL_TOOLS` (a boolean flag —
+> truthy means register the journal tools at boot; falsy means
+> the bridge boots without them).
 >
-> - **Client-side filter** over `list_pages` requires `list_pages` to
->   work, which it doesn't on every SB version. On this dev box,
->   `GET /.fs` 307s to `/` (T7 resolution; still open as the
->   "Not yet specified" item about the actual list-directory
->   endpoint for this SB version). When the list endpoint is found
->   or fixed, client-side search becomes: read every name, read
->   every body (or stream them), grep, return hits. Cheap on a small
->   space; quadratic on a large one.
-> - **Server-side search via Space Lua** means hitting `/.shell`
->   from the bridge with a query that runs `space.readFile` +
->   string-match inside SB's Lua runtime. Fast even on big spaces;
->   indexes if SB builds them. But the prior map called `/.shell`
->   "a rich and dangerous axis" and locked it out for v1.
+> Three-gate check at bridge boot: (1) `space_path` is set and
+> non-empty; (2) `os.access(space_path, os.R_OK)` returns True;
+> (3) `journal_tools` is truthy. If any fails, the bridge logs a
+> one-line `INFO`/`WARN` and skips journal-tool registration.
+> All existing tools (`read_page`, `write_page`, `list_pages`,
+> `silverbullet://page/{name}`) still work — the journal tools
+> are strictly additive. **Existing T1–T8 tests must continue to
+> pass with the new env vars unset.**
 >
-> Two design questions to settle on a grilling round before
-> implementation:
+> **Files when resolved**: `src/mcp_silverbullet/main.py` (load
+> new vars), `src/mcp_silverbullet/server.py` (call into the
+> journal module from `build_mcp`), new
+> `src/mcp_silverbullet/journal.py` (the gate + skeleton).
+> **Tests when resolved**: Layer-1 boot tests for both modes
+> (gate on / gate off) — assert journal tools are present or
+> absent from `await client.list_tools()`. Reuse the
+> `httpx.MockTransport` pattern from existing tests; no live FS
+> needed.
+> **Unblocks**: T11, T12.
+> **Done when**: the bridge boots cleanly with the journal tools
+> *off* (existing tests pass), the bridge boots cleanly with the
+> tools *on* and `space_path` readable (skeleton journal tools
+> registered), the bridge boots cleanly with the tools *on* but
+> `space_path` not readable (warning + tools not registered).
+
+---
+
+### T11. Read tools (histogram / tag_summary / recent_pages)
+
+> **Labels**: `wayfinder:task`
+> **Type**: AFK
+> **Status**: open
+> **Question**: What three pure-Python read tools does the
+> journal surface expose?
+> **Context**: With T10's gate in place, expose three tools that
+> are *purely* filesystem reads — no subprocess, no `rg`, no
+> external deps. All three accept an optional `prefix: str = ""`
+> parameter (validated: no `..`, no leading `/`, treated as a
+> path-segment substring against file names; if non-empty, restricts
+> the inventory to files whose relative path contains the segment).
 >
-> 1. **Settled — shape (per operator, this turn):** *search by both
->    page name and content*. The query is a single substring,
->    case-insensitive; the tool returns one entry per page that
->    matched in either the name or the body. A `name` field on the
->    hit carries the page name; a `match: "name" | "content" |
->    "both"` field tells the agent *which* leg of the search hit so
->    it doesn't have to call `read_page` to find out. A `snippet`
->    field with the matched body region (Markdown-shaped, ~80
->    chars of context around the match) lets the agent quote the
->    relevant text directly without a follow-on read. Net surface:
->    `name: str, match: str, snippet: str` per hit. A `query: str`
->    parameter is the only input.
+> - **`journal_histogram(prefix: str = "") -> dict[str, int]`** —
+>   walk `*.md` under `space_path` (filtered by `prefix`),
+>   bucket by `YYYY-MM` extracted from the *filename* if it
+>   matches `^\d{4}-\d{2}-\d{2}` (the SB daily-journal naming
+>   convention), else from the file's mtime. Returns
+>   `{"2025-12": 22, "2026-01": 27, ...}` sorted by key.
+> - **`tag_summary(prefix: str = "") -> dict[str, int]`** —
+>   walk `*.md` files, parse YAML frontmatter (`---\n...\n---\n`),
+>   extract `tags:` (single string or list of strings; case
+>   preserved). Returns `{"meta": 50, "daily": 111, ...}`
+>   sorted by count desc.
+> - **`recent_pages(limit: int = 10, prefix: str = "") ->
+>   list[PageRef]`** — files sorted by mtime desc, returns
+>   `{name, mtime_iso, size_bytes}[]` truncated to `limit`.
+>   `PageRef` is a frozen dataclass; same shape as `FileMeta`
+>   plus `mtime_iso`.
 >
-> 2. **Still open — implementation path.** Client-side is what the
->    prior map's `search_pages` ban was actually protecting against
->    (it requires a working list endpoint), so unlocking it is a
->    narrower scope change than opening Space Lua. Space Lua opens
->    arbitrary SB-side scripting surface and re-decides T4 of the
->    prior map. The bridge isn't on the list-endpoint fix path
->    yet, so client-side needs that work first.
+> **Files when resolved**: `src/mcp_silverbullet/journal.py`
+> (the implementations), `src/mcp_silverbullet/server.py` (the
+> `@mcp.tool()` registrations, gated by `journal_tools_enabled`).
+> **Tests when resolved**: Layer-1 tests against a tmpdir
+> fixture populated with synthetic `*.md` files (one with
+> frontmatter, one without; one matching `^\d{4}-\d{2}-\d{2}`,
+> one not). Asserts on the three return shapes for empty
+> space, prefix-restricted space, mixed-content space.
+> **Unblocks**: T13.
+> **Done when**: the three tools round-trip a tmpdir fixture in
+> Layer-1; the bridge stays silent in `tools/list` when the
+> gate is off; tool descriptions match what the agent sees.
+
+---
+
+### T12. `pages_touching_topic` (search by name + content)
+
+> **Labels**: `wayfinder:task`
+> **Type**: AFK
+> **Status**: open
+> **Question**: How does the bridge expose name+content search
+> without `rg` as a hard dep?
+> **Context**: This is the implementation that resolves the
+> original T9 search-by-name-and-content ask. Two-step search:
+> (1) walk `*.md` files under `space_path` (optionally filtered
+> by `prefix`); (2) for each file, check the basename (case-
+> insensitive substring) AND the body (case-insensitive
+> substring) for the query. Returns
+> `{name, match: "name"|"content"|"both", snippet: str}[]`,
+> where `snippet` is the first ~80-char Markdown-shaped window
+> around the content match (or a short body excerpt for name-only
+> matches).
 >
-> **Resolution will land on**: a new `@mcp.tool()` named
-> `search_pages`, with one parameter (`query: str`, plain string,
-> case-insensitive substring) and one return shape (the
-> `name` / `match` / `snippet` triple decided above).
-> Implementation either in `sb_client.py` (client-side, blocking
-> until the list endpoint is fixed) or as a new module that hits
-> `/.shell` (Space Lua, requires re-deciding T4 of the prior map).
-> Layer-1 + Layer-2 tests on the chosen path.
-> **Done when**: the operator has chosen the implementation path;
-> the chosen shape is implementable end-to-end; tests cover
-> success + empty-result + 404-from-SB paths.
-> **Blocks on**: (none — destination milestone shifted by operator
-> request).
+> Two implementation strategies: (a) `rg` if available on PATH
+> (`shutil.which("rg") is not None`), called via subprocess with
+> a strict allow-list of flags (`--no-heading --line-number
+> --no-config` plus user `query`); (b) Python `pathlib` + `re`
+> fallback otherwise. Either path returns the same shape.
+>
+> **Files when resolved**: `src/mcp_silverbullet/journal.py`
+> (the implementation), `src/mcp_silverbullet/server.py` (the
+> `@mcp.tool()` registration). New dep: none on Python side
+> (`rg` is optional). The flake env should *optionally* include
+> `ripgrep` so the dev shell has it; runtime doesn't depend on it.
+> **Tests when resolved**: Layer-1 tests with the Python fallback
+> path (force `rg` unavailable in fixture). Layer-2 test against
+> the live `/var/lib/silverbullet/` (env-gated, like the T7
+> live-SB test).
+> **Unblocks**: T13.
+> **Done when**: the inverted-style `query="DAILY"` finds every
+> `Daily/*.md` (name match) plus any page whose body mentions
+> "DAILY"; the empty-result case returns `[]`; the malformed-
+> frontmatter case in `tag_summary` doesn't crash.
+
+---
+
+### T13. Live-space test for the journal tools
+
+> **Labels**: `wayfinder:task`
+> **Type**: AFK
+> **Status**: open
+> **Question**: How do we exercise the journal tools against
+> the live space at `/var/lib/silverbullet/`?
+> **Context**: T7's env-gated live-SB test exercises the
+> `/.fs`-backed tools. The journal tools don't go through SB
+> at all — they read the FS directly. New test
+> `tests/test_e2e_live_journal.py` skips unless
+> `MCP_SILVERBULLET_LIVE_SPACE_PATH` is set; with it set, the
+> test reads `/var/lib/silverbullet/Daily/` (or whatever the
+> env var points at) and asserts `(a)` `journal_histogram()`
+> returns a non-empty dict with at least one entry newer than
+> 2023-10; `(b)` `tag_summary()` includes `"daily"` as a key;
+> `(c)` `recent_pages(limit=5)` returns 5 entries from the
+> Daily subdirectory. The test must clean up nothing (read-only)
+> and must skip cleanly when the env var is unset.
+>
+> **Files when resolved**: `tests/test_e2e_live_journal.py`.
+> **Done when**: with `MCP_SILVERBULLET_LIVE_SPACE_PATH` set to
+> this dev box's space, the three assertions pass; with the
+> var unset, the test skips with a clear message. Existing
+> Layer-1 + Layer-2 + T7 e2e tests still pass.
 
 ## Not yet specified
 
@@ -466,9 +595,13 @@ file; "blocking" is rendered by ticket ordering and an explicit
   fog is allowed_origins / disabling DNS-rebinding entirely.
 - `GET /.fs` (no path) on the live SilverBullet (`127.0.0.1:63000`)
   returns **307 to `/`**, so `list_pages` cannot use the design-doc
-  list URL as written. `GET`/`PUT`/`DELETE /.fs/{name}` work. Need
-  the actual list-directory endpoint for this SB version before T7
-  can assert `list_pages`.
+  list URL as written. `GET`/`PUT`/`DELETE /.fs/{name}` work.
+  Probed 11 candidate list endpoints (`/.fs.json`, `/index.json`,
+  `/api/v1/pages`, `/api/fs`, etc.) — all `200`s are HTML (the SB
+  SPA), no JSON list. **Effectively moot now** that T11/T12 give
+  the bridge a direct-FS read path; the SB-side list-endpoint fix
+  is still worth doing for users without FS access, but it's no
+  longer blocking the journal surface.
 
 ## Out of scope
 
