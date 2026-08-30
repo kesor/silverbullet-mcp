@@ -8,10 +8,10 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes ten MCP **tools** —
+file API on `/.fs/…`). The bridge exposes eleven MCP **tools** —
 `read_page`, `page_exists`, `write_page`, `append_to_page`,
 `patch_page_lines`, `patch_page_replace`, `move_page`, `delete_page`,
-`list_pages` —
+`list_pages`, `diff_pages`, `list_tasks` —
 and one MCP **resource template** — `silverbullet://page/{name}` —
 letting Grok read and write your SilverBullet pages as conversation
 context or as tool calls.
@@ -24,9 +24,9 @@ only the bridge is on the tunnel, and only Grok has the token.
 
 - **Goal**: Grok on the web can `read_page`, `write_page`,
   `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-  `move_page`, `delete_page`, `list_pages`, `page_exists`, and
-  `diff_pages` against SilverBullet, behind the user's existing
-  Cloudflare tunnel, with one bearer token.
+  `move_page`, `delete_page`, `list_pages`, `page_exists`,
+  `diff_pages`, and `list_tasks` against SilverBullet, behind
+  the user's existing Cloudflare tunnel, with one bearer token.
 - **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search,
   multi-user, mutating silver bullet's source, hosting the bridge
   for other people.
@@ -236,7 +236,13 @@ second page (`other_name`) or a literal markdown string
 (`other_body`) and returns a `difflib.unified_diff` between the
 two bodies alongside the read-side envelopes for each page; the
 shape is line-based by default (token-level / word-level diff is
-a v1.3 refinement). **Ten tools, one resource template.**
+a v1.3 refinement). T29 adds `list_tasks(page?, prefix?)` — an
+eleventh tool that enumerates checkbox bullets on a page (per-page
+form, always available via `GET /.fs/{page}`) or across the whole
+space (space-walk form, requires the journal surface to be on);
+returns `[{name, ref, line, state, text}]` where `ref` is the
+wikilink target on the same bullet, or `null` when the bullet has
+no wikilink. **Eleven tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
@@ -250,6 +256,7 @@ a v1.3 refinement). **Ten tools, one resource template.**
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo `X-*` per the SB contract) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python (filter happens *before* hydration so the prefix reduces the per-page round-trip count) | `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` (T28 widened from the v1.1 minimal subset; ``etag`` is `None` for every row on this SB build because the list payload omits the field — an operator who needs ``if_match`` round-trips opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) | none |
 | `diff_pages` | `name: str, other_name: Optional[str] = None, other_body: Optional[str] = None` (exactly one of `other_name` / `other_body`) | `GET /.fs/{name}` (and `GET /.fs/{other_name}` when `other_name` is given; one read per page, sequential, no writes) | `{diff: str, name: {name, body, etag, size_bytes, last_modified_ms}, other: same envelope or None}` (T27; line-based unified diff via `difflib.unified_diff`; `diff=""` when the two bodies are identical; `other=None` for the literal-string variant) | none (read-only — the tool tracks every request method and asserts only GETs were issued) |
+| `list_tasks` | `page: Optional[str] = None, prefix: str = ""` | `GET /.fs/{page}` when `page` is given; otherwise walks the SB space directory directly (requires the journal surface) | `list[{name, ref, line, state, text}]` (T29; `name` is the page the bullet lives on; `ref` is the wikilink target on the same bullet (``[[Pages/Hobbies]]`` → ``"Pages/Hobbies"``, ``[[...|alias]]`` → stripped to the target) or `null` when the bullet has no wikilink; `line` is the 1-indexed editor line (frontmatter included); `state` is the literal checkbox character — `" "` for `[ ]`, `"x"` for `[x]`, `"X"` for `[X]`; `text` is the bullet content after the marker) | none |
 
 Resource template:
 

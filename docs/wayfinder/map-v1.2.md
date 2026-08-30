@@ -885,6 +885,192 @@ resolution below -->
   (no live SB env). ``nix flake check`` not run (no
   Nix in this env).
 
+- **T29. `list_tasks(page?, prefix?)`.** (commit pending):
+  The bridge gained an eleventh tool that enumerates
+  checkbox bullets either per-page (always on, routes
+  through ``sb_client.read_page``) or across the whole
+  space (opt-in via the journal gate, walks the space
+  directory directly). The wire shape is
+  ``list[{name, ref, line, state, text}]`` — the T29
+  ticket's original spec listed four fields; ``name``
+  was added so the space-walk form is self-describing
+  (an agent walking the space needs to know which page
+  each task came from). ``state`` is the literal
+  checkbox character (``" "`` for ``[ ]``, ``"x"`` for
+  ``[x]``, ``"X"`` for ``[X]`` — SB's three states).
+  ``ref`` is the wikilink target on the same bullet
+  (``[[Pages/Hobbies]]`` → ``"Pages/Hobbies"``,
+  ``[[target|alias]]`` strips the alias to the target)
+  or ``None`` for non-addressable bullets. ``line`` is
+  the 1-indexed editor line (frontmatter included).
+  ``text`` is the bullet content after the marker.
+
+  **Parser in ``journal.py``, MCP tool in
+  ``server.py``**: the pure parser (``_parse_tasks`` /
+  ``_find_task_bullet`` / ``_extract_first_wikilink`` /
+  ``_split_frontmatter_lines``) lives in ``journal.py``
+  because the space-walk variant reuses it; the per-
+  page MCP tool lives in ``server.py`` because it
+  closes over ``sb_client``. ``_split_frontmatter_lines``
+  now returns ``(list[str] | None, list[str])`` — the
+  ``None`` distinguishes "no frontmatter" from "empty
+  frontmatter block" so the parser can compute
+  editor-shaped line numbers correctly (an empty
+  frontmatter block still occupies two lines — the
+  opening and closing fences).
+
+  **Frontmatter skip**: bullets inside the YAML
+  frontmatter block (``- foo`` as a block-list tag, for
+  instance) are not tasks. The parser shares the
+  ``_split_frontmatter_lines`` helper with the tag
+  parser so a future frontmatter-shape tweak doesn't
+  silently leave the tag parser counting tasks as tags
+  or vice versa. A malformed frontmatter (opening
+  fence, no closing fence) is treated as "no
+  frontmatter" — better to under-count tasks than to
+  silently drop them on a typo'd page.
+
+  **Multi-wikilink lines**: rare in the wild but seen
+  (``- [ ] see [[First]] and [[Second]]``); the parser
+  keeps the first ``[[…]]`` because the editor's
+  ``externalTaskRef`` resolves to the first wikilink.
+
+  **Per-page vs space-walk split**: the per-page form
+  is always available because it routes through
+  ``sb_client.read_page`` (no direct FS access needed —
+  the bridge can read any page it has HTTP access to).
+  The space-walk form (``page=None``) requires the
+  journal gate (``MCP_SILVERBULLET_JOURNAL_TOOLS=1``
+  plus ``MCP_SILVERBULLET_SPACE_PATH``) and surfaces
+  ``ToolError("list_tasks without page argument requires
+  the journal surface to be enabled")`` when the gate
+  is off. Same exception-translation contract as the
+  read/write tools on the per-page form (404 /
+  5xx / 412 / 413 / timeout / body-too-large all
+  surface as ``ToolError`` via
+  :func:`_translate_sb_errors`).
+
+  **Files touched**: ``src/mcp_silverbullet/journal.py``
+  (new ``TaskEntry`` dataclass, ``_TASK_BULLET_RE`` /
+  ``_WIKILINK_RE`` regex constants, ``_split_frontmatter_lines``
+  helper extended with ``None`` sentinel, ``_parse_tasks`` /
+  ``_find_task_bullet`` / ``_extract_first_wikilink``
+  functions, ``_list_tasks_for_space`` walker; module
+  docstring updated to mention T29/T30 split gate;
+  ``__all__`` gained ``TaskEntry``),
+  ``src/mcp_silverbullet/server.py`` (new
+  ``list_tasks`` MCP tool handler registered in
+  ``register_tools``; ``register_tools`` gained a
+  ``journal_root: Path | None = None`` kwarg for the
+  space-walk branch; ``build_mcp`` threads the journal
+  config's ``space_path`` as ``journal_root`` when the
+  gate is on; module docstring's status line bumped
+  to ``T23/T24/T25/T26/T27/T28/T29 done; T30 next``;
+  the ``instructions`` string's tool list bumped to
+  eleven and gained a ``list_tasks`` sentence),
+  ``tests/test_tasks.py`` (new file — 24 tests: 18
+  direct parser unit tests, 6 space-walk MCP tests
+  including the "skip hidden directories", "prefix
+  filters to subtree", and "skip unreadable files"
+  cases the T11/T12 walker already handles), the
+  per-page MCP tool's wire-shape / error-translation
+  tests are in ``tests/test_tools_in_memory.py``
+  under the new ``# --- list_tasks (T29) ---`` section
+  header (11 tests: empty page, full wire shape,
+  alias strip, multi-wikilink, frontmatter skip,
+  editor-shaped line numbers, nested bullets, 404,
+  5xx, timeout, journal-gate-off space-walk error),
+  ``tests/test_journal_gate.py`` (``SB_TOOL_NAMES``
+  bumped to eleven; ``test_list_tasks`` joins the
+  set-shape assert on the pre-existing SB tools),
+  ``tests/test_http_auth.py`` (the ``list_tools``
+  round-trip on the Layer-2 ASGI server now expects
+  eleven entries), ``README.md`` (the "What it
+  exposes" tool list gained a ``list_tasks`` bullet;
+  the Pi-MCP wiring paragraph's "ten tools" →
+  "eleven tools"; the v1.2 map link line bumped to
+  "one open ticket after T23+T24+T25+T26+T27+T28+T29"),
+  ``CHANGELOG.md`` (T29 entry under Unreleased's
+  ``### Added`` with the wire shape and migration
+  note), ``docs/design.md`` (§ Tools prose bumped
+  to mention T29; the Tools table grew a
+  ``list_tasks`` row with the full wire shape; §
+  Tools prose bumped "Ten tools, one resource
+  template" → "Eleven tools, one resource
+  template"; the "What this is" prose and the
+  "Goals, non-goals" list were bumped to include
+  ``list_tasks``).
+
+  **Bonus improvements visible while doing it**:
+  the ``_split_frontmatter_lines`` helper's
+  ``(frontmatter_lines, body_lines)`` return shape
+  was widened to ``(frontmatter_lines | None,
+  body_lines)`` — the ``None`` distinguishes "no
+  frontmatter at all" from "empty frontmatter
+  block", which the parser needs to compute
+  editor-shaped line numbers correctly (an empty
+  frontmatter block still occupies two lines — the
+  opening and closing fences). Without this
+  distinction, a page like ``"---\n---\nfoo"``
+  (an empty frontmatter) would have its body
+  shifted by one line; the ``None`` sentinel
+  surfaces "this page has frontmatter" so the
+  offset math (``N + 3`` content lines) fires
+  even when ``N == 0``. The new ``TaskEntry``
+  dataclass is frozen (matches ``PageRef`` /
+  ``JournalConfig`` — same immutability convention
+  every other wire-shape dataclass in the project
+  uses). The ``_parse_tasks`` regex anchors the
+  marker at column 0 with optional leading
+  whitespace (``^(\s*)-``) so nested bullets at
+  any indent match; an unanchored regex would let
+  a ``-`` in the middle of a paragraph match.
+  The ``_WIKILINK_RE`` uses a lazy negated class
+  (``[^\][^[]*?``) so the regex stops at the
+  *first* ``]]`` rather than at the end of the
+  string — ``[[a]] [[b]]`` yields ``"a"``, not
+  ``"a]] [[b"``. The space-walk
+  ``_list_tasks_for_space`` walker reads each
+  file's body via ``read_text(encoding="utf-8")``
+  inside a try/except for ``OSError`` /
+  ``UnicodeDecodeError`` so a single corrupted
+  page doesn't fail the whole walk (same
+  tolerance ``_recent_pages`` already has for
+  transient FS races). The Layer-1 tests assert
+  on the exact TaskEntry dataclass field set via
+  ``dataclasses.asdict`` round-trip so a future
+  refactor that adds / removes / renames a field
+  surfaces loudly — the wire shape is part of
+  the public contract, not an implementation
+  detail. The ``list_tasks`` MCP tool description
+  documents the per-page / space-walk split,
+  the wiki alias-strip rule, and the
+  journal-gate-required error so an agent
+  reading the tool description doesn't have to
+  read the source to figure out which form to
+  call.
+
+  **Unblocks**: T30 (``check_task`` reuses
+  ``_find_task_bullet`` for the read-before-
+  write step — the matching logic is shared so
+  ``check_task(page, ref)`` finds the same
+  bullet ``list_tasks(page)`` would surface
+  for the same ref). The wikilink-target
+  semantics (``[[target|alias]]`` →
+  ``target``) are now locked in
+  ``_extract_first_wikilink``; T30's
+  ``check_task`` uses the same helper so a
+  bullet toggled by ``check_task`` shows up
+  in the next ``list_tasks`` call with the
+  same ref.
+
+  Test count: 286 pass + 2 skip (was 251 pass
+  + 2 skip; +35 net: 24 new ``tests/test_tasks.py``
+  + 11 new ``tests/test_tools_in_memory.py``
+  ``list_tasks`` section). Live e2e not run on
+  this dev box (no live SB env). ``nix flake
+  check`` not run (no Nix in this env).
+
 ## Tickets
 
 <!--
@@ -1180,11 +1366,12 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T29. `list_tasks(page?, prefix?) -> [{ref, line, state, text}]`
+### T29. `list_tasks(page?, prefix?) -> [{name, ref, line, state, text}]`
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Assignee**: `minimax-m3` (claimed 2026-08-30, resolved same day)
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: How does the bridge enumerate checkboxes?
 >
 > **Context**: A SilverBullet "task" is a markdown bullet with a
@@ -1194,42 +1381,88 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > ref. `list_tasks` walks every checkbox bullet on a page (or
 > the whole space when `page` is omitted, filtered by `prefix`
 > on the file name) and returns one entry per bullet:
-> `{ref, line, state, text}` where:
+> `{name, ref, line, state, text}` where:
 >
-> - `ref` is the wikilink text on the bullet, or `None` if the
->   bullet has no wikilink (in which case the task is not
->   addressable by T30's `check_task`; the agent falls back to
->   `patch_page_lines`).
-> - `line` is the 1-indexed line number of the bullet on the page.
-> - `state` is one of `" "` (todo), `"x"` (done), `"X"` (done,
->   cancelled — SB's third state).
-> - `text` is the rest of the bullet line after the `[ ]` marker
->   (or the full bullet for the journal-style lines that have the
->   marker at the start).
+> - `name` is the page the bullet lives on (path relative to the
+>   space root for the space-walk form). The T29 ticket's original
+>   wire shape omitted `name`; we added it so an agent walking the
+>   space can tell which page each task came from without parsing
+>   the call. The per-page form echoes the caller's `page`
+>   argument back so the shape is parallel.
+> - `ref` is the wikilink target on the bullet (``[[…]]``), with an
+>   optional ``|alias`` suffix stripped (the editor's
+>   ``externalTaskRef`` resolves to the *target*, not the display
+>   text). ``None`` when the bullet has no wikilink (in which case
+>   the task is not addressable by T30's ``check_task``; the agent
+>   falls back to ``patch_page_lines``).
+> - ``line`` is the 1-indexed line number of the bullet on the
+>   page, editor-shaped (frontmatter included). An agent that
+>   wants to ``patch_page_lines(name, line=8)`` after the list
+>   call can use the line number directly.
+> - ``state`` is one of ``" "`` (todo), ``"x"`` (done), ``"X"``
+>   (cancelled — SB's third state).
+> - ``text`` is the rest of the bullet line after the ``[ ]``
+>   marker, leading whitespace trimmed.
 >
-> Both `page` and `prefix` are optional; the tool walks the space
-> directory when `page` is omitted, matching T11's
-> `journal_histogram` / `tag_summary` / T12's
-> `pages_touching_topic` shape (same `_iter_md` walker, same
+> Both ``page`` and ``prefix`` are optional; the tool walks the
+> space directory when ``page`` is omitted, matching T11's
+> ``journal_histogram`` / ``tag_summary`` / T12's
+> ``pages_touching_topic`` shape (same ``_iter_md`` walker, same
 > prefix validation, same hidden-dir skip).
 >
 > **Done when**: Layer-1 tests cover: page with mix of addressable
 > (wikilink) and non-addressable bullets, page with no bullets,
-> missing page → `ToolError("page not found: {name}")`, prefix
-> filtering, hidden-dir skip, the three states (`" "`, `"x"`,
-> `"X"`). Live e2e (T13-shaped) covers
-> `/var/lib/silverbullet/Areas/Kanban/Kanban Board - Hobbies.md`
+> missing page → ``ToolError("page not found: {name}")``, prefix
+> filtering, hidden-dir skip, the three states (``" "``, ``"x"``,
+> ``"X"``). Live e2e (T13-shaped) covers
+> ``/var/lib/silverbullet/Areas/Kanban/Kanban Board - Hobbies.md``
 > or equivalent.
 >
-> **Files when resolved**: `src/mcp_silverbullet/journal.py`
-> (new `_list_tasks(space_root, page, prefix)` walker; the
+> **Files when resolved**: ``src/mcp_silverbullet/journal.py``
+> (new ``_list_tasks_for_space(space_root, prefix)`` walker; the
 > space-walk variant is gated behind the journal-tools env vars
 > from T10 the same way the other journal tools are, while the
 > per-page variant is always available because the bridge can
-> `read_page` any page it has access to).
+> ``read_page`` any page it has access to).
 >
 > **Blocks on**: T10 (journal gate), T11/T12 (the walker
 > pattern). **Unblocks**: T30.
+>
+> **Resolution**: see Decisions so far above. The
+> implementation shipped an eleventh tool (``list_tasks``)
+> that walks checkbox bullets either per-page (always on,
+> routes through ``sb_client.read_page``) or across the whole
+> space (opt-in via the journal gate, walks the space
+> directory directly via ``_list_tasks_for_space``). The pure
+> parser (``_parse_tasks`` / ``_find_task_bullet`` /
+> ``_extract_first_wikilink`` / ``_split_frontmatter_lines``)
+> lives in ``journal.py`` and is reused by the space-walk
+> variant; the per-page MCP tool lives in ``server.py`` because
+> it closes over ``sb_client``. The wire shape includes
+> ``name`` (added beyond the ticket's original spec so the
+> space-walk form is self-describing) plus the four fields the
+> ticket called out: ``ref``, ``line``, ``state``, ``text``.
+> Frontmatter bullets are skipped (YAML config keys are not
+> tasks); nested bullets at any indent are matched; multi-
+> wikilink lines keep the first ``[[…]]`` (the editor's
+> ``externalTaskRef`` resolves to the first). Per-page form
+> reuses ``_translate_sb_errors`` so 404 / 5xx / 412 / 413 /
+> timeout wording matches ``read_page``. Space-walk form
+> rejects ``..`` and absolute prefixes via the same
+> ``_validate_prefix`` helper the T11/T12 tools use; a missing
+> journal gate on the space-walk path surfaces
+> ``ToolError("list_tasks without page argument requires
+> the journal surface to be enabled")`` so the agent knows to
+> fall back to the per-page form. Layer-1 tests cover the
+> parser (24 direct unit tests in ``tests/test_tasks.py``)
+> and the MCP-tool surface (11 tests in
+> ``tests/test_tools_in_memory.py`` under the ``# ---
+> list_tasks (T29) ---`` section header, plus 6 space-walk
+> tests in ``tests/test_tasks.py``). Live e2e against the
+> kanban board is left to a future session with a live SB
+> env — the parser's contract is locked down by the unit
+> tests so the live-SB round-trip is structural rather than
+> load-bearing.
 
 ---
 

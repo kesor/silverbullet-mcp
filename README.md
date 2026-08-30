@@ -7,7 +7,7 @@ side-car on loopback; it does not provision tunnels.
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
-v1.2 map (agent-facing QOL + bullet primitives, two open tickets after T23+T24+T25+T26+T27+T28): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.2 map (agent-facing QOL + bullet primitives, one open ticket after T23+T24+T25+T26+T27+T28+T29): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ## What it exposes
 
@@ -23,6 +23,7 @@ Ten tools and one resource template:
 - `delete_page(name, if_match?)` — hard delete; returns `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo timestamps / size per SB's contract)
 - `list_pages(prefix?)` — returns `[{name, etag, size_bytes, last_modified_ms, created_ms}][]` (T28 widened the per-row shape from the v1.1 `[{name, etag}]` to the same envelope family the read/write tools use; sends `X-Sync-Mode: 1` so SB 2.x returns JSON from `GET /.fs` instead of 307-redirecting to the SPA). On this SB build the list payload omits the `etag` field, so etags are `null` unless the operator opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` (one GET per row; partial failures leave the affected row's etag as `null` rather than failing the whole call).
 - `diff_pages(name, other_name?, other_body?)` — line-based unified diff between two pages (or a page and a literal string); returns `{diff, name, other?}`. The wire shape: `diff` is a `difflib.unified_diff` between the two bodies (empty string for a no-op diff), `name` is the read-side envelope for the first page (`{name, body, etag, size_bytes, last_modified_ms}`), and `other` is the same envelope for the second page (only present when `other_name` was given; `None` when `other_body` was given). Read-only — never writes. Pass exactly one of `other_name` / `other_body`; passing neither or both is `ToolError("pass exactly one of other_name or other_body")` upfront, no wasted read.
+- `list_tasks(page?, prefix?)` — enumerate checkbox bullets on a page (per-page form, always available via `GET /.fs/{page}`) or across the whole space (space-walk form, requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and `MCP_SILVERBULLET_SPACE_PATH`). Returns `[{name, ref, line, state, text}]`: `name` is the page, `ref` is the wikilink target on the same bullet (`[[Pages/Hobbies]]` → `"Pages/Hobbies"`; an aliased `[[target|alias]]` strips the alias so the ref is the wikilink *target*, not the display text) or `null` when the bullet has no wikilink (such bullets are not addressable by `check_task` — use `patch_page_lines` instead), `line` is the 1-indexed editor line number (frontmatter included, matching what an SB editor highlights), `state` is the literal checkbox character (`" "` for `[ ]`, `"x"` for `[x]`, `"X"` for `[X]`), `text` is the bullet content after the checkbox marker. Frontmatter-block bullets are skipped (they're YAML config keys, not tasks). The space-walk form requires `page=None` (omit `page`) and an optional `prefix` substring against filenames; without the journal gate, omitting `page` surfaces `ToolError("list_tasks without page argument requires the journal surface to be enabled")` so the agent knows to fall back to the per-page form.
 - `silverbullet://page/{name}` — JSON envelope `{body, etag, size_bytes, last_modified_ms}` (same shape as `read_page`); MIME type is `application/json` in T24 (was `text/markdown` in v1.1)
 
 Every write tool honors `if_match` (`"*"` to require existence,
@@ -228,10 +229,10 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's ten tools — `read_page`,
+`/reload` in Pi and the bridge's eleven tools — `read_page`,
 `page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
 `patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
-`diff_pages` — register as direct Pi tools.
+`diff_pages`, `list_tasks` — register as direct Pi tools.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so

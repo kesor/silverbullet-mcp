@@ -3,13 +3,30 @@
 T10 of the map gates the journal surface; T11 implements three of the
 four tools (``journal_histogram``, ``tag_summary``,
 ``recent_pages``); T12 implements the fourth (``pages_touching_topic``).
-The bridge may run on a host that does *not* have direct access to the
-SB space directory (e.g., a sidecar container without a volume mount);
-the journal tools are an optional, strictly-additive surface that
-requires ``MCP_SILVERBULLET_SPACE_PATH`` and
-``MCP_SILVERBULLET_JOURNAL_TOOLS`` to enable. With either unset or
-the path unreadable, the bridge boots cleanly without the journal
-tools and the existing ``/.fs``-backed tools continue to work.
+T29 adds the bullet-primitive parser (and the space-walk variant of
+``list_tasks``); T30 adds ``check_task`` — read before write,
+flip the checkbox by wikilink ref. The bridge may run on a host that
+does *not* have direct access to the SB space directory (e.g., a
+sidecar container without a volume mount); the journal tools are an
+optional, strictly-additive surface that requires
+``MCP_SILVERBULLET_SPACE_PATH`` and ``MCP_SILVERBULLET_JOURNAL_TOOLS``
+to enable. With either unset or the path unreadable, the bridge boots
+cleanly without the journal tools and the existing ``/.fs``-backed
+tools continue to work.
+
+The T29/T30 bullet primitives have a split gate:
+
+- The per-page form of :func:`list_tasks` and :func:`check_task`
+  route through ``sb_client.read_page`` / ``write_page`` and are
+  *always* available — the bridge can read any page it has access
+  to regardless of the space-path mount, because ``/.fs/{name}``
+  doesn't need the local FS. (This is the same reason a
+  per-page form is meaningful at all: SB's HTTP API is reachable
+  on a sidecar without a volume mount, so per-page reads work
+  even when the space-walk tools are off.)
+- The space-walk form of :func:`list_tasks` (``page`` omitted,
+  ``prefix`` filters filenames) walks ``space_root`` directly and
+  requires the journal gate (the same T10 gate, no new env vars).
 
 Two-step gate (resolved at :func:`resolve_journal_config`):
 
@@ -145,6 +162,308 @@ class PageRef:
 # ``2023-10-05.md`` matches and ``2023-10-05-evening.md`` does too
 # (the latter will fall back to mtime for the bucket key).
 _DAILY_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+# --- T29 / T30 bullet-primitive internals ------------------------------
+
+
+@dataclass(frozen=True)
+class TaskEntry:
+    """One checkbox bullet parsed from a SilverBullet page.
+
+    ``name`` is the page the bullet lives on (the SB path-relative
+    name; same shape :class:`PageRef.name` uses, so callers can
+    thread it through the same display code). ``line`` is the
+    1-indexed line number on the page (matches what an editor
+    displays — line 1 is the first line of the file, even when the
+    file has no frontmatter, and the ``+1`` for frontmatter is
+    intentionally NOT applied: SB's editor counts lines including
+    the frontmatter block, so a bullet on what looks like
+    "line 8 of the body" is line 9 if there's a 3-line
+    frontmatter). ``state`` is the literal character inside the
+    brackets: ``" "`` for ``[ ]`` (todo), ``"x"`` for ``[x]`` (done),
+    ``"X"`` for ``[X]`` (cancelled — SB's third state).
+
+    ``ref`` is the *wikilink target* on the same line (the text
+    inside the first ``[[...]]`` token, stripped of an optional
+    ``|alias`` suffix), or ``None`` when the bullet has no
+    wikilink. A ``None`` ref means the bullet is *not addressable*
+    by T30's :func:`check_task` — the agent falls back to
+    :func:`patch_page_lines` for non-wikilinked bullets, per the
+    v1.2 standing preference "Auto-migrate bullets to add a
+    synthetic wikilink is explicitly out of scope: destructive,
+    the user didn't ask for it, and it would change the meaning
+    of existing pages."
+
+    ``text`` is the bullet's text after the ``[ ]`` marker,
+    leading whitespace trimmed. The wikilink (if any) is left in
+    place so the agent can read both the ref and the surrounding
+    prose.
+    """
+
+    name: str
+    line: int
+    state: str
+    ref: str | None
+    text: str
+
+
+# Bullet pattern: optional leading whitespace (so nested bullets
+# match), ``-`` followed by at least one space, ``[`` then exactly
+# one of `` `` / ``x`` / ``X`` then ``]`` then at least one space,
+# then the rest of the line. ``re.match`` anchors at column 0 so
+# leading whitespace is captured by ``\s*``. We deliberately do NOT
+# allow ``*`` or ``+`` markers (SB's editor renders those as plain
+# bullets, not tasks); we don't allow ``[X]``-vs-``[x]`` confusion
+# (case matters — ``[X]`` is the cancelled state, ``[x]`` is done;
+# a lowercase ``[X]``-style mix-up would be a SB editor bug, not a
+# page-author choice).
+_TASK_BULLET_RE = re.compile(r"^(\s*)-\s+\[([ xX])\]\s+(.*)$")
+
+
+# Wikilink pattern: ``[[<target>]]`` where ``<target>`` may contain
+# ``|`` for an alias (we strip the alias below — the agent needs
+# the *target*, not the *display text*). We don't try to handle
+# nested ``[[ ]]`` (Markdown doesn't allow them inside a single
+# wikilink token); the first ``]]`` closes the wikilink.
+_WIKILINK_RE = re.compile(r"\[\[([^\]\[]*?)\]\]")
+
+
+def _split_frontmatter_lines(body: str) -> tuple[list[str] | None, list[str]]:
+    """Return ``(frontmatter_lines_or_None, body_lines)`` for a page body.
+
+    The shape matches SB's frontmatter convention: ``---\\n…
+    \\n---\\n<body>``. The returned ``body_lines`` excludes the
+    closing fence and the trailing newline; ``frontmatter_lines``
+    is everything between the two fences, or ``None`` when the
+    body has no frontmatter at all (the opening ``---`` fence is
+    missing).
+
+    The ``None`` shape distinguishes "no frontmatter" from "empty
+    frontmatter block" — both yield ``frontmatter_lines`` of
+    length zero, but :func:`_parse_tasks` needs to know which is
+    which to compute editor-shaped line numbers (an empty
+    frontmatter block still occupies two lines — the opening and
+    closing fences). :func:`_parse_tags` predates this helper and
+    keeps its own frontmatter-detection logic (its regex-based
+    approach distinguishes a top-level ``tags:`` key from nested
+    YAML without parsing the whole frontmatter; consolidating the
+    two parsers is a v1.3+ ticket, not v1.2). Callers that don't
+    care about the no-frontmatter distinction can treat ``None``
+    the same as ``[]`` and not break.
+
+    When the frontmatter is malformed (opening fence but no
+    closing fence) the function returns ``(None, body_lines)``
+    rather than ``([], body_lines)`` — the body shape stays the
+    same (the walker doesn't have to special-case a malformed
+    page) and the "no frontmatter" signal is honest about the
+    page being broken. Better to under-count tasks on a
+    malformed page than to silently drop them.
+    """
+    lines = body.split("\n")
+    if not lines or lines[0] != "---":
+        return None, lines
+    # The opening fence is ``---`` followed by a newline (the
+    # ``split("\n")`` above already gives us the first ``"---"``
+    # element and dropped the newline). Look for the closing fence
+    # — a standalone ``---`` (no leading whitespace, per YAML spec)
+    # on its own line.
+    close_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx] == "---":
+            close_idx = idx
+            break
+    if close_idx is None:
+        # Malformed: opening fence but no closing fence. Treat as
+        # if no frontmatter was present — the body shape stays the
+        # same and the walker doesn't have to special-case a
+        # malformed page.
+        return None, lines
+    return lines[1:close_idx], lines[close_idx + 1 :]
+
+
+def _parse_tasks(name: str, body: str) -> list[TaskEntry]:
+    """Extract checkbox bullets from a SilverBullet page body.
+
+    Returns one :class:`TaskEntry` per matched bullet, in source
+    order. Line numbers are 1-indexed against the **whole** body
+    (frontmatter included) — matches what an SB editor displays,
+    so the agent's ``patch_page_lines(name, line=8, …)`` can
+    target the same line the editor would highlight.
+
+    Bullets inside the frontmatter block are skipped (they're
+    YAML config keys, not tasks; matching them would surface
+    ``---``-fenced YAML as a task list and confuse the agent).
+    Nested bullets at any indentation level are matched — SB's
+    editor treats nested ``- [ ]`` lines as addressable tasks, so
+    the bridge does too. Code-block-fenced bullets (``- [ ]``
+    inside a ```` ``` ```` block) are *not* specially skipped —
+    a v1.2 limitation; documented in the v1.2 map's T29 ticket
+    as a known gap. The next line-number / wikilink-aware task
+    primitive in v1.3 should add code-block awareness.
+
+    The wikilink extraction picks the *first* ``[[…]]`` on the
+    line (the one closest to the marker) and strips any ``|alias``
+    suffix — the editor's ``externalTaskRef`` resolves to the
+    wikilink *target*, not the display text. Multi-wikilink lines
+    (rare in the wild) keep the first ref; the agent can still
+    read the rest of the bullet text via :attr:`TaskEntry.text`
+    if it needs the second ref.
+    """
+    frontmatter_lines, body_lines = _split_frontmatter_lines(body)
+    # Editor-shaped line numbers count from 1 against the *full*
+    # body (frontmatter included). When there is no frontmatter
+    # (``frontmatter_lines is None``) the offset is 1 (body-lines
+    # start at editor line 1); when frontmatter is present, the
+    # offset is ``N + 3`` where ``N`` is the number of frontmatter
+    # content lines (opening fence = line 1, ``N`` content lines,
+    # closing fence = line ``N + 2``, body starts at line ``N + 3``).
+    if frontmatter_lines is None:
+        frontmatter_offset = 1
+    else:
+        frontmatter_offset = len(frontmatter_lines) + 3
+    tasks: list[TaskEntry] = []
+    for line_idx, raw in enumerate(body_lines):
+        match = _TASK_BULLET_RE.match(raw)
+        if match is None:
+            continue
+        # ``line_idx`` is 0-indexed into ``body_lines`` (post-
+        # frontmatter). The ``frontmatter_offset`` shifts it to the
+        # editor-shaped 1-indexed line directly (no further ``+1``
+        # needed — the offset already accounts for the 1-indexed
+        # convention).
+        editor_line = line_idx + frontmatter_offset
+        state = match.group(2)
+        text = match.group(3).strip()
+        ref = _extract_first_wikilink(text)
+        tasks.append(
+            TaskEntry(
+                name=name,
+                line=editor_line,
+                state=state,
+                ref=ref,
+                text=text,
+            )
+        )
+    return tasks
+
+
+def _extract_first_wikilink(text: str) -> str | None:
+    """Return the target of the first ``[[wikilink]]`` on the line, or ``None``.
+
+    The target is the text inside ``[[ ]]`` with an optional
+    ``|alias`` suffix stripped — the editor's ``externalTaskRef``
+    resolves to the *target*, not the display text. So
+    ``[[Pages/Hobbies#card|read the card]]`` yields
+    ``"Pages/Hobbies#card"``, not the alias.
+
+    The capture group is a *lazy* negated-class match (any
+    character that's not ``]`` or ``[``), so the regex stops at
+    the *first* ``]]`` rather than at the end of the string —
+    ``[[a]] [[b]]`` yields ``"a"``, not ``"a]] [[b"``. The lazy
+    match also means a stray ``]`` inside the target (rare, but
+    seen on URLs that contain brackets) wouldn't break the
+    parse: ``[[https://example.com/path]a]]`` is already
+    malformed Markdown; we let the line fall through to a ref
+    of the substring before the first ``]]``, which is the most
+    useful answer in practice.
+    """
+    match = _WIKILINK_RE.search(text)
+    if match is None:
+        return None
+    target = match.group(1)
+    # Strip the alias: ``Pages/Hobbies#card|read the card`` →
+    # ``Pages/Hobbies#card``. The pipe is the alias separator in
+    # SB wikilinks (Markdown convention).
+    pipe_idx = target.find("|")
+    if pipe_idx >= 0:
+        target = target[:pipe_idx]
+    return target or None
+
+
+def _find_task_bullet(
+    body: str, ref: str
+) -> tuple[int, str, str, int, int] | None:
+    """Locate the unique checkbox bullet whose wikilink target equals ``ref``.
+
+    Returns ``(editor_line, state, text, byte_offset, byte_end)`` on
+    a unique match, or ``None`` when no bullet matches. The byte
+    offsets are the (start, end) of the bullet line within the
+    body — useful for splicing a new body without having to
+    re-walk lines. The caller (T30's :func:`check_task`) needs
+    both the line and the byte range because flipping a marker
+    only changes a single character inside the line; we
+    reconstruct the new body by slicing ``body[:byte_offset] +
+    modified_line + body[byte_end:]``.
+
+    Matching rule: a bullet matches iff its first ``[[wikilink]]``
+    target equals ``ref`` exactly. The match is case-sensitive
+    (``Pages/Hobbies`` ≠ ``pages/hobbies``) — SB's page lookup is
+    case-sensitive at the file system level, so a case-folded
+    match would let ``check_task`` toggle a task the editor
+    couldn't find by the same ref.
+
+    Returns ``None`` when no bullet matches. A separate ``"found
+    more than one"`` signal lives in :func:`check_task` itself
+    (a multi-match is a caller error, not a normal "no match"
+    case), so this helper stays at "find one or report none".
+    """
+    if not ref:
+        # An empty ref would match every line containing ``[[]]`` —
+        # an empty wikilink pair — and is almost certainly a caller
+        # bug, not a real "look up no task" intent. Surface it as
+        # "no match" so the caller can raise the same error it would
+        # surface for any other missing ref.
+        return None
+    # ``body.split("\n")`` returns a trailing empty string when the
+    # body ends with ``"\n"`` (because ``"\n"`` is the separator, not
+    # the terminator — SB stores text with a final newline the way
+    # editors do). Drop the trailing empty so the iteration matches
+    # the editor's "N lines" view (mirrors
+    # :func:`mcp_silverbullet.server._split_body_lines`).
+    body_lines = body.split("\n")
+    if body_lines and body_lines[-1] == "":
+        body_lines.pop()
+    if not body_lines:
+        return None
+    matches: list[tuple[int, str, str, int, int]] = []
+    byte_cursor = 0
+    for editor_idx, raw in enumerate(body_lines):
+        # Each line in the body is ``raw + "\n"`` (one byte) for
+        # every line except the last, which has no trailing
+        # newline (we already dropped the empty trailing element).
+        # The byte offsets let the caller splice the modified
+        # line back into the body without re-walking.
+        line_byte_len = len(raw.encode("utf-8"))
+        newline_byte_len = (
+            len(b"\n") if editor_idx < len(body_lines) - 1 else 0
+        )
+        match = _TASK_BULLET_RE.match(raw)
+        if match is not None:
+            bullet_text = match.group(3).strip()
+            target = _extract_first_wikilink(bullet_text)
+            if target == ref:
+                matches.append(
+                    (
+                        editor_idx + 1,
+                        match.group(2),
+                        bullet_text,
+                        byte_cursor,
+                        byte_cursor + line_byte_len,
+                    )
+                )
+        byte_cursor += line_byte_len + newline_byte_len
+    if len(matches) == 0:
+        return None
+    # Whether the match count is 1 or >1 we return the *first*
+    # match so the byte offsets splice the first occurrence into
+    # the new body. The caller is responsible for raising the
+    # multi-match error — this helper's contract is "find the
+    # first match or report none". (We use a sentinel return shape
+    # rather than raising here so :func:`check_task` can build a
+    # clearer error message that includes the count and the line
+    # of the second match.)
+    return matches[0]
 
 
 def _validate_prefix(prefix: str) -> str:
@@ -639,6 +958,61 @@ async def _pages_touching_topic(
     return results
 
 
+# --- T29 tool body (space-walk variant) -------------------------------
+
+
+async def _list_tasks_for_space(
+    space_root: Path, prefix: str
+) -> list[dict[str, object]]:
+    """Walk every ``*.md`` page under ``space_root`` and return checkbox bullets.
+
+    The space-walk variant of T29's :func:`list_tasks` tool. The
+    per-page variant lives in :mod:`mcp_silverbullet.server` (the
+    bridge reads via ``sb_client.read_page``); this walker is the
+    fallback when the caller doesn't name a specific page AND the
+    journal gate is on (the direct-FS access the journal tools
+    rely on). Hidden directories are skipped via :func:`_iter_md`
+    (same skip rule as T11/T12 — ``.git`` / ``.cache`` / ``.ssh``
+    etc. don't appear in task lists).
+
+    Sort order is ``(name, line)`` so the wire payload is
+    deterministic regardless of ``os.walk`` order — the agent
+    reading a space-wide task list needs a stable order to
+    reason about "did I already handle this task?" between
+    turns. The line numbers are editor-shaped 1-indexed against
+    the full body (frontmatter included), same convention
+    :func:`_parse_tasks` uses.
+
+    Files that fail to read (encoding error, race with a
+    concurrent editor save) are skipped — the same
+    "read-modify-write tools should be tolerant of transient
+    FS races" pattern T11's ``_recent_pages`` follows. The
+    alternative is to abort the whole walk on the first
+    failure, which would surface a confusing
+    "list_tasks failed" to a caller that just asked for a
+    space summary.
+    """
+    tasks: list[dict[str, object]] = []
+    validated_prefix = _validate_prefix(prefix)
+    for path, name in _iter_md(space_root, validated_prefix):
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for entry in _parse_tasks(name, body):
+            tasks.append(
+                {
+                    "name": entry.name,
+                    "ref": entry.ref,
+                    "line": entry.line,
+                    "state": entry.state,
+                    "text": entry.text,
+                }
+            )
+    tasks.sort(key=lambda t: (t["name"], t["line"]))
+    return tasks
+
+
 # --- registration ------------------------------------------------------
 
 
@@ -725,6 +1099,7 @@ def register_journal_tools(
 __all__ = [
     "JournalConfig",
     "PageRef",
+    "TaskEntry",
     "register_journal_tools",
     "resolve_journal_config",
 ]

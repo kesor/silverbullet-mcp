@@ -30,11 +30,18 @@ tools use
 and adds an opt-in per-page etag-hydration fallback driven by
 ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`` so an operator who
 needs ``if_match`` round-trips from a list call can pay the
-N+1 cost of one GET per page. The bridge still registers
-ten ``/.fs``-backed tools (``read_page`` / ``page_exists`` /
-``write_page`` / ``delete_page`` / ``append_to_page`` /
-``patch_page_lines`` / ``patch_page_replace`` / ``move_page`` /
-``list_pages`` / ``diff_pages``) plus one resource template
+N+1 cost of one GET per page. T29 adds ``list_tasks`` for an
+eleventh tool — an always-on per-page checkbox enumerator
+(``list_tasks(page=name)`` reads the page and returns one entry
+per ``- [ ]`` / ``- [x]`` / ``- [X]`` bullet) plus an opt-in
+space-walk variant (``list_tasks(page=None, prefix="Daily")``)
+that walks the SB space directory directly (gated behind the
+journal config the same way ``journal_histogram`` etc. are).
+The bridge registers ten ``/.fs``-backed tools (``read_page`` /
+``page_exists`` / ``write_page`` / ``delete_page`` /
+``append_to_page`` / ``patch_page_lines`` / ``patch_page_replace``
+/ ``move_page`` / ``list_pages`` / ``diff_pages``) plus one
+bullet primitive (``list_tasks``) plus one resource template
 (``silverbullet://page/{name}``). Each tool closes over a single
 :class:`SBClient` opened at boot; SB's typed exceptions translate
 to :mcp_exc:`ToolError` with the exact wording from
@@ -46,15 +53,16 @@ T10 of the v1.1 map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the ten ``/.fs``-backed tools and the resource
-template. See :mod:`mcp_silverbullet.journal` for the gate logic.
+registers only the eleven ``/.fs``-backed + bullet-primitive tools
+and the resource template. See :mod:`mcp_silverbullet.journal` for
+the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24/T25/T26/T27/T28 done; T29 next).
+agent-facing QOL tickets (T23/T24/T25/T26/T27/T28/T29 done; T30 next).
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx2 as httpx
 from mcp.server.auth.settings import AuthSettings
@@ -72,7 +81,12 @@ from mcp.server.mcpserver.exceptions import (
 )
 from mcp.server.mcpserver.server import MCPServer
 
-from mcp_silverbullet.journal import JournalConfig, register_journal_tools
+from mcp_silverbullet.journal import (
+    JournalConfig,
+    _list_tasks_for_space,
+    _parse_tasks,
+    register_journal_tools,
+)
 from mcp_silverbullet.sb_client import (
     BodyTooLarge,
     FileMeta,
@@ -512,14 +526,16 @@ def build_mcp(
         name=name,
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
-            "check existence of, and diff SilverBullet pages. "
-            "Ten tools (`read_page`, `page_exists`, `write_page`, "
+            "check existence of, diff, and enumerate checkbox "
+            "tasks on SilverBullet pages. Eleven tools "
+            "(`read_page`, `page_exists`, `write_page`, "
             "`delete_page`, `append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`, "
-            "`move_page`, `list_pages`, `diff_pages`) plus one "
-            "resource template `silverbullet://page/{name}` for "
-            "attaching page bodies to conversation context. The "
-            "three read-modify-write tools (`append_to_page`, "
+            "`move_page`, `list_pages`, `diff_pages`, "
+            "`list_tasks`) plus one resource template "
+            "`silverbullet://page/{name}` for attaching page "
+            "bodies to conversation context. The three "
+            "read-modify-write tools (`append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`) accept "
             "`dry_run=True` (T26) to preview the patch without "
             "committing. `list_pages` returns the full meta "
@@ -531,7 +547,14 @@ def build_mcp(
             "`other_name` (a second page to diff against) or "
             "`other_body` (a literal string) and returns a "
             "line-based unified diff alongside the read-side "
-            "envelopes for both pages."
+            "envelopes for both pages. `list_tasks` (T29) "
+            "enumerates checkbox bullets on a page "
+            "(`list_tasks(page=\"name\")`) or across the whole "
+            "space (`list_tasks(prefix=\"Daily\")`, requires "
+            "the journal surface); the per-page form is always "
+            "available via `GET /.fs/{page}`, the space-walk "
+            "form requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` "
+            "plus `MCP_SILVERBULLET_SPACE_PATH`."
         ),
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
@@ -541,7 +564,14 @@ def build_mcp(
     )
 
     register_tools(
-        mcp, sb_client, hydrate_etags=list_pages_hydrate_etags
+        mcp,
+        sb_client,
+        hydrate_etags=list_pages_hydrate_etags,
+        journal_root=(
+            Path(journal.space_path)
+            if journal is not None and journal.enabled
+            else None
+        ),
     )
     if journal is not None:
         register_journal_tools(mcp, journal)
@@ -553,8 +583,9 @@ def register_tools(
     sb_client: SBClient,
     *,
     hydrate_etags: bool = False,
+    journal_root: Path | None = None,
 ) -> None:
-    """Attach the ten ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the ten ``/.fs``-backed tools, the bullet primitives, and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
@@ -577,7 +608,11 @@ def register_tools(
     blocks (one per read), each keyed on whichever page that
     read targeted (``name`` for the first, ``other_name`` for
     the second), so a 404 on either side surfaces as
-    ``ToolError("page not found: <that page's name>")``. The
+    ``ToolError("page not found: <that page's name>")``. ``list_tasks``
+    (T29) is the always-on per-page form: the space-walk
+    variant requires ``journal_root`` and falls back to a
+    ``ToolError`` when ``journal_root`` is ``None`` and the
+    caller didn't name a page. The
     resource template uses the SDK's separate ``ResourceError``
     shapes (JSON-RPC protocol errors vs tool-handler
     ``is_error=True``) and keeps its own translation.
@@ -587,6 +622,15 @@ def register_tools(
     the etag field that SB's list payload omits. Default off;
     threaded from :func:`build_mcp` which reads
     ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``.
+
+    ``journal_root`` is the v1.2 T29 space-walk opt-in: when set,
+    the ``list_tasks`` tool's "no page given" branch walks the
+    local SB space directory (same shape as
+    :func:`mcp_silverbullet.journal._list_tasks_for_space`).
+    ``None`` (default, or when the journal gate is off) makes
+    the space-walk branch surface a ``ToolError``; the per-page
+    form is always available because it routes through
+    ``sb_client.read_page`` and doesn't need direct FS access.
 
     The journal surface (T11/T12) is gated separately — see
     :func:`mcp_silverbullet.journal.register_journal_tools`, called by
@@ -1274,6 +1318,82 @@ def register_tools(
             "name": _diff_page_envelope(first),
             "other": _diff_page_envelope(second) if other_name_given else None,
         }
+
+    @mcp.tool(
+        title="List tasks",
+        description=(
+            "Enumerate checkbox bullets on a SilverBullet page "
+            "(per-page form, always available) or across the "
+            "whole space (space-walk form, requires the journal "
+            "surface to be enabled via "
+            "`MCP_SILVERBULLET_JOURNAL_TOOLS=1` plus "
+            "`MCP_SILVERBULLET_SPACE_PATH`). Returns one entry per "
+            "checkbox bullet: `{name, ref, line, state, text}`. "
+            "`name` is the page the bullet lives on (path "
+            "relative to the space root for the space-walk "
+            "form). `ref` is the wikilink target on the same "
+            "line (``[[Pages/Hobbies]]`` → ``\"Pages/Hobbies\"``; "
+            "an aliased ``[[...|display]]`` strips the alias so "
+            "the ref is the wikilink *target*, not the display "
+            "text) or `null` when the bullet has no wikilink "
+            "(such bullets are not addressable by `check_task`; "
+            "use `patch_page_lines` for those). `line` is the "
+            "1-indexed editor line number (frontmatter included, "
+            "matching what an SB editor highlights). `state` is "
+            "the literal checkbox character: `\" \"` for `[ ]` "
+            "(todo), `\"x\"` for `[x]` (done), `\"X\"` for `[X]` "
+            "(cancelled — SB's third state). `text` is the "
+            "bullet's content after the checkbox marker. "
+            "Frontmatter-block bullets are skipped (they're "
+            "YAML config keys, not tasks). "
+            "Pass `page` to read a single page via "
+            "`GET /.fs/{name}`; omit `page` to walk the space "
+            "directory directly (gated by the journal tools "
+            "config; `prefix` filters filenames as a substring "
+            "when walking). Errors: page not found → standard "
+            "`ToolError(\"page not found: <name>\")`; omitting "
+            "`page` without the journal gate on → "
+            "`ToolError(\"list_tasks without page argument "
+            "requires the journal surface to be enabled\")`."
+        ),
+    )
+    async def list_tasks(
+        page: str | None = None, prefix: str = ""
+    ) -> list[dict[str, object]]:
+        if page is not None:
+            # Per-page form: always available because it routes
+            # through ``sb_client.read_page``, which doesn't need
+            # direct FS access. The same 404 / 5xx / 412 / 413
+            # / timeout wording as the read tool surfaces via
+            # :func:`_translate_sb_errors`.
+            async with _translate_sb_errors(page):
+                result = await sb_client.read_page(page)
+            body = result.body or ""
+            entries = _parse_tasks(page, body)
+            return [
+                {
+                    "name": entry.name,
+                    "ref": entry.ref,
+                    "line": entry.line,
+                    "state": entry.state,
+                    "text": entry.text,
+                }
+                for entry in entries
+            ]
+        # Space-walk form: gated by ``journal_root`` (which
+        # :func:`build_mcp` populates from the journal config).
+        # The gate exists because the walker reads the SB space
+        # directory directly, which a sidecar without a volume
+        # mount cannot do — the same constraint the journal
+        # gate (T10) was set up to handle.
+        if journal_root is None:
+            raise ToolError(
+                "list_tasks without page argument requires the "
+                "journal surface to be enabled "
+                "(MCP_SILVERBULLET_JOURNAL_TOOLS=1 plus "
+                "MCP_SILVERBULLET_SPACE_PATH)"
+            )
+        return await _list_tasks_for_space(journal_root, prefix)
 
     @mcp.resource(
         "silverbullet://page/{name}",

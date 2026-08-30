@@ -126,6 +126,38 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ### Added
 
+- **`list_tasks(page?, prefix?)`** — enumerate checkbox bullets
+  on a page (per-page form, always available via
+  `GET /.fs/{page}`) or across the whole space (space-walk
+  form, requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` plus
+  `MCP_SILVERBULLET_SPACE_PATH`). Returns one entry per
+  checkbox bullet: `{name, ref, line, state, text}`. `name`
+  is the page the bullet lives on (path relative to the space
+  root for the space-walk form); `ref` is the wikilink target
+  on the same line (`[[Pages/Hobbies]]` →
+  `"Pages/Hobbies"`; an aliased `[[target|alias]]` strips the
+  alias so the ref is the wikilink *target*, not the display
+  text) or `null` when the bullet has no wikilink (such
+  bullets are not addressable by `check_task`; use
+  `patch_page_lines` for those). `line` is the 1-indexed
+  editor line number (frontmatter included, matching what an
+  SB editor highlights). `state` is the literal checkbox
+  character: `" "` for `[ ]` (todo), `"x"` for `[x]` (done),
+  `"X"` for `[X]` (cancelled — SB's third state). `text` is
+  the bullet content after the checkbox marker. Frontmatter-
+  block bullets are skipped (they're YAML config keys, not
+  tasks). The space-walk form requires `page=None` (omit
+  `page`) and an optional `prefix` substring against
+  filenames; without the journal gate, omitting `page`
+  surfaces `ToolError("list_tasks without page argument
+  requires the journal surface to be enabled")` so the agent
+  knows to fall back to the per-page form.
+
+  Migration: none — the tool is additive. Agents that want a
+  bullet inventory of a single page compose
+  `read_page → regex match on "^- \[[ xX]\] "` today; swap
+  to `list_tasks(page=name)` for a structured envelope.
+
 - **`diff_pages(name, other_name?, other_body?)`** — line-based
   unified diff between two pages or a page and a literal
   markdown string (T27). Pass exactly one of `other_name` (a

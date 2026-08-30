@@ -8,17 +8,21 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All ten ``/.fs``-backed tools (``read_page``, ``page_exists``,
+- All eleven ``/.fs``-backed tools (``read_page``, ``page_exists``,
   ``write_page``, ``delete_page``, ``append_to_page``,
   ``patch_page_lines``, ``patch_page_replace``, ``move_page``,
-  ``list_pages``) on the 200 happy path;
+  ``list_pages``, ``diff_pages``, ``list_tasks``) on the
+  200 happy path;
   ``write_page`` / ``delete_page`` / ``append_to_page`` /
   ``patch_page_lines`` / ``patch_page_replace`` return the ETag,
   ``list_pages`` returns the file metas, ``read_page`` and the
   resource template both surface the markdown body, ``page_exists``
-  returns ``bool`` (T25). ``append_to_page`` (T19), ``patch_page_lines``
-  (T20), ``patch_page_replace`` (T21), and ``move_page`` (T22) are
-  the read-modify-write / write-then-delete tools.
+  returns ``bool`` (T25), ``diff_pages`` returns the unified diff
+  alongside the read-side envelopes (T27), ``list_tasks`` returns
+  one entry per checkbox bullet (T29). ``append_to_page`` (T19),
+  ``patch_page_lines`` (T20), ``patch_page_replace`` (T21), and
+  ``move_page`` (T22) are the read-modify-write / write-then-delete
+  tools.
 - ``write_page`` carries the ``if_match`` straight through to
   ``sb_client`` (T3 covers the wire envelope; this test guards the
   MCP-tool-to-SB-client argument path).
@@ -44,7 +48,16 @@ with destination-collision and atomicity-caveat error wording
 distinct from the unified 412/404 shapes. T25 (``page_exists``)
 adds the ninth tool: a cheap ``bool`` existence check that doesn't
 go through :func:`server._translate_sb_errors` because 404 is the
-*answer*, not an error.
+*answer*, not an error. T27 (``diff_pages``) is the tenth tool.
+T29 (``list_tasks``) is the eleventh tool: an always-on
+per-page checkbox enumerator whose space-walk variant requires
+the journal gate. ``list_tasks`` reuses
+:func:`server._translate_sb_errors` on its read path, so its
+404 / 5xx / timeout wording matches ``read_page``; the
+space-walk branch surfaces a ``ToolError(\"list_tasks without
+page argument requires the journal surface to be enabled\")``
+when the journal gate is off (a different error shape, specific
+to the space-walk shape).
 """
 
 from __future__ import annotations
@@ -4339,4 +4352,312 @@ async def test_diff_pages_does_not_issue_writes() -> None:
 
     assert result.is_error is False
     assert methods == ["GET", "GET"]  # one read per page, no writes
+
+
+# --- list_tasks (T29) --------------------------------------------------
+#
+# ``list_tasks`` returns checkbox bullets parsed from a page body
+# (per-page form, always available via ``sb_client.read_page``) or
+# across the whole space (space-walk form, gated by the journal
+# config). T29 ticket wire shape: ``{name, ref, line, state, text}``.
+# State is one of ``" "`` / ``"x"`` / ``"X"`` (SB's three checkbox
+# markers); ``ref`` is the wikilink target on the same line, or
+# ``None`` for non-addressable bullets.
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_returns_empty_when_page_has_no_bullets() -> None:
+    """A page with no checkbox bullets → empty list.
+
+    Empty result (not an error) — the agent reading a page with
+    no tasks shouldn't get a confusing "tool failed" back.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="# just a heading\n\nno tasks here\n")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_tasks", {"page": "Areas/Kanban"}
+        )
+    # T29 wire shape is a bare ``list[...]``, but the SDK wraps
+    # ``list[X]`` returns in ``{"result": [...]}`` for
+    # ``structured_content`` (the same shape ``recent_pages`` and
+    # ``pages_touching_topic`` use).
+    assert result.is_error is False
+    assert result.structured_content == {"result": []}
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_carries_name_ref_line_state_text() -> None:
+    """Each entry has the five T29 fields.
+
+    The wire shape is fixed by T29 — adding a field is a
+    breaking change (an agent that destructures the dict will
+    miss the new key). Removing a field is also a breaking
+    change. This test pins the field set in place so a future
+    refactor that drops one surfaces loudly.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "# kanban\n"
+                "- [ ] todo with [[Pages/Hobbies]] ref\n"
+                "- [x] done item\n"
+                "- [X] cancelled item\n"
+                "- [ ] no-ref bullet\n"
+            ),
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_tasks", {"page": "Areas/Kanban"}
+        )
+
+    sc = result.structured_content
+    assert sc["result"] == [
+        {"name": "Areas/Kanban", "ref": "Pages/Hobbies", "line": 2, "state": " ", "text": "todo with [[Pages/Hobbies]] ref"},
+        {"name": "Areas/Kanban", "ref": None, "line": 3, "state": "x", "text": "done item"},
+        {"name": "Areas/Kanban", "ref": None, "line": 4, "state": "X", "text": "cancelled item"},
+        {"name": "Areas/Kanban", "ref": None, "line": 5, "state": " ", "text": "no-ref bullet"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_strips_wikilink_alias_to_target() -> None:
+    """``[[target|alias]]`` → ref = ``"target"`` (no alias).
+
+    SB's editor resolves ``externalTaskRef`` to the wikilink
+    *target*, not the display text. The bridge matches the
+    editor: the alias is stripped so an agent calling
+    ``check_task(page, "Pages/Hobbies")`` toggles the right
+    bullet.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="- [ ] read the card [[Pages/Hobbies#card|read the card]]\n",
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    assert result.structured_content["result"][0]["ref"] == "Pages/Hobbies#card"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_picks_first_wikilink_on_multi_ref_line() -> None:
+    """A bullet with multiple ``[[wikilink]]`` tokens keeps the first ref.
+
+    Rare in the wild but seen on lines that mention two related
+    pages. The editor's ``externalTaskRef`` resolves to the
+    *first* wikilink — the bridge matches.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="- [ ] see [[First]] and [[Second]]\n",
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    [entry] = result.structured_content["result"]
+    assert entry["ref"] == "First"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_skips_frontmatter_bullets() -> None:
+    """``- [ ]`` inside a frontmatter block is YAML config, not a task.
+
+    A page with ``tags: ...`` frontmatter often has
+    ``- [ ]`` lines that are config keys (YAML block-list
+    items). The bridge skips the frontmatter block so a
+    config-key ``- [ ]`` doesn't surface as a task — that
+    would confuse the agent into thinking the page has a
+    todo item it doesn't actually have.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "---\n"
+                "tags:\n"
+                "  - foo\n"
+                "  - bar\n"
+                "---\n"
+                "# heading\n"
+                "- [ ] real task after frontmatter\n"
+            ),
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    sc = result.structured_content
+    # Only the real task survives; the YAML block-list items are
+    # not tasks.
+    assert len(sc["result"]) == 1
+    assert sc["result"][0]["ref"] is None
+    assert sc["result"][0]["text"] == "real task after frontmatter"
+    # Line numbers are editor-shaped (frontmatter included), so
+    # this task is on editor line 6 (1=---, 2=tags:, 3=foo, 4=bar,
+    # 5=---, 6=# heading, 7=real task). Wait — the heading is
+    # line 6 and the task is line 7. Let me re-check by counting:
+    # the body in this test is split as
+    # ``["---", "tags:", "  - foo", "  - bar", "---", "# heading",
+    # "- [ ] real task after frontmatter"]``. 1-indexed, the task
+    # is on line 7.
+    assert sc["result"][0]["line"] == 7
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_line_numbers_are_editor_shaped() -> None:
+    """``line`` field is 1-indexed against the full body (frontmatter included).
+
+    An agent that wants to ``patch_page_lines(name, line=N)``
+    needs ``N`` to point at the same line the editor
+    highlights. Without frontmatter, line numbers happen to
+    equal body-line numbers; with frontmatter, they don't —
+    this test pins the editor-shaped convention.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "---\n"      # line 1 (opening fence)
+                "tags: foo\n"  # line 2
+                "---\n"      # line 3 (closing fence)
+                "\n"         # line 4 (blank)
+                "- [ ] task\n"  # line 5
+            ),
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    [entry] = result.structured_content["result"]
+    assert entry["line"] == 5
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_nested_bullets_are_addressable() -> None:
+    """Indented ``- [ ]`` lines under an outer bullet count as tasks.
+
+    SB's editor treats nested checkbox bullets as addressable
+    tasks (a kanban sub-task), so the bridge does too. Quick
+    check that the parser's leading-whitespace prefix in
+    ``_TASK_BULLET_RE`` doesn't accidentally reject indented
+    bullets.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "- [ ] outer\n"
+                "  - [ ] nested-1 [[Inner1]]\n"
+                "    - [ ] deep [[Inner2]]\n"
+            ),
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    sc = result.structured_content
+    assert len(sc["result"]) == 3
+    assert sc["result"][0]["text"] == "outer"
+    assert sc["result"][1]["ref"] == "Inner1"
+    assert sc["result"][2]["ref"] == "Inner2"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_404_returns_tool_error() -> None:
+    """Page not found surfaces the design-doc 404 wording.
+
+    Same wording as ``read_page`` — the read tool translates
+    the SB 404 to ``ToolError("page not found: <name>")`` and
+    ``list_tasks`` reuses :func:`_translate_sb_errors` to keep
+    the wording in one place.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_tasks", {"page": "missing"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool list_tasks: page not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_5xx_returns_tool_error() -> None:
+    """SB 5xx surfaces the unified ``ToolError("silverbullet error: <status>")`` wording.
+
+    The same translation :func:`_translate_sb_errors` applies
+    to every ``/.fs``-backed tool. ``list_tasks`` (T29) routes
+    the read through that helper so an SB-side failure looks
+    identical to the agent regardless of which tool surfaced
+    it.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool list_tasks: silverbullet error: 503"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_timeout_returns_tool_error() -> None:
+    """httpx timeout → ``ToolError("silverbullet request timed out")``.
+
+    Same wording as every other ``/.fs``-backed tool. The
+    timeout exception type (``httpx.TimeoutException``) is
+    caught by :func:`_translate_sb_errors` so ``list_tasks``
+    doesn't need its own timeout clause.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {"page": "x"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool list_tasks: silverbullet request timed out"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_without_page_without_journal_root_errors() -> None:
+    """``page=None`` with the journal gate off → ``ToolError``.
+
+    The space-walk variant requires direct FS access (because
+    SB doesn't expose a "list every task on every page"
+    endpoint over HTTP — we'd otherwise need N+1 round trips
+    per ``list_pages`` + ``read_page``). On a sidecar without
+    a volume mount the gate is off and the space-walk branch
+    surfaces a clear error so the agent knows to fall back
+    to the per-page form (``list_tasks(page="...")``).
+    """
+    server = _build(lambda req: httpx.Response(200))
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_tasks", {})
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "list_tasks without page argument" in text
+    assert "MCP_SILVERBULLET_JOURNAL_TOOLS" in text
 
