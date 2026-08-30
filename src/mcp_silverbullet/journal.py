@@ -5,7 +5,9 @@ four tools (``journal_histogram``, ``tag_summary``,
 ``recent_pages``); T12 implements the fourth (``pages_touching_topic``).
 T29 adds the bullet-primitive parser (and the space-walk variant of
 ``list_tasks``); T30 adds ``check_task`` — read before write,
-flip the checkbox by wikilink ref. The bridge may run on a host that
+flip the checkbox by wikilink ref. T34 of v1.3 adds ``search_pages``
+— a bounded wrapper over T12's machinery with a ``limit`` knob
+(default 20, hard cap 100). The bridge may run on a host that
 does *not* have direct access to the SB space directory (e.g., a
 sidecar container without a volume mount); the journal tools are an
 optional, strictly-additive surface that requires
@@ -1080,6 +1082,82 @@ async def _pages_touching_topic(
     return results
 
 
+# --- T34 tool body (bounded search) -----------------------------------
+
+
+# Default + hard cap for ``search_pages``. The default of 20 is what an
+# agent typically wants ("show me the top matches for this query");
+# the hard cap of 100 keeps the response bounded even for a runaway
+# operator who passes ``limit=10000`` (the alternative is a multi-MB
+# tool result for a single substring search, which the agent has to
+# paginate through anyway).
+_SEARCH_DEFAULT_LIMIT = 20
+_SEARCH_HARD_LIMIT = 100
+
+
+def _validate_search_limit(limit: int) -> int:
+    """Reject non-positive or oversized ``limit`` before the scan.
+
+    ``limit < 1`` would silently truncate to the empty list (the
+    caller probably meant "any number of results", not "zero
+    results"); ``limit > _SEARCH_HARD_LIMIT`` is a runaway-input
+    guard. The hard cap is the operator's lever — operators who
+    want a larger result set can fork, same as the v1.3 T36
+    body-size cap.
+    """
+    if limit < 1:
+        raise ToolError(
+            f"limit must be a positive integer; got {limit}"
+        )
+    if limit > _SEARCH_HARD_LIMIT:
+        raise ToolError(
+            f"limit {limit} exceeds hard cap of "
+            f"{_SEARCH_HARD_LIMIT}; narrow the query or prefix "
+            f"instead of raising the cap"
+        )
+    return limit
+
+
+async def _search_pages(
+    space_root: Path,
+    query: str,
+    prefix: str,
+    limit: int,
+) -> list[dict[str, str]]:
+    """Bounded substring search over the SB space directory.
+
+    Thin wrapper over :func:`_pages_touching_topic` (T12) that
+    applies the v1.3 T34 result cap. The scan, match-kind
+    classification (``name`` / ``content`` / ``both``), and snippet
+    shaping are all delegated to T12 — T34 is a *bounding* layer,
+    not a parallel implementation, same pattern the rest of the
+    v1.3 surface follows ("no new deps, reuse what v1 already
+    built"). T34 differs from T12 only in:
+
+    - A ``limit`` knob (default 20, hard cap 100) that truncates
+      the post-sort list. The truncation happens *after*
+      :func:`_pages_touching_topic`'s ``name``-ascending sort so
+      the first ``limit`` results are the same files a caller
+      would get without the cap, just with the tail chopped.
+    - Tighter input validation surfaced at the tool boundary:
+      :func:`_normalize_query` is called here (T12 also calls it
+      inside, but a call from the tool handler makes the
+      validation visible to the agent before any FS walk).
+
+    Out of scope (deliberately):
+    - BM25 / vector / semantic search — explicitly a non-goal in
+      ``docs/design.md``.
+    - Pagination / cursors — same v1.4+ punt as
+      ``list_pages``'s pagination concern.
+    - A separate ``case_sensitive`` knob — T34 inherits T12's
+      case-insensitive default; a T34a follow-up can flip the
+      bit if an agent ever needs it.
+    """
+    validated_limit = _validate_search_limit(limit)
+    results = await _pages_touching_topic(space_root, query, prefix)
+    return results[:validated_limit]
+
+
 # --- T29 tool body (space-walk variant) -------------------------------
 
 
@@ -1142,9 +1220,13 @@ def register_journal_tools(
     mcp: MCPServer,
     config: JournalConfig,
 ) -> None:
-    """Register the four journal tools iff the gate is on.
+    """Register the five journal tools iff the gate is on.
 
-    Called from :func:`mcp_silverbullet.server.build_mcp`; the caller
+    ``journal_histogram`` (T11) / ``tag_summary`` (T11) /
+    ``recent_pages`` (T11) / ``pages_touching_topic`` (T12) /
+    ``search_pages`` (T34 — bounded wrapper over T12 with a
+    ``limit`` knob). When the gate is off, none of the five
+    is registered. Called from :func:`mcp_silverbullet.server.build_mcp`; the caller
     passes the already-resolved :class:`JournalConfig` so this
     function does no env parsing and is pure against its inputs. When
     the gate is off this is a no-op (the ``/.fs``-backed tools
@@ -1216,6 +1298,36 @@ def register_journal_tools(
         query: str, prefix: str = ""
     ) -> list[dict[str, str]]:
         return await _pages_touching_topic(root, query, prefix)
+
+    @mcp.tool(
+        title="Search pages",
+        description=(
+            "Bounded substring content search over `*.md` pages under "
+            "the SB space directory (T34). Same `name`/`content`/"
+            "`both` match-kind and snippet shape as `pages_touching_topic` "
+            "(T12), with a `limit` knob (default 20, hard cap 100) "
+            "that bounds the result list. An agent that wants an "
+            "unbounded scan of the space calls `pages_touching_topic` "
+            "directly; `search_pages` exists for the common "
+            "\"show me the top matches\" case where the response "
+            "should be bounded by default. Restricted to pages whose "
+            "relative path contains `prefix`. Empty/whitespace-only "
+            "`query` is rejected before any FS walk."
+        ),
+    )
+    async def search_pages(
+        query: str,
+        prefix: str = "",
+        limit: int = _SEARCH_DEFAULT_LIMIT,
+    ) -> list[dict[str, str]]:
+        # Validate inputs at the boundary so the agent sees the
+        # error without a wasted FS walk. ``_normalize_query`` is
+        # idempotent — ``_pages_touching_topic`` also calls it, but
+        # calling it here surfaces the error message before any
+        # FS walk in the failure case.
+        _normalize_query(query)
+        _validate_prefix(prefix)
+        return await _search_pages(root, query, prefix, limit)
 
 
 __all__ = [

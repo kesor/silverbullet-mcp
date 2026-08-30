@@ -99,6 +99,7 @@ async def test_live_journal_histogram_tag_summary_recent_pages() -> None:
         port=port,
         allowed_hosts=(),
         journal=JournalConfig(enabled=True, space_path=space_path),
+        list_pages_hydrate_etags=False,
     )
     server_task = asyncio.create_task(serve(settings))
     try:

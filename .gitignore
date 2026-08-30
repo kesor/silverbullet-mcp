@@ -32,3 +32,8 @@ result-*
 .idea/
 .vscode/
 .DS_Store
+
+# Personal MCP client config (per-developer; not for public history).
+# Tracks the user's local bridge URL and bearer-token path. Downstream
+# contributors create their own.
+.mcp.json

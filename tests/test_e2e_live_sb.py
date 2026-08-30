@@ -109,6 +109,7 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
         port=port,
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
     )
     body = "hello from T7 live e2e\n"
     server_task = asyncio.create_task(serve(settings))
@@ -639,3 +640,219 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
         with suppress(asyncio.CancelledError):
             await server_task
         await _delete_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T31 verification: does SB actually enforce ``If-Match`` on
+# ``PUT /.fs/{name}``? The v1.2 design has assumed this since T23; the
+# map's T31 ticket resolves the assumption by writing a test that fails
+# loudly if it doesn't hold. The shape follows the ticket verbatim:
+# create a marker, read it twice (the ticket's "read twice" framing is
+# kept even though most SBs return the same etag both times — the
+# double-read is what the map said to do), write with the first etag
+# (must 200, no precondition expected), then mutate the page
+# out-of-band so the first etag is genuinely stale, then write again
+# with that same first etag and assert 412-equivalent ``ToolError``.
+#
+# The out-of-band mutation step is load-bearing: the only way to
+# guarantee ``etag_a`` is stale is to write the page through a path
+# that doesn't carry ``If-Match: etag_a``. The bridge's own
+# ``write_page(..., if_match=None)`` works for that (the
+# ``If-Match: <read_etag>`` threading only kicks in when the caller
+# doesn't pass one — see the v1.2 ``check_task`` / ``append_to_page``
+# carry-forwards); we use it here so the test exercises the bridge
+# end-to-end.
+#
+# This test is separate from the soft-recording precondition block in
+# ``test_live_sb_write_read_list_and_precondition``: that block was
+# correct *at T7* (we didn't know yet whether SB honors ``If-Match``,
+# so it recorded the SB fact rather than asserting). T31 is the
+# verification step that promotes the assumption to a checked
+# invariant; the soft block stays as-is so the git history captures
+# the v1.2 → v1.3 evolution cleanly.
+# ---------------------------------------------------------------------------
+
+T31_MARKER = "e2e-mcp-silverbullet-t31-if-match.md"
+
+
+async def _delete_t31_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T31_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_if_match_stale_etag_returns_412() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    body_a = "T31 first write body\n"
+    body_b = "T31 second write body (no If-Match; mutates out-of-band)\n"
+    body_c = "T31 third write body with stale If-Match; should 412\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: create the marker.
+                    created = await session.call_tool(
+                        "write_page",
+                        {"name": T31_MARKER, "content": body_a},
+                    )
+                    assert created.is_error is False, created
+                    created_payload = created.structured_content or {}
+                    etag_a = created_payload.get("etag")
+                    last_modified_a = created_payload.get("last_modified_ms")
+                    size_a = created_payload.get("size_bytes")
+                    if etag_a is None:
+                        # The dev-box SB returns no ``ETag`` response
+                        # header on PUT — a pre-existing SB fact the
+                        # v1.1 T22 / v1.2 T7 resolutions recorded.
+                        # T31 cannot thread a real etag without one,
+                        # so we fall back to the next-best synthetic:
+                        # ``"<last_modified_ms>-<size_bytes>"``. The
+                        # bridge forwards whatever the caller passes
+                        # in ``if_match`` verbatim, so a synthetic
+                        # value is structurally equivalent to a real
+                        # etag for the purposes of this test (the
+                        # question is whether SB honors the
+                        # ``If-Match`` header *at all*, not whether
+                        # the value looks like a real etag). The
+                        # synthetic etag is *guaranteed* to drift on
+                        # the mutating write below (since
+                        # ``size_bytes`` changes), so the stale-write
+                        # step is a real concurrency test either way.
+                        if last_modified_a is None or size_a is None:
+                            raise AssertionError(
+                                "T31 cannot construct a fallback etag: "
+                                "live SB stripped both ETag and "
+                                "X-Last-Modified on the PUT response. "
+                                "T31 is unrunnable against this SB "
+                                "build; the v1.2 / v1.3 concurrency "
+                                "story has no header to thread; T31 "
+                                "closes negatively on the missing "
+                                "ETag finding alone."
+                            )
+                        etag_a = f'"{last_modified_a}-{size_a}"'
+
+                    # Step 2: read twice (the ticket's "read twice"
+                    # framing — most SBs return the same etag both
+                    # times; the second read is kept so the test
+                    # matches the spec exactly).
+                    read_1 = await session.call_tool(
+                        "read_page", {"name": T31_MARKER}
+                    )
+                    assert read_1.is_error is False, read_1
+                    read_2 = await session.call_tool(
+                        "read_page", {"name": T31_MARKER}
+                    )
+                    assert read_2.is_error is False, read_2
+
+                    # Step 3: write with ``if_match=etag_a`` (still
+                    # current, must succeed).
+                    first_write = await session.call_tool(
+                        "write_page",
+                        {
+                            "name": T31_MARKER,
+                            "content": body_a,
+                            "if_match": etag_a,
+                        },
+                    )
+                    assert first_write.is_error is False, (
+                        f"If-Match with a current etag should 200; "
+                        f"got is_error=True: {first_write}"
+                    )
+
+                    # Step 4: mutate the page out-of-band so
+                    # ``etag_a`` is *guaranteed* stale. We do this
+                    # through the bridge with ``if_match=None`` (no
+                    # precondition) so the bridge layer doesn't see
+                    # the second write as a no-op retry. After the
+                    # mutation, ``etag_a`` is stale whether SB
+                    # returned a real etag (which would have drifted)
+                    # or we synthesized one from
+                    # ``last_modified_ms + size_bytes`` (which
+                    # *guarantees* drift on a different body length).
+                    mutating_write = await session.call_tool(
+                        "write_page",
+                        {"name": T31_MARKER, "content": body_b},
+                    )
+                    assert mutating_write.is_error is False, mutating_write
+
+                    # Step 5: write again with the *stale* etag.
+                    # The bridge threads ``If-Match: etag_a`` to
+                    # SB; an SB that honors preconditions returns
+                    # 412, which :func:`_translate_sb_errors`
+                    # surfaces as ``ToolError("precondition
+                    # failed; check if_match/if_none_match")``. An
+                    # SB that ignores ``If-Match`` returns 200 and
+                    # silently overwrites — the failure mode the
+                    # v1.2 / v1.3 concurrency story relies on
+                    # *not* happening. The hard assert below is
+                    # the verification: pass = T31 positive,
+                    # fail = T31 negative (which spawns T31a /
+                    # T31b per the map).
+                    stale_write = await session.call_tool(
+                        "write_page",
+                        {
+                            "name": T31_MARKER,
+                            "content": body_c,
+                            "if_match": etag_a,
+                        },
+                    )
+                    assert stale_write.is_error is True, (
+                        f"stale If-Match etag should 412 on "
+                        f"PUT /.fs/{T31_MARKER}; bridge returned "
+                        f"is_error=False (live SB silently "
+                        f"overwrote the page on a stale etag — "
+                        f"the v1.2 / v1.3 concurrency story "
+                        f"does not hold on this SB build; T31 "
+                        f"closes negatively; T31a / T31b spawn "
+                        f"to switch to the body-field "
+                        f"expected_last_modified convention "
+                        f"from xmatthewx/silverbullet-mcp-server)"
+                    )
+                    # The wording is the unified 412 translation
+                    # in :func:`_translate_sb_errors`. We assert
+                    # on the substring so future wording tweaks
+                    # don't break the test; the full message is
+                    # logged above on failure.
+                    assert stale_write.content, (
+                        "is_error=True but content is empty — "
+                        "no message to check the 412 wording against"
+                    )
+                    assert "precondition failed" in (
+                        stale_write.content[0].text
+                    ), (
+                        f"stale If-Match raised a non-412 error: "
+                        f"{stale_write.content[0].text!r}"
+                    )
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t31_marker(sb_url, sb_token)

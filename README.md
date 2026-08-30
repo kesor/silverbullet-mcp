@@ -8,14 +8,17 @@ Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
 v1.2 map (agent-facing QOL + bullet primitives, destination reached with `check_task`): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
-v1.3 map (agent-grade discovery + edit hygiene, lead-blocked on T31): [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
+v1.3 map (agent-grade discovery + edit hygiene, blocked on T31a + T31b after T31 closed negatively): [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
 Competitive landscape research (feature matrix + ranked borrow list across nine SB-MCP competitors): [`docs/competitive-landscape.md`](docs/competitive-landscape.md).
 Subjective notes from that survey (judgment calls, predictions, what I considered and rejected): [`docs/competitive-impressions.md`](docs/competitive-impressions.md).
 
 ## What it exposes
 
-Twelve tools and one resource template (v1.3 plans six more — see
-[§ v1.3 roadmap](#v13-roadmap)):
+Twelve tools and one resource template (v1.3 plans five more — see
+[§ v1.3 roadmap](#v13-roadmap); the count below is the always-on
+`/.fs`-backed + bullet-primitive surface, the optional journal
+surface is listed under [§ Optional: journal surface](#optional-journal-surface-t10t12-t34)
+and includes the v1.3-shipped `search_pages`):
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
@@ -41,31 +44,56 @@ client's stale etag does not overwrite the first client's write.
 The [v1.3 wayfinder](docs/wayfinder/map-v1.3.md) charts six
 tickets aimed at closing the most common agent-side friction
 points and surfacing the existing journal surface as agent-facing
-discovery:
+discovery. **T31 closed negatively on 2026-08-30** (live SB
+on this dev box does not honor `If-Match` and does not return
+`ETag` on PUT); the map now has eight open tickets — the
+original six plus T31a (synthetic-etag fallback when SB
+strips `ETag`) and T31b (post-write verification helper that
+re-reads and compares etags when SB silently overwrites on
+stale `If-Match`). **T34 shipped on 2026-08-30** (now in
+[What it exposes](#what-it-exposes)). T32 / T33 / T36 are
+blocked on T31a + T31b; T31a / T31b / T35 are unblocked.
 
 - **`create_page(name, content, if_match?)`** (T32) — distinct
   from `write_page`'s overwrite-or-create default; surfaces a
   clean `already_exists` `ToolError` instead of a 412 the agent
-  has to pattern-match on.
+  has to pattern-match on. **Blocked on T31a + T31b.**
 - **`prepend_to_page(name, content, position="after_frontmatter"|"top",
   if_match?, dry_run=False)`** (T33) — top-of-body insert with
   YAML frontmatter awareness; mirrors `append_to_page`'s
-  `dry_run` shape.
-- **`search_pages(query, prefix?, limit?)`** (T34) — substring
-  content search delegating to the existing journal machinery;
-  journal-gated like `list_tasks`'s space-walk form.
+  `dry_run` shape. **Blocked on T31a + T31b.**
+- **`search_pages(query, prefix?, limit?)`** (T34) — **SHIPPED
+  2026-08-30**. Substring content search delegating to the
+  existing journal machinery; journal-gated like
+  `list_tasks`'s space-walk form. **Unaffected by T31.**
+  See [§ Optional: journal surface](#optional-journal-surface-t10t12-t34)
+  for the full description.
 - **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
   wikilink-target backlinks for the rename-pre-flight workflow;
-  journal-gated.
+  journal-gated. **Unaffected by T31.**
 - **256 KiB body-size cap on every write tool** (T36) —
   `body_too_large` `ToolError` with the remediation hint before
-  the SB round trip.
-- **T31 verification** — single live-SB test asserting that
-  `If-Match: <stale_etag>` returns 412 on `PUT /.fs/{name}`. If
-  it doesn't, T31a / T31b spawn to switch to
-  `expected_last_modified` body-field convention. This is the
-  lead ticket; everything else assumes the v1.2 concurrency
-  story holds.
+  the SB round trip. **Blocked on T31a + T31b** (T36 applies
+  to all write tools, including the ones T31b re-points at
+  the post-write verification helper — the cap and the
+  helper compose).
+- **T31 verification** (resolved 2026-08-30, **negative**) —
+  `tests/test_e2e_live_sb.py::test_if_match_stale_etag_returns_412`
+  asserts that `If-Match: <stale_etag>` returns 412 on
+  `PUT /.fs/{name}`. It does not: live SB silently overwrote
+  the page with `is_error=False`. Two follow-ups charted:
+  - **T31a** — synthesize a fallback etag from
+    `X-Last-Modified` + `X-Content-Length` when SB strips
+    `ETag` (`synthesize_etag(last_modified_ms, size_bytes)`
+    helper in `sb_client.py`; stable across reads of the same
+    body, drifts on different bodies).
+  - **T31b** — replace the `If-Match`-only path with a
+    post-write verification step (re-read after the PUT and
+    compare the new etag against `if_match`; raise
+    `ToolError("concurrent edit detected: ...")` on mismatch).
+    Threaded into `write_page`, `append_to_page`,
+    `patch_page_lines`, `patch_page_replace`, `move_page`,
+    `check_task`.
 
 ### v1.2 wire-shape changes
 
@@ -184,16 +212,17 @@ for showing a human what the patch would change. The agent can
 choose to apply the patch by calling the tool again with
 `dry_run=False`, or surface the diff to the user for confirmation.
 
-## Optional: journal surface (T10–T12)
+## Optional: journal surface (T10–T12, T34)
 
 If the bridge process also has read access to the SB space directory
 (typical on the same machine that runs SilverBullet; rare behind a
-containerized split), four direct-FS read tools can be enabled:
+containerized split), five direct-FS read tools can be enabled:
 
 - `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`
 - `tag_summary(prefix?)` — count occurrences of every `tags:` value
 - `recent_pages(limit?, prefix?)` — newest pages by mtime
 - `pages_touching_topic(query, prefix?)` — case-insensitive name+content substring search; returns `{name, match, snippet}[]` where `match` is `"name"`, `"content"`, or `"both"` and `snippet` is an ~80-char window centered on the content match (or a body excerpt for name-only matches). Uses `rg --json` when `rg` is on `PATH`; falls back to a pure-Python substring scan otherwise.
+- `search_pages(query, prefix?, limit=20)` (T34) — bounded variant of `pages_touching_topic` with a `limit` knob (default 20, hard cap 100). Same `{name, match, snippet}` wire shape; same `rg` / Python-fallback split. The agent that wants the top N hits uses `search_pages`; the agent that wants an unbounded scan uses `pages_touching_topic`.
 
 They are strictly additive: the `/.fs`-backed tools above continue to
 work whether the journal surface is on or off. Set both
@@ -266,10 +295,13 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's twelve tools — `read_page`,
+`/reload` in Pi and the bridge's twelve always-on tools — `read_page`,
 `page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
 `patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
-`diff_pages`, `check_task`, `list_tasks` — register as direct Pi tools.
+`diff_pages`, `check_task`, `list_tasks` — register as direct Pi
+tools. The journal surface (including `search_pages`) registers
+additionally when `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and
+`MCP_SILVERBULLET_SPACE_PATH` are both set.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so
@@ -307,7 +339,7 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_PORT` | `8000` | Bind port |
 | `MCP_SILVERBULLET_ALLOWED_HOSTS` | *(unset → SDK loopback default)* | Extra `Host` values, comma-separated |
 | `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
-| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the four journal tools above; requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
+| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the five journal tools above (T10–T12, T34); requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
 | `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages` (T28). Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. Partial failures (404 / 412 / 5xx / timeout on one page) leave that row's etag as `null` rather than failing the whole call. |
 
 Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`

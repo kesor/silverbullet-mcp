@@ -51,6 +51,9 @@ JOURNAL_TOOL_NAMES = {
     "tag_summary",
     "recent_pages",
     "pages_touching_topic",
+    # T34 added ``search_pages`` (bounded wrapper over T12).
+    # Same journal gate — off when the gate is off, on when it's on.
+    "search_pages",
 }
 SB_TOOL_NAMES = {
     "read_page",

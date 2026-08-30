@@ -675,3 +675,252 @@ async def test_pages_touching_topic_skips_files_that_disappear_between_walk_and_
         )
     [row] = result.structured_content["result"]
     assert row["name"] in {"a.md", "b.md"}
+
+
+# --- T34 search_pages --------------------------------------------------
+#
+# T34 (``search_pages(query, prefix?, limit?)``) is a bounded wrapper
+# over ``pages_touching_topic`` — same match-kind / snippet shape, with
+# a ``limit`` knob (default 20, hard cap 100) and tighter input
+# validation at the tool boundary. The behavior-shared cases
+# (name-match, content-match, both-match, sort order, prefix filter)
+# are covered above under T12; T34's tests focus on the *bounding*
+# behavior and the input-validation surface.
+
+
+@pytest.mark.asyncio
+async def test_search_pages_returns_matches_with_default_limit(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """Three matches, default limit (20) — all returned, name-asc."""
+    _write(tmp_path, "zeta.md", "bridge mentioned\n")
+    _write(tmp_path, "alpha.md", "bridge too\n")
+    _write(tmp_path, "mike.md", "bridge three\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("search_pages", {"query": "bridge"})
+    assert result.is_error is False
+    assert _names(result) == ["alpha.md", "mike.md", "zeta.md"]
+    for row in result.structured_content["result"]:
+        assert set(row.keys()) == {"name", "match", "snippet"}
+        assert row["match"] == "content"
+
+
+@pytest.mark.asyncio
+async def test_search_pages_limit_truncates_after_sort(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit`` truncates the name-ascending result list to the first N.
+
+    Three matches exist, ``limit=2`` returns the first two in
+    name-asc order (``alpha.md``, ``mike.md``) and drops ``zeta.md``.
+    This is the "agent wants the top N" case the T34 ticket describes.
+    """
+    _write(tmp_path, "zeta.md", "bridge mentioned\n")
+    _write(tmp_path, "alpha.md", "bridge too\n")
+    _write(tmp_path, "mike.md", "bridge three\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 2}
+        )
+    assert result.is_error is False
+    assert _names(result) == ["alpha.md", "mike.md"]
+
+
+@pytest.mark.asyncio
+async def test_search_pages_limit_higher_than_match_count_returns_all(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit`` larger than the match count returns every match.
+
+    The hard cap (100) is the operator's lever; values below the
+    cap with fewer matches than the cap surface every match.
+    """
+    _write(tmp_path, "a.md", "bridge mentioned\n")
+    _write(tmp_path, "b.md", "bridge too\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 50}
+        )
+    assert result.is_error is False
+    assert _names(result) == ["a.md", "b.md"]
+
+
+@pytest.mark.asyncio
+async def test_search_pages_limit_one_returns_first_match(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit=1`` returns the single name-ascending smallest match.
+
+    Sanity-check the truncation primitive at its smallest valid
+    value — the agent that wants \"just the first hit\" uses this.
+    """
+    _write(tmp_path, "zeta.md", "bridge mentioned\n")
+    _write(tmp_path, "alpha.md", "bridge too\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 1}
+        )
+    assert result.is_error is False
+    [row] = result.structured_content["result"]
+    assert row["name"] == "alpha.md"
+
+
+# --- input validation --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_empty_query(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """Empty ``query`` → ``ToolError`` before any FS walk (T34 ticket)."""
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("search_pages", {"query": ""})
+    assert result.is_error is True
+    assert "empty" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_whitespace_only_query(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """Whitespace-only ``query`` → ``ToolError`` after normalize.
+
+    Mirrors the T12 test of the same shape — ``search_pages``
+    inherits ``_normalize_query``'s collapse-then-check.
+    """
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "   \n\t  "}
+        )
+    assert result.is_error is True
+    assert "empty" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_zero_limit(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit=0`` → ``ToolError`` (would silently return empty list)."""
+    _write(tmp_path, "a.md", "bridge mentioned\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 0}
+        )
+    assert result.is_error is True
+    assert "limit" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_negative_limit(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit=-5`` → ``ToolError`` (non-positive integer)."""
+    _write(tmp_path, "a.md", "bridge mentioned\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": -5}
+        )
+    assert result.is_error is True
+    assert "limit" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_limit_over_hard_cap(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit > 100`` → ``ToolError`` naming the hard cap.
+
+    The hard cap is 100; an operator who passes 9999 gets a clear
+    \"too large\" message that names the cap and the remediation
+    (narrow the query or prefix instead of raising the cap).
+    """
+    _write(tmp_path, "a.md", "bridge mentioned\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 9999}
+        )
+    assert result.is_error is True
+    assert "100" in result.content[0].text
+    assert "cap" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_accepts_limit_at_hard_cap(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``limit=100`` (the hard cap itself) is accepted (boundary, inclusive).
+
+    The cap is the operator's lever; values at the cap are valid.
+    """
+    _write(tmp_path, "a.md", "bridge mentioned\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "limit": 100}
+        )
+    assert result.is_error is False
+    assert len(result.structured_content["result"]) == 1
+
+
+# --- prefix filter passthrough ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_pages_prefix_filters_to_subtree(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """``prefix`` scoping works the same as ``pages_touching_topic``'s.
+
+    T34 delegates to T12 internally; the prefix-validation contract
+    (no traversal, no absolute) carries forward unchanged. The
+    match exists in two files; ``prefix="Areas"`` returns only the
+    one under the Areas subtree.
+    """
+    _write(tmp_path, "Daily/2026-01-05.md", "bridge mentioned\n")
+    _write(tmp_path, "Areas/contacts.md", "bridge too\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "bridge", "prefix": "Areas"}
+        )
+    assert _names(result) == ["Areas/contacts.md"]
+
+
+@pytest.mark.asyncio
+async def test_search_pages_rejects_dot_dot_prefix(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """Prefix-traversal guard carries forward (``_validate_prefix``)."""
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "search_pages", {"query": "anything", "prefix": "../etc"}
+        )
+    assert result.is_error is True
+    assert ".." in result.content[0].text
+
+
+# --- wire shape --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_pages_no_match_returns_empty(
+    tmp_path: Path, force_python_path: None
+) -> None:
+    """Files exist, no match → ``{"result": []}`` (same shape as T12)."""
+    _write(tmp_path, "a.md", "alpha\n")
+    _write(tmp_path, "b.md", "beta\n")
+    server = _build(tmp_path)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("search_pages", {"query": "zzz"})
+    assert result.is_error is False
+    assert result.structured_content == {"result": []}

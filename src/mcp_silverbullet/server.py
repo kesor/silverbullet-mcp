@@ -65,6 +65,20 @@ primitive (``list_tasks``) — twelve total —
 and the resource template. See :mod:`mcp_silverbullet.journal` for
 the gate logic.
 
+T34 of v1.3 adds ``search_pages`` to the journal surface — a
+bounded wrapper over T12's machinery with a ``limit`` knob
+(default 20, hard cap 100). The gate behaviour is unchanged
+(off when the gate is off, on with the rest of the journal
+tools when it's on); the tool itself is the fifth journal
+entry alongside the existing four (T10–T12).
+
+T34 of v1.3 adds ``search_pages`` to the journal surface — a
+bounded wrapper over T12's machinery with a ``limit`` knob
+(default 20, hard cap 100). The gate behaviour is unchanged
+(off when the gate is off, on with the rest of the journal
+tools when it's on); the tool itself is a thirteenth ``/.fs``
++ journal entry alongside the existing twelve.
+
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
@@ -511,8 +525,11 @@ def build_mcp(
     journal
         Already-resolved journal gate config. ``None`` means the gate
         is off (no journal tools registered). When the gate is on,
-        the bridge registers the four journal-surface tools in
-        addition to the eleven ``/.fs``-backed + bullet-primitive
+        the bridge registers the five journal-surface tools
+        (``journal_histogram`` / ``tag_summary`` / ``recent_pages``
+        / ``pages_touching_topic`` / ``search_pages`` — the last
+        is T34, a bounded wrapper over T12 with a ``limit`` knob)
+        in addition to the twelve ``/.fs``-backed + bullet-primitive
         tools (``read_page`` / ``page_exists`` / ``write_page`` /
         ``delete_page`` / ``append_to_page`` /
         ``patch_page_lines`` / ``patch_page_replace`` /
@@ -543,15 +560,19 @@ def build_mcp(
         name=name,
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
-            "check existence of, diff, enumerate, and flip "
-            "checkbox tasks on SilverBullet pages. Twelve tools "
-            "(`read_page`, `page_exists`, `write_page`, "
-            "`delete_page`, `append_to_page`, "
+            "check existence of, diff, enumerate, search, and "
+            "flip checkbox tasks on SilverBullet pages. Twelve "
+            "always-on tools (`read_page`, `page_exists`, "
+            "`write_page`, `delete_page`, `append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`, "
             "`move_page`, `list_pages`, `diff_pages`, "
-            "`check_task`, `list_tasks`) plus one resource "
-            "template `silverbullet://page/{name}` for "
-            "attaching page bodies to conversation context. "
+            "`check_task`, `list_tasks`) plus up to five "
+            "journal-gated tools (`journal_histogram`, "
+            "`tag_summary`, `recent_pages`, "
+            "`pages_touching_topic`, `search_pages`) when the "
+            "operator enables the journal surface, plus one "
+            "resource template `silverbullet://page/{name}` "
+            "for attaching page bodies to conversation context. "
             "The four read-modify-write tools "
             "(`append_to_page`, `patch_page_lines`, "
             "`patch_page_replace`, `check_task`) accept "
