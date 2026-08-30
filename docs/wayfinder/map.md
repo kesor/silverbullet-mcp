@@ -28,17 +28,21 @@ artefact.
   `mattpocock/skills@domain-modeling`, `modern-web-guidance`, `fullstack-dev`,
   `security-and-hardening`, `incremental-implementation`.
 - **Standing preferences for this effort**:
-  - **Off-the-shelf libraries only** — prefer `@modelcontextprotocol/server`,
-    `hono`, `zod`, nixpkgs over hand-rolled parsers/transports/builders.
+  - **Off-the-shelf libraries only** — prefer the official `mcp` Python
+    SDK (`mcp==2.1.1`, MIT), `httpx` for the SilverBullet client, nixpkgs
+    over hand-rolled parsers/transports/builders.
   - **One `flake.nix`** owns dependencies for both the runtime and the dev
-    shell. No separate `package.json` lockfiles outside what the flake pins.
+    shell. No separate `pyproject.toml`/`requirements.txt` lockfiles outside
+    what the flake pins.
   - **Side-car process**, not embedded — locked at charter time.
   - **Streamable HTTP transport** locked at T1
     ([resolution](#t1-transport-choice-streamable-http-vs-httpsse)),
     2026-07-28 spec era, stateless posture, single `POST /mcp`.
-  - The design doc must spell out a path for both `trycloudflare.com` quick
-    tunnels (zero-account) and stable named tunnels.
-  - **No MCP Apps / no UI resources** — read/write tools only.
+  - The design doc must spell out the **boot order** with the user-owned
+    Cloudflare tunnel. Tunnel durability itself is out of scope per T6.
+  - **No MCP Apps / no UI resources** — three tools + one resource
+    template, locked at T4.
+  - **Static bearer auth, one shared secret on both hops** — locked at T2.
 
 ## Decisions so far
 
@@ -48,17 +52,38 @@ artefact.
   `mcp-silverbullet/`, plain TypeScript on Node 24, separate process from
   SilverBullet. Communicates with SB via its existing `/.fs` and `/.auth` HTTP
   API. (Locked at charter time.)
-- **[MCP protocol era](#t-protocol-era)**: 2026-07-28 spec, SDK v2
-  (`@modelcontextprotocol/server` 2.0.0). Match nixpkgs unpinned
-  (will pin to npm tag at first build).
-- **[Cloudflare tunnel model](#t-cf-tunnel-model)**: Already provisioned by
-  user; design doc only needs to document boot order and re-connect
-  procedure. Out of scope: provisioning automation.
+- **[MCP protocol era](#t-protocol-era)**: 2026-07-28 spec, on the
+  official `mcp` Python SDK (v2, `mcp==2.1.1`). Nixpkgs unpinned until T5
+  picks a Python version.
+- **[T-cf-tunnel]** (charter-locked, lifted fully at T6): tunnel is
+  user-managed; the bridge binds `127.0.0.1:<port>` and the operator
+  publishes it through their existing `cloudflared` invocation.
 - **[T1 — Transport choice](#t1-transport-choice-streamable-http-vs-httpsse)**:
   Streamable HTTP — the only standard remote binding in the 2026-07-28 era.
   Stateless posture: single `POST /mcp`, optional per-request SSE responses,
   no protocol-level sessions, no `initialize` handshake. HTTP+SSE rejected
   for being deprecated and incompatible with `trycloudflare.com`.
+- **[T2 — Auth model](#t2-auth-model)**: Static bearer on both hops, one
+  shared secret (`MCP_SILVERBULLET_TOKEN`); bridge→SB carries the same
+  `Authorization: Bearer <T>` it just verified. No OAuth 2.1 — the SDK's
+  `TokenVerifier` protocol is a 10-line constant-time compare against the
+  env-supplied token.
+- **[T3 — Stack](#t3-stack)**: Python on `mcp==2.1.1` (`mcp.server.MCPServer`
+  + `mcp.run(transport="streamable-http", stateless_http=True,
+  transport_security=…)`). Streamable HTTP is a one-call option, `httpx`
+  ships transitively for the SB client, `TokenVerifier` is the only auth
+  integration point.
+- **[T4 — Tool surface](#t4-tool-surface)**: Three tools, one resource
+  template — `read_page`, `write_page` (with `X-Source: external` on the
+  PUT), `list_pages` (filter by prefix client-side), and
+  `silverbullet://page/{name}` for Grok's "attach" UI.
+- **[T6 — Tunnel durability](#t6-tunnel-durability)**: Resolved as
+  out-of-scope lift. The bridge binds `127.0.0.1:<port>`; the user's
+  existing `cloudflared` publishes it. One paragraph in `design.md`
+  §Deployment covers boot order; URL-rotation is the operator's problem.
+- **[T8 — License & repo home](#t8-license--repo-home)**: License → MIT
+  (matches the upstream SDK). Repo home → deferred ("dev local for now");
+  reopen if/when there's a reason to publish.
 
 ## Tickets
 
@@ -221,13 +246,23 @@ never blocked on T1.
 
 ### T5. Nix shape
 
+> **Status**: ⏳ in-progress (rephrased after T3 to match the Python stack)
 > **Labels**: `wayfinder:research`
-> **Question**: How does the flake consume the chosen SDK?
->   - `nodePackages` derivation with `@modelcontextprotocol/server` pinned?
->   - `pnpm2nix` reading a `pnpm-lock.yaml`?
->   - `dream2nix`?
->   - `buildNpmPackage` with a manually-written lockfile?
-> Confirm one approach is smallest and most reproducible.
+> **Question**: How does the flake consume the Python stack locked by T3?
+> Candidates:
+>   - `python311.withPackages (ps: [ ps.mcp ps.httpx ps.pydantic ... ])`
+>     plus a hand-written `requirements.txt`. Simplest. Relies on
+>     `python311Packages.mcp` being populated in nixpkgs unstable, which
+>     it is on master as of 2026.
+>   - `poetry2nix` reading a `pyproject.toml`/`poetry.lock`. Heavier but
+>     pins transitive deps with a lockfile.
+>   - `uv2nix` reading a `uv.lock` (PEP 723 script-style or uv-managed
+>     venv). Heavier still, bleeding edge.
+>   - `buildPythonApplication` derivation wrapping a hand-built virtualenv.
+>     Most reproducible, most code.
+> Confirm which is smallest and most reproducible for a one-binary
+> bridge whose only Python deps are `mcp` + `httpx` (+ `pydantic`
+> transitively).
 > **Files when resolved**: design.md §Build, plus a stub `flake.nix` we
 > can flesh out post-design.
 
