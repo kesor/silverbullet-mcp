@@ -75,7 +75,7 @@ Charted; no tickets resolved yet. Frontier tickets are open below.
 
 <!-- index only — one line per closed ticket, link to the ticket's resolution below -->
 
-(empty — no tickets resolved yet on this map)
+- [T1. Repo skeleton + pyproject.toml](#t1-repo-skeleton--pyprojecttoml) (commit `dd478`): package shell at `src/mcp_silverbullet/` with smoke entry point, `pyproject.toml` pinning `mcp==2.1.1` + `httpx2>=2.5.0` + Starlette + uvicorn (plus `pytest`/`pytest-asyncio`/`respx` as the test extra), stub `README.md` (T6 replaces), `uv.lock` resolved against Python 3.13. `uv sync` resolves 42 packages; `python -m mcp_silverbullet` prints hello and exits 0.
 
 ## Tickets
 
@@ -94,7 +94,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK (the agent does it)
-> **Assignee**: claude (claimed 2026-01-15)
+> **Assignee**: claude (claimed 2026-01-15, resolved same day)
+> **Status**: ✅ resolved (commit `dd478`)
 > **Question**: Lay down the directory layout, `pyproject.toml` with
 > pinned deps, an empty `src/mcp_silverbullet/` package, a `uv.lock`
 > generated via `uv lock`, a `.gitignore`, and the smoke-test entry
@@ -105,6 +106,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Done when**: `uv sync` produces a venv with `mcp==2.1.1` and
 > `httpx>=0.27` resolved, `python -m mcp_silverbullet` prints a hello
 > and exits 0, and `git ls-files` shows the new files.
+> **Resolution**: `mcp==2.1.1` and `httpx2==2.12.0` (a.k.a. `httpx2>=2.5.0`) resolved; `python -m mcp_silverbullet` prints hello and exits 0; venv built against CPython 3.13.15 (the nixpkgs default). See commit `dd478` for the full diff and the carrying-forward notes (sb_client.py will import from httpx2, not httpx; FastMCP is now MCPServer in v2.x).
 > **Unblocks**: T2, T3, T4.
 
 ---
