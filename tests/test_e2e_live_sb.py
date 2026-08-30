@@ -137,6 +137,21 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         body.encode("utf-8")
                     )
 
+                    # ``page_exists`` (T25): the freshly-written
+                    # marker is on disk, so the round-trip should
+                    # return ``True``. Live-SB coverage is optional
+                    # per the v1 T7 carry-forward (the Layer-1 +
+                    # Layer-3 tests already lock the wire shape),
+                    # but a single round-trip here guards the
+                    # full HTTP path against the live server.
+                    present = await session.call_tool(
+                        "page_exists", {"name": MARKER}
+                    )
+                    assert present.is_error is False, present
+                    assert (present.structured_content or {}) == {
+                        "result": True
+                    }
+
                     read_back = await session.call_tool(
                         "read_page", {"name": MARKER}
                     )

@@ -11,9 +11,10 @@ v1.2 map (agent-facing QOL + bullet primitives, six open tickets after T23+T24):
 
 ## What it exposes
 
-Eight tools and one resource template:
+Nine tools and one resource template:
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
+- `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
 - `write_page(name, content, if_match?)` — create/update; returns `{name, etag, size_bytes, last_modified_ms, created_ms}` (T23 acknowledgement envelope)
 - `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the T23 ack envelope
 - `patch_page_lines(name, start_line, end_line, new_content, if_match?)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the T23 ack envelope
@@ -181,8 +182,8 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's eight tools — `read_page`,
-`write_page`, `append_to_page`, `patch_page_lines`,
+`/reload` in Pi and the bridge's nine tools — `read_page`,
+`page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
 `patch_page_replace`, `move_page`, `delete_page`, `list_pages` —
 register as direct Pi tools.
 

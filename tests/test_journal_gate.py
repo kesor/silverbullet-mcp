@@ -61,6 +61,7 @@ SB_TOOL_NAMES = {
     "patch_page_lines",
     "patch_page_replace",
     "move_page",
+    "page_exists",
 }
 
 

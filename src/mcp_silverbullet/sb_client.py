@@ -22,6 +22,14 @@ Four entry points:
   ``list[FileMeta]`` (the minimal subset) until T28 widens both
   client and tool to ``list[PageMeta]``.
 
+A fifth entry point, added in v1.2:
+
+- :func:`exists_page` — ``GET /.fs/{name}`` — returns ``bool``
+  (T25): ``True`` for 200, ``False`` for 404, raises
+  :class:`ServerError` on 5xx so the caller can distinguish
+  "doesn't exist" from "SB is broken". Body bytes are never
+  materialized; this is a cheap existence check, not a read.
+
 The status-code mapping lives in :func:`_raise_for_status` and matches
 the table in ``docs/design.md`` § Tools. The PUT envelope carries the
 full header set the design doc § SilverBullet client contract calls
@@ -248,6 +256,78 @@ class SBClient:
         response = await self._client.get(f"/.fs/{name}")
         _raise_for_status(response)
         return _meta_from_response(response, name, body=response.text)
+
+    async def exists_page(self, name: str) -> bool:
+        """Cheap existence check: ``GET /.fs/{name}`` → ``True`` / ``False``.
+
+        Translates ``200`` → ``True``, ``404`` → ``False``, ``5xx``
+        → :class:`ServerError`, ``412`` → :class:`PreconditionFailed`,
+        ``413`` → :class:`BodyTooLarge` (each via the standard
+        :func:`_raise_for_status` mapping — the SB client's typed
+        exceptions are the canonical surface for "this went wrong",
+        and the MCP-tool handler translates them to ``ToolError``
+        per the design doc). The body bytes are never materialized
+        (we don't read ``response.text`` / ``response.content``) —
+        the call is one round-trip with the headers only, which is
+        cheaper than a full :func:`read_page` for the "does this
+        page exist?" question. If the caller also wants the etag
+        / size / body, :func:`read_page` is one round trip away;
+        this method is for the *existence-only* case.
+
+        Why a GET and not HEAD: SB's ``/.fs`` endpoint is documented
+        to honor ``GET`` but ``HEAD`` semantics aren't part of the
+        upstream contract we lock against (``server/src/handlers/
+        fs.rs``), so a HEAD could behave differently across SB
+        versions. GET is the wire-level primitive the design doc
+        guarantees.
+
+        Why ``ServerError`` on 5xx rather than returning ``False``:
+        the caller asked a definitive question ("does the page
+        exist?") and "I don't know, the server is broken" is not a
+        valid ``False`` answer. The MCP-tool handler surfaces the
+        exception as a :exc:`ToolError` so the agent sees the
+        difference between a real "no" (proceed with create /
+        skip) and "SB is down, don't make decisions" (retry or
+        surface to the user).
+
+        A 412 / 413 on a GET is unexpected — preconditions and
+        body-size limits live on writes, not reads — but either
+        would indicate a proxy / SB misconfiguration, so we let it
+        propagate via the standard :func:`_raise_for_status` mapping
+        for the tool layer to surface the same way it does for the
+        read tools. Without this, an unhandled ``PreconditionFailed``
+        or ``BodyTooLarge`` would leak as a generic ``MCPError``
+        rather than the design-doc ``ToolError`` wording.
+
+        The function does not wrap in :func:`_translate_sb_errors`
+        (that's an MCP-layer concern); instead, it surfaces
+        ``ServerError`` / ``PreconditionFailed`` / ``BodyTooLarge``
+        directly and lets the MCP tool handler translate to
+        ``ToolError``. Timeouts bubble up as
+        :class:`httpx.TimeoutException` (the SB client's standard
+        exception type); the tool layer translates those too.
+        """
+        response = await self._client.get(f"/.fs/{name}")
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        # Every other status (5xx, unexpected 4xx, future 2xx that
+        # isn't 200) gets handed to ``_raise_for_status`` so the
+        # exception type and wording stay in one place. ``False`` is
+        # the *only* "no" answer; an unexpected status (e.g. a 204
+        # if SB ever returns one for an empty page, or a 500)
+        # surfaces as a typed exception so the caller gets a clear
+        # error rather than a quietly wrong yes/no.
+        _raise_for_status(response)
+        # ``_raise_for_status`` returns silently on 2xx and raises
+        # on everything else, so the only reachable path here is
+        # the future-proofing case: a 2xx other than 200 should
+        # count as "exists" (the safest answer to the existence
+        # question if SB ever adds, e.g., a 204 No Content for an
+        # empty page). Today no such response is documented; this
+        # line is defensive rather than load-bearing.
+        return True
 
     async def write_page(
         self,

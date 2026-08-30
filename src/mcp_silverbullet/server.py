@@ -9,10 +9,13 @@ return type from ``str | None`` (the new ETag) to a
 made a write knows ``size_bytes`` / ``last_modified_ms`` /
 ``created_ms`` without a follow-up read. T24 widens the read-side
 tool shape (``read_page`` and the ``silverbullet://page/{name}``
-resource template) to match. T28 widens ``list_pages``. The bridge
-still registers eight ``/.fs``-backed tools
-(``read_page`` / ``write_page`` / ``delete_page`` /
-``append_to_page`` / ``patch_page_lines`` /
+resource template) to match. T25 adds ``page_exists`` for a
+ninth ``/.fs``-backed tool — a cheap ``GET`` that returns
+``bool`` so an agent can answer "does this page exist?" without
+paying for the full read body. T28 widens ``list_pages``. The
+bridge still registers nine ``/.fs``-backed tools
+(``read_page`` / ``page_exists`` / ``write_page`` /
+``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
 ``patch_page_replace`` / ``move_page`` / ``list_pages``) plus one
 resource template (``silverbullet://page/{name}``). Each tool
 closes over a single :class:`SBClient` opened at boot; SB's typed
@@ -25,7 +28,7 @@ T10 of the v1.1 map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the eight ``/.fs``-backed tools and the resource
+registers only the nine ``/.fs``-backed tools and the resource
 template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
@@ -33,7 +36,7 @@ client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24 done; T28 next).
+agent-facing QOL tickets (T23/T24/T25 done; T28 next).
 """
 
 from __future__ import annotations
@@ -289,9 +292,10 @@ def build_mcp(
     mcp = MCPServer(
         name=name,
         instructions=(
-            "Read, write, append to, patch, move, delete, and list "
-            "SilverBullet pages. Eight tools (`read_page`, "
-            "`write_page`, `append_to_page`, `patch_page_lines`, "
+            "Read, write, append to, patch, move, delete, list, "
+            "and check existence of SilverBullet pages. Nine tools "
+            "(`read_page`, `page_exists`, `write_page`, "
+            "`append_to_page`, `patch_page_lines`, "
             "`patch_page_replace`, `move_page`, `delete_page`, "
             "`list_pages`) plus one resource template "
             "`silverbullet://page/{name}` for attaching page "
@@ -311,7 +315,7 @@ def build_mcp(
 
 
 def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
-    """Attach the eight ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the nine ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
@@ -354,6 +358,54 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         async with _translate_sb_errors(name):
             page = await sb_client.read_page(name)
         return _read_meta_to_payload(page)
+
+    @mcp.tool(
+        title="Page exists",
+        description=(
+            "Cheap existence check for a SilverBullet page. "
+            "Returns `true` if the page exists, `false` if it "
+            "doesn't. Issues `GET /.fs/{name}` and discards the "
+            "body, so it's cheaper than `read_page` for the "
+            "\"does this page exist?\" question (no body bytes "
+            "are materialized). A `false` answer is definitive "
+            "— 404 means the page isn't there. A 5xx surfaces as "
+            "`ToolError(\"silverbullet error: <status>\")` so the "
+            "caller can distinguish \"no, proceed with create\" "
+            "from \"SB is broken, don't make decisions\". If the "
+            "caller also needs the etag / size / body, "
+            "`read_page` is one round trip away; this tool is "
+            "for the existence-only case. ToolError wording on "
+            "timeouts matches the rest of the bridge: "
+            "\"silverbullet request timed out\"."
+        ),
+    )
+    async def page_exists(name: str) -> bool:
+        # ``exists_page`` swallows ``PageNotFound`` internally and
+        # returns ``False``; we don't go through
+        # :func:`_translate_sb_errors` because that helper turns
+        # 404 into a ``ToolError`` (the right behaviour for the
+        # read/write tools, wrong for the existence question).
+        # Other SB exceptions (412 / 413 / 5xx) and httpx timeouts
+        # still need translating, so we wrap them inline — same
+        # wording as :func:`_translate_sb_errors`, but without the
+        # 404 clause. (``PreconditionFailed`` and ``BodyTooLarge``
+        # are highly unusual on a GET, but if SB / a proxy ever
+        # behaves oddly we still want a sensible ``ToolError``
+        # rather than an unhandled exception.)
+        try:
+            return await sb_client.exists_page(name)
+        except PreconditionFailed as exc:
+            raise ToolError(
+                "precondition failed; check if_match/if_none_match"
+            ) from exc
+        except BodyTooLarge as exc:
+            raise ToolError(
+                f"body too large: limit is {_BODY_LIMIT_MIB} MiB"
+            ) from exc
+        except ServerError as exc:
+            raise ToolError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError("silverbullet request timed out") from exc
 
     @mcp.tool(
         title="Write page",

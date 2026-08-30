@@ -294,6 +294,93 @@ resolution below -->
   template test for the JSON wire shape; live e2e skipped).
   `nix flake check` not run (this dev box doesn't have Nix).
 
+- **T25. `page_exists(name) -> bool`.** (commit pending): The
+  bridge gained a ninth `/.fs`-backed tool for a cheap
+  existence check. `page_exists(name)` issues `GET /.fs/{name}`,
+  returns `True` on 200 / `False` on 404 / `ToolError` on 5xx,
+  and discards the body bytes (no `response.text` /
+  `response.content` access). The new wire shape is `bool` —
+  additive, not a breaking change, but every other reference in
+  the codebase to "eight tools" had to be bumped to "nine" to
+  stay honest.
+
+  **Why GET, not HEAD**: SB's `/.fs` endpoint documents GET
+  semantics; HEAD isn't part of the upstream contract the
+  bridge locks against (`server/src/handlers/fs.rs`). GET is the
+  wire-level primitive the design doc guarantees. (The map's
+  standing preference said this out loud; T25 is the
+  ticket that lands it.)
+
+  **Why 5xx → ToolError, not False**: the caller asked a
+  definitive question ("does the page exist?") and "I don't
+  know, the server is broken" is not a valid False. An agent
+  that gets `False` proceeds with confidence; an agent that
+  gets a `ToolError` retries or surfaces the failure. Same
+  reasoning as the rest of the bridge's 5xx-to-ToolError
+  translation.
+
+  **Why a fresh `page_exists` MCP tool handler, not a wrapper
+  around `_translate_sb_errors`**: that helper turns 404 into a
+  `ToolError` (right for the read/write tools, wrong for the
+  existence question — 404 *is* the answer). The new handler
+  catches `PreconditionFailed` / `BodyTooLarge` / `ServerError` /
+  `httpx.TimeoutException` inline and translates each to the
+  same wording `_translate_sb_errors` uses, so the agent's
+  error-handling doesn't have to special-case `page_exists`.
+  (`PreconditionFailed` and `BodyTooLarge` are highly unusual
+  on a GET, but if a proxy / SB misconfiguration triggers one
+  the caller still gets a design-doc `ToolError` rather than
+  an unhandled exception leaking as a generic `MCPError`.)
+
+  **Files touched**: `src/mcp_silverbullet/sb_client.py` (new
+  `exists_page` method on `SBClient`; module-level docstring
+  updated to mention the fifth entry point), `src/mcp_silverbullet/
+  server.py` (new `@mcp.tool("Page exists")` handler; module-
+  level docstring bumped "eight" → "nine" throughout; the
+  server `instructions` string now lists nine tools;
+  `register_tools` docstring ditto), `tests/test_sb_client.py`
+  (+5 tests: 200 → True, 404 → False, body-not-materialized on
+  200, 5xx raises `ServerError`, GET-method-and-path),
+  `tests/test_tools_in_memory.py` (+6 tests: 200 → True, 404 →
+  False, 5xx → ToolError wording, timeout → ToolError wording,
+  412 → 412-wording, body-not-leaked-on-200),
+  `tests/test_journal_gate.py` (`SB_TOOL_NAMES` gains
+  `"page_exists"` — the journal gate's set-shape assert on the
+  eight pre-existing SB tools now expects nine),
+  `tests/test_http_auth.py` (the `list_tools` round-trip on the
+  Layer-2 ASGI server now expects nine entries),
+  `README.md` (the "What it exposes" tool list gains
+  `page_exists`; the prose summary and the Pi-MCP wiring
+  paragraph bumped "eight" → "nine"), `CHANGELOG.md` (T25
+  entry under Unreleased's `### Added` — no migration note
+  because the tool is additive), `docs/design.md` (§ Tools
+  prose now says "Nine tools, one resource template"; the
+  Tools table grew a `page_exists` row; the Status-code
+  mapping table calls out the 404-is-the-answer exception for
+  `page_exists`).
+
+  **Bonus improvements visible while doing it**: the
+  `page_exists` handler's exception clause list is a deliberate
+  superset of `_translate_sb_errors` minus the 404 clause — so
+  the design-doc wording is preserved on every error variant
+  the bridge could surface, and the next reader doesn't have
+  to wonder why this one handler is "different" from the
+  others. The `exists_page` client method delegates to
+  `_raise_for_status` for every non-success status so the
+  typed-exception vocabulary stays in one place.
+
+  **Unblocks**: T28 (the `list_pages` widening can now rely
+  on `page_exists` as a cheap alternative for "is this specific
+  page in the space?" — the agent doesn't have to fetch the
+  whole list to find out). T29/T30 don't directly depend on
+  T25, but the `page_exists` shape is the kind of cheap
+  primitive that simplifies the per-page existence checks a
+  bullet-walker would do anyway.
+
+  Test count: 196 pass + 2 skip (was 185 pass + 2 skip; +5
+  new sb_client tests + 6 new in-memory tests; `nix flake
+  check` green).
+
 ## Tickets
 
 <!--
@@ -387,7 +474,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: How does the bridge expose a cheap existence check?
 >
 > **Context**: Today, "does `Areas/Foo.md` exist?" costs a full

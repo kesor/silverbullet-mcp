@@ -8,9 +8,10 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes eight MCP **tools** —
-`read_page`, `write_page`, `append_to_page`, `patch_page_lines`,
-`patch_page_replace`, `move_page`, `delete_page`, `list_pages` —
+file API on `/.fs/…`). The bridge exposes nine MCP **tools** —
+`read_page`, `page_exists`, `write_page`, `append_to_page`,
+`patch_page_lines`, `patch_page_replace`, `move_page`, `delete_page`,
+`list_pages` —
 and one MCP **resource template** — `silverbullet://page/{name}` —
 letting Grok read and write your SilverBullet pages as conversation
 context or as tool calls.
@@ -214,11 +215,14 @@ dev = [
 v1 locked three tools at T4; v1.1 grew the surface to eight (T18
 added `delete_page`, T19 added `append_to_page`, T20 added
 `patch_page_lines`, T21 added `patch_page_replace`, T22 added
-`move_page`). **Eight tools, one resource template.**
+`move_page`). v1.2's T25 adds `page_exists` for a ninth tool —
+a cheap `GET /.fs/{name}` that returns `bool` instead of the full
+markdown body. **Nine tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
 | `read_page` | `name: str` | `GET /.fs/{name}` | `{body, etag, size_bytes, last_modified_ms}` (T24; `name` and `created_ms` dropped — caller passed `name`, reads have no create-vs-update distinction) | none |
+| `page_exists` | `name: str` | `GET /.fs/{name}` (body bytes discarded) | `bool` (T25: `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken") | none |
 | `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may create / overwrite / refuse on `412` |
 | `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may append / refuse on `412` (concurrent-write protection) |
 | `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
@@ -261,11 +265,11 @@ we are.
 
 | SB response | Tool behavior |
 |---|---|
-| `200 OK` | success — return body / `FileMeta` |
-| `404 Not Found` | `read_page` returns `ToolError("page not found: {name}")` (handler-level error → `isError=True`) |
-| `412 Precondition Failed` | `write_page` returns `ToolError("precondition failed; check if_match/if_none_match")` |
-| `413 Body Too Large` | `write_page` returns `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
-| `5xx` | `ToolError("silverbullet error: <status>")` |
+| `200 OK` | success — return body / `FileMeta` / `bool` |
+| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. |
+| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). |
+| `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
+| `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions" |
 | timeout | `ToolError("silverbullet request timed out")` |
 
 ### What we are not doing (v1)

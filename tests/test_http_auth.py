@@ -285,6 +285,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                         "delete_page",
                         "list_pages",
                         "move_page",
+                        "page_exists",
                         "patch_page_lines",
                         "patch_page_replace",
                         "read_page",

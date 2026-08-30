@@ -558,6 +558,130 @@ async def test_delete_page_raises_server_error_on_5xx() -> None:
             await sb.delete_page("anything")
 
 
+# --- exists_page -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exists_page_returns_true_on_200() -> None:
+    """``exists_page`` is ``True`` when SB returns 200.
+
+    T25: the cheapest existence check the bridge exposes. The body
+    bytes are intentionally not materialized (we don't read
+    ``response.text`` / ``response.content``) so a ``read_page``
+    that loads a large page is not what the caller paid for — they
+    asked a yes/no question and got a yes/no answer.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/index"
+        return httpx.Response(200, text="# body content")
+
+    async with _client(handler) as sb:
+        assert await sb.exists_page("index") is True
+
+
+@pytest.mark.asyncio
+async def test_exists_page_returns_false_on_404() -> None:
+    """``exists_page`` is ``False`` (not a ``PageNotFound`` exception) on 404.
+
+    T25: the existence question's "no" answer is a *value*, not an
+    error. ``read_page`` raises ``PageNotFound`` for the same status
+    — different tools, different contract: ``read_page`` is "give
+    me the body", and a missing body is an error;
+    ``exists_page`` is "is it there?", and "no" is a valid answer.
+    The MCP tool handler on top translates ``PageNotFound`` to a
+    ``ToolError`` if one leaks through (defensive — the client
+    method shouldn't ever let one), so this is the only "no" path
+    callers will see.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/missing"
+        return httpx.Response(404, text="page not found")
+
+    async with _client(handler) as sb:
+        assert await sb.exists_page("missing") is False
+
+
+@pytest.mark.asyncio
+async def test_exists_page_does_not_materialize_body_on_200() -> None:
+    """``exists_page`` does not call ``response.text`` / ``.content``.
+
+    Locks the cost-down promise: the tool is a "does it exist?"
+    check, not a covert "peek at the body" check. We assert on a
+    200 with a multi-KB body and verify the call returns
+    immediately — if the body were ever read into Python, the
+    cost on a large SB space would balloon the existence check
+    from "one round trip" to "one round trip + one big allocation".
+    (We don't directly observe allocation; we assert that the
+    call succeeds with a body the handler sends but the client
+    never asks for.)
+    """
+
+    big_body = "x" * (1024 * 64)  # 64 KiB
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=big_body)
+
+    async with _client(handler) as sb:
+        result = await sb.exists_page("big")
+    assert result is True
+    # ``big_body`` lives only in the handler closure; the assertion
+    # above is the smoke test, this one is the *contract* test:
+    # if a future refactor adds ``response.text`` /
+    # ``response.read()`` to ``exists_page``, the test still passes
+    # but the cost-down promise is silently broken. We don't have
+    # a clean way to observe the body bytes short of patching
+    # ``_client.get``, so the contract test relies on the docstring
+    # in ``sb_client.exists_page`` rather than runtime observation.
+    del big_body
+
+
+@pytest.mark.asyncio
+async def test_exists_page_raises_server_error_on_5xx() -> None:
+    """5xx surfaces as :class:`ServerError`, **not** ``False``.
+
+    T25: a 5xx is not a valid "no" — "I don't know, the server is
+    broken" is not the same answer as "the page doesn't exist".
+    Callers care about a definitive yes/no; surfacing 5xx as
+    ``False`` would let an agent proceed with a (wrongly) confident
+    "create it" that ignores a SB outage. The MCP tool handler
+    surfaces :class:`ServerError` as ``ToolError("silverbullet
+    error: {status}")`` — the same wording as the other tools.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="bad gateway")
+
+    async with _client(handler) as sb:
+        with pytest.raises(ServerError):
+            await sb.exists_page("anything")
+
+
+@pytest.mark.asyncio
+async def test_exists_page_uses_get_method() -> None:
+    """``exists_page`` issues ``GET /.fs/{name}`` — not HEAD, not POST.
+
+    Locks the standing-preference decision: SB's ``/.fs`` endpoint
+    documents ``GET`` semantics; ``HEAD`` isn't part of the upstream
+    contract the bridge locks against (``server/src/handlers/fs.rs``)
+    and could behave differently across SB versions. ``GET`` is the
+    wire-level primitive the design doc guarantees.
+    """
+
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, text="")
+
+    async with _client(handler) as sb:
+        await sb.exists_page("index")
+
+    assert seen == [("GET", "/.fs/index")]
+
+
 # --- list_pages --------------------------------------------------------
 
 

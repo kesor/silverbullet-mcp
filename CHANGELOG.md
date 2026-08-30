@@ -90,6 +90,21 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
   [README § v1.2 wire-shape changes](README.md#v12-wire-shape-changes)
   for the full migration note.
 
+### Added
+
+- **`page_exists(name)`** — cheap existence check (T25); issues
+  `GET /.fs/{name}`, returns `bool`: `True` on 200, `False` on 404,
+  `ToolError("silverbullet error: {status}")` on 5xx. The body
+  bytes are never materialized, so the call is one round trip with
+  the headers only — cheaper than `read_page` when the caller only
+  wants a yes/no answer. A 5xx deliberately surfaces as an error
+  rather than `False` so the caller can distinguish "no, proceed
+  with create" from "SB is broken, don't make decisions".
+
+  Migration: none — the tool is additive. If the caller has been
+  composing `read_page → catch 404` to answer the same question,
+  swap to `page_exists` for a body-free round trip.
+
 ## [v1.1] — full CRUD + editing
 
 Build map: [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).

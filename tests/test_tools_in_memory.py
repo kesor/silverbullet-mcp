@@ -8,17 +8,17 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All eight ``/.fs``-backed tools (``read_page``, ``write_page``,
-  ``delete_page``, ``append_to_page``, ``patch_page_lines``,
-  ``patch_page_replace``, ``move_page``, ``list_pages``) on the 200
-  happy path;
+- All nine ``/.fs``-backed tools (``read_page``, ``page_exists``,
+  ``write_page``, ``delete_page``, ``append_to_page``,
+  ``patch_page_lines``, ``patch_page_replace``, ``move_page``,
+  ``list_pages``) on the 200 happy path;
   ``write_page`` / ``delete_page`` / ``append_to_page`` /
   ``patch_page_lines`` / ``patch_page_replace`` return the ETag,
   ``list_pages`` returns the file metas, ``read_page`` and the
-  resource template both surface the markdown body.
-  ``append_to_page`` (T19), ``patch_page_lines`` (T20),
-  ``patch_page_replace`` (T21), and ``move_page`` (T22) are the
-  read-modify-write / write-then-delete tools.
+  resource template both surface the markdown body, ``page_exists``
+  returns ``bool`` (T25). ``append_to_page`` (T19), ``patch_page_lines``
+  (T20), ``patch_page_replace`` (T21), and ``move_page`` (T22) are
+  the read-modify-write / write-then-delete tools.
 - ``write_page`` carries the ``if_match`` straight through to
   ``sb_client`` (T3 covers the wire envelope; this test guards the
   MCP-tool-to-SB-client argument path).
@@ -28,14 +28,20 @@ Coverage:
   "precondition failed; check if_match/if_none_match"; 413 →
   "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
   timeout → "silverbullet request timed out". The eight tools share
-  the translation through :func:`server._translate_sb_errors`.
+  the translation through :func:`server._translate_sb_errors`;
+  ``page_exists`` (T25) translates 5xx and timeout inline because
+  404 is the *answer* (not an error) for the existence question
+  — a different exception-translation contract on the ninth tool.
 - The resource template returns the same body for the happy path and
   surfaces ``ToolError`` for a missing page (v1 keeps one error shape
   for both surfaces; T4 carry-forward note in the map).
 
 T22 (``move_page``) is the eighth tool: write-then-delete rename
 with destination-collision and atomicity-caveat error wording
-distinct from the unified 412/404 shapes.
+distinct from the unified 412/404 shapes. T25 (``page_exists``)
+adds the ninth tool: a cheap ``bool`` existence check that doesn't
+go through :func:`server._translate_sb_errors` because 404 is the
+*answer*, not an error.
 """
 
 from __future__ import annotations
@@ -188,6 +194,156 @@ async def test_read_page_5xx_returns_tool_error() -> None:
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool read_page: silverbullet error: 503"
+
+
+# --- page_exists -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_page_exists_returns_true_on_200() -> None:
+    """``page_exists`` returns ``True`` on 200 — the existence is confirmed.
+
+    T25: cheap existence check that costs one ``GET /.fs/{name}``
+    round trip without materializing the body. Locks the
+    ``bool`` return type and the success path so a future
+    refactor that swaps it for a richer envelope doesn't
+    silently widen the wire shape.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/index"
+        return httpx.Response(200, text="# body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "index"})
+
+    assert result.is_error is False
+    # ``page_exists`` returns a Python ``bool``; the SDK wraps
+    # single-value returns in ``{"result": ...}`` for
+    # ``structured_content`` (the same shape as ``list_pages``'s
+    # list return). The agent reads ``structured_content["result"]``
+    # to get the boolean.
+    assert result.structured_content == {"result": True}
+
+
+@pytest.mark.asyncio
+async def test_page_exists_returns_false_on_404() -> None:
+    """``page_exists`` returns ``False`` on 404 — not a ``ToolError``.
+
+    T25: 404 is the existence question's "no" answer, *not* an
+    error. Compare with :func:`test_read_page_404_returns_tool_error_with_design_doc_wording`
+    — same upstream status, different wire shape, different
+    tool. The two shapes coexist because the questions are
+    different: "give me the body" (read) and "is it there?"
+    (exists).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "missing"})
+
+    assert result.is_error is False
+    assert result.structured_content == {"result": False}
+
+
+@pytest.mark.asyncio
+async def test_page_exists_5xx_returns_tool_error() -> None:
+    """5xx surfaces as ``ToolError("silverbullet error: {status}")``.
+
+    T25 deliberately returns an error (not ``False``) on 5xx: "I
+    don't know, the server is broken" is not a valid "no". An
+    agent that gets ``False`` proceeds with confidence; an agent
+    that gets a tool error retries or surfaces the failure. Same
+    wording as the other tools so the agent's error-handling
+    doesn't have to special-case ``page_exists``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "anything"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool page_exists: silverbullet error: 503"
+
+
+@pytest.mark.asyncio
+async def test_page_exists_timeout_returns_tool_error() -> None:
+    """Timeout surfaces as ``ToolError("silverbullet request timed out")``.
+
+    Locks the timeout wording on the existence tool to match the
+    rest of the bridge. ``exists_page`` lets ``httpx.TimeoutException``
+    propagate (the SB client doesn't translate timeouts — that's
+    the MCP layer's job); the tool handler catches and translates
+    it inline, mirroring :func:`_translate_sb_errors` minus the
+    404 clause.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "anything"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool page_exists: silverbullet request timed out"
+
+
+@pytest.mark.asyncio
+async def test_page_exists_412_returns_precondition_tool_error() -> None:
+    """A GET that 412s surfaces the unified 412 ``ToolError``.
+
+    ``exists_page`` issues ``GET /.fs/{name}`` and a 412 on a GET
+    is unusual (preconditions live on writes), but the SB client
+    surfaces any 412 as :class:`PreconditionFailed` and the tool
+    handler translates it with the same wording as the other
+    tools. Missing this case would mean a proxy / SB
+    misconfiguration leaves an unhandled exception, which the SDK
+    surfaces as a generic ``MCPError`` without the design-doc
+    wording.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "index"})
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool page_exists: precondition failed; check if_match/if_none_match"
+    )
+
+
+@pytest.mark.asyncio
+async def test_page_exists_does_not_materialize_body() -> None:
+    """The handler returns a body; ``page_exists`` doesn't surface it.
+
+    Locks the cost-down promise: a body-returning 200 should not
+    make the MCP tool's structured content grow a body field. If
+    a future refactor swaps ``exists_page`` for ``read_page`` and
+    returns the read-side envelope, the wire shape silently widens
+    and a caller expecting a ``bool`` breaks.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="# body that must not leak",
+            headers={"ETag": '"abc"', "X-Content-Length": "27"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "index"})
+
+    assert result.is_error is False
+    # ``bool`` is the wire shape. Nothing else.
+    assert result.structured_content == {"result": True}
 
 
 # --- write_page --------------------------------------------------------
