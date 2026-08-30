@@ -20,6 +20,14 @@ Resolving every ticket in **Not yet specified** below lands on a single
 deployment. No code is shipped as part of this map — the design doc is the
 artefact.
 
+### 🏁 Reached.
+
+`docs/design.md` (563 lines) is the delivered artefact. Every ticket
+resolved in this map has a dedicated section in the doc, anchored back
+to the ticket's resolution body. The map is preserved as the
+ticket-by-ticket decision record; the doc is the prose form of the
+same decisions.
+
 ## Notes
 
 - **Domain**: protocol bridge between MCP hosts (Grok on the web) and an
@@ -528,3 +536,6 @@ end-to-end" sanity check during dev. **Not** used in CI.
 - A general-purpose MCP router or multi-user support — single-user,
   single-instance. Reopen if user base widens.
 - Selling or hosting the bridge for other people — local-tunnel-only.
+- OAuth 2.1 / dynamic-client registration for the bridge — rejected by T2.
+- A publishing decision for the repo home — deferred by T8 ("dev local
+  for now").
