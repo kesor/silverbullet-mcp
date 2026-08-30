@@ -27,7 +27,7 @@ containerized split), four direct-FS read tools can be enabled:
 - `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`
 - `tag_summary(prefix?)` — count occurrences of every `tags:` value
 - `recent_pages(limit?, prefix?)` — newest pages by mtime
-- `pages_touching_topic(query, prefix?)` — name+content search
+- `pages_touching_topic(query, prefix?)` — case-insensitive name+content substring search; returns `{name, match, snippet}[]` where `match` is `"name"`, `"content"`, or `"both"` and `snippet` is an ~80-char window centered on the content match (or a body excerpt for name-only matches). Uses `rg --json` when `rg` is on `PATH`; falls back to a pure-Python substring scan otherwise.
 
 They are strictly additive: the `/.fs`-backed tools above continue to
 work whether the journal surface is on or off. Set both

@@ -124,6 +124,7 @@ gated journal surface** (T10–T13).
 - [T8. Write-envelope fog (X-* headers on PUT)](#t8-write-envelope-fog-x--headers-on-put) (commit `9275c`): full design-doc envelope — `write_page` sends every X-* header `docs/design.md` § SilverBullet client contract calls out for PUT, on top of the static `X-Source: external` + `X-Permission: rw` + `Content-Type: text/markdown`. New per-call fields: `X-Created = X-Last-Modified = int(time.time_ns() / 1_000_000)` (epoch ms, the unit SB's `header_i64` parses); `X-Content-Length = len(content.encode("utf-8"))` (UTF-8 byte count, matching SB's `meta.size`). Static fields stay in `_WRITE_HEADERS`; new `_epoch_ms()` helper isolates the timestamp computation. Operator chose this path on the basis that the design doc calls for the full envelope and SB's PUT handler reads (but mostly ignores) these from the request — `server-common/src/space/disk.rs::write_file` honors `meta.last_modified > 0` (stamps file mtime) but ignores `meta.created / meta.size / meta.perm`. Live PUT against the dev-box SB on `127.0.0.1:63000` succeeded with the new envelope; response carried `X-Last-Modified` matching our value (file mtime honored) and `X-Created` a few ms later (file btime, since the disk impl ignores request `created`). Bridge doesn't observe either side. 41 passed + 1 skipped.
 - [T10. Journal-tools config gate (foundation)](#t10-journal-tools-config-gate-foundation) (commit `46d81`): new module `src/mcp_silverbullet/journal.py` (gate + four skeleton tools); `Settings.journal` resolved by `load_settings`; `build_mcp(..., journal=...)` calls `register_journal_tools` only when `JournalConfig.enabled`. Three-gate check (truthy opt-in / non-empty path / readable) → INFO log on open, WARN on requested-but-unusable, silent on off. Skeleton tools raise `ToolError("journal tool not implemented yet; landing in T11/T12")` so a stray call surfaces loudly. Drive-by: `sb_client.list_pages` now sends `X-Sync-Mode: 1` so SB 2.x's `handle_fs_list` returns JSON instead of 307-redirecting to the SPA (prior map's T3 mock-only coverage missed it; T6 smoke parked it as "effectively moot" once the journal surface replaced the original search tool). New `tests/test_journal_gate.py` (11 cases). 54 passed (with live env) / 53 passed + 1 skipped (without); `nix flake check` green.
 - [T11. Read tools (histogram / tag_summary / recent_pages)](#t11-read-tools-histogram--tag_summary--recent_pages): three of the four T10 skeletons replaced with real implementations in `src/mcp_silverbullet/journal.py`. New helpers: `_validate_prefix` (rejects `..` / leading `/` with a `ToolError`), `_iter_md` (`rglob("*.md")` filtered to skip hidden directory segments), `_bucket_key` (basename regex `^\d{4}-\d{2}-\d{2}` → `YYYY-MM`, else UTC mtime), `_parse_tags` (hand-rolled frontmatter scanner for `tags: scalar` OR `tags:\n  - item\n  - item` — no PyYAML dep), `_unquote`, `_mtime_iso` (UTC ISO-8601), `PageRef` dataclass. New tests `tests/test_journal_read.py` (19 cases); inverted the T10 skeleton-error tests in `tests/test_journal_gate.py` so only `pages_touching_topic` (T12) still raises the skeleton error. Three SDK-shape carry-forwards worth flagging: (1) `dict[str, X]` return types emit the dict directly via a `RootModel` (no `{"result": …}` wrap); (2) `list[X]` returns *are* wrapped in `{"result": …}`; (3) `ToolError` raised from a tool handler is wire-level `is_error=True` with the message prefixed `"Error executing tool <name>: "`. Live smoke against `/var/lib/silverbullet/`: histogram returns the real distribution (`2023-10: 18`, `2024-09: 7`, …), `tag_summary` top tags are `daily: 75`, `quick: 36`, `daily-journal: 33`, `contact: 20`, …, `recent_pages(limit=5, prefix="Daily")` returns the five newest `Daily/*.md`. 72 passed + 1 skip (T7 env-gated); `nix flake check` green.
+- [T12. `pages_touching_topic` (search by name + content)](#t12-pages_touching_topic-search-by-name--content): last T10 skeleton replaced with a real name+content substring search in `src/mcp_silverbullet/journal.py`. Optional `rg --json` acceleration (when on PATH; `_RG_BIN` cache, `_RG_TIMEOUT_S` 30s, `--no-config --no-messages -i`); falls back to pure-Python substring scan on `rg` failure / timeout / absence. New helpers: `_rg_available`, `_rg_content_matches`, `_safe_read_body`, `_content_snippet`, `_body_excerpt`, `_normalize_query`. Name match is against the **relative path** (the ticket said "basename" but the done-when example `query="DAILY"` finding `Daily/*.md` requires the relative path; this matches the `prefix` filter's behavior for consistency). Snippet shape: line containing the match returned whole if it fits in 80 chars, else windowed to 80 chars centered on the match with `…` ellipses. Empty / whitespace-only queries raise `ToolError`. Empty space returns `[]`. Results sorted by name-asc. New tests `tests/test_journal_search.py` (25 cases): input validation (empty / whitespace / `..` / `/` prefix), name-only / content-only / both match kinds, snippet shaping (short-line verbatim, long-line windowed, correct-line selection, frontmatter stripping in body excerpts), prefix filtering, hidden-dir skip, literal-substring semantics (no regex metachar activation), whitespace-collapsing query, `rg`-available path, `rg` timeout fallback, `rg` non-zero-exit fallback, list-payload wrapping, mid-iteration file disappearance. Live smoke against `/var/lib/silverbullet/` with `MCP_SILVERBULLET_JOURNAL_TOOLS=1`: 130 hits on `query="DAILY"` covering all three match kinds (pure name, pure content, both), Python path ≈ rg path ≈ 18ms each. `flake.nix` dev shell now carries `pkgs.ripgrep` so the rg path runs from `nix develop`; runtime still doesn't depend on it. 96 passed + 1 skip (T7 env-gated).
 
 ## Tickets
 
@@ -593,48 +594,6 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > `pages_touching_topic` still raises the T12 skeleton
 > error. 72 tests pass + 1 skip (T7 env-gated); `nix flake
 > check` green.
-> **Context**: With T10's gate in place and the four skeleton
-> tools registered, T11 replaces three of them with real
-> implementations that are *purely* filesystem reads — no
-> subprocess, no `rg`, no external deps. All three accept an
-> optional `prefix: str = ""` parameter (validated: no `..`, no
-> leading `/`, treated as a path-segment substring against file
-> names; if non-empty, restricts the inventory to files whose
-> relative path contains the segment).
->
-> - **`journal_histogram(prefix: str = "") -> dict[str, int]`** —
->   walk `*.md` under `space_path` (filtered by `prefix`),
->   bucket by `YYYY-MM` extracted from the *filename* if it
->   matches `^\d{4}-\d{2}-\d{2}` (the SB daily-journal naming
->   convention), else from the file's mtime. Returns
->   `{"2025-12": 22, "2026-01": 27, ...}` sorted by key.
-> - **`tag_summary(prefix: str = "") -> dict[str, int]`** —
->   walk `*.md` files, parse YAML frontmatter (`---\n...\n---\n`),
->   extract `tags:` (single string or list of strings; case
->   preserved). Returns `{"meta": 50, "daily": 111, ...}`
->   sorted by count desc.
-> - **`recent_pages(limit: int = 10, prefix: str = "") ->
->   list[PageRef]`** — files sorted by mtime desc, returns
->   `{name, mtime_iso, size_bytes}[]` truncated to `limit`.
->   `PageRef` is a frozen dataclass; same shape as `FileMeta`
->   plus `mtime_iso`.
->
-> **Files when resolved**: `src/mcp_silverbullet/journal.py`
-> (replacing the three T10 skeleton bodies), no other module
-> changes. **Tests when resolved**: Layer-1 tests against a
-> tmpdir fixture populated with synthetic `*.md` files (one
-> with frontmatter, one without; one matching
-> `^\d{4}-\d{2}-\d{2}`, one not). Asserts on the three return
-> shapes for empty space, prefix-restricted space,
-> mixed-content space. Skeleton-error tests in
-> `test_journal_gate.py` get dropped (or inverted: assert
-> real behavior, not placeholder errors).
-> **Blocks on**: T10.
-> **Unblocks**: T13.
-> **Done when**: the three tools round-trip a tmpdir fixture in
-> Layer-1; the four `tool … not implemented yet` errors are
-> gone for these three; tool descriptions match what the agent
-> sees.
 
 ---
 
@@ -642,7 +601,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: open
+> **Assignee**: pi (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved
 > **Question**: How does the bridge expose name+content search
 > without `rg` as a hard dep?
 > **Context**: This replaces the T10 skeleton body for the
@@ -679,6 +639,95 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > "DAILY"; the empty-result case returns `[]`; the
 > `tool … not implemented yet` skeleton error is gone for
 > this tool.
+> **Resolution**: replaced the T10 skeleton body with a real
+> name+content substring search in `src/mcp_silverbullet/journal.py`.
+> The bridge reads every file's body for the snippet anyway, so the
+> ``rg --json`` acceleration only saves body reads for files that
+> have neither a name nor a content match — useful when the space
+> is large, immaterial when it's not (the operator's 130-page
+> ``Daily``-query finished in 18ms on both paths).
+>
+> Name-match interpretation: the ticket said "basename" but the
+> done-when example (``query="DAILY"`` finding every ``Daily/*.md``)
+> requires matching the **relative path** (``Daily/2026-01-05.md``
+> does not contain "DAILY" in its basename). The relative-path
+> reading is also consistent with how the ``prefix`` filter works
+> (``prefix="Daily"`` already matches ``Areas/Daily Notes.md`` via
+> its relative path). Implementation matches the relative path
+> ``name`` from :func:`_iter_md`; if the operator wanted strict
+> basename matching, that's a one-line change in
+> :func:`_pages_touching_topic` (replace ``q_lower in name.lower()``
+> with the equivalent on ``Path(name).name``).
+>
+> New helpers in :mod:`mcp_silverbullet.journal`:
+>
+> - :func:`_rg_available` — memoized ``shutil.which("rg")``;
+>   monkeypatch ``_RG_BIN`` to force the Python path (the
+>   ``force_python_path`` fixture in ``tests/test_journal_search.py``
+>   does this).
+> - :func:`_rg_content_matches` — runs ``rg --json -i --no-config
+>   --no-messages -- <query> <files...>``, parses one JSON record
+>   per line, returns ``{name: first_match_line}`` (empty dict when
+>   ``rg`` succeeded with no matches, ``None`` on error / timeout
+>   so the caller falls through to the Python path). Subprocess
+>   timeout ``_RG_TIMEOUT_S`` = 30s; ``rg`` exit codes ``0`` /
+>   ``1`` (no matches) treated as success, anything higher is a
+>   ``WARN``-logged fallback trigger.
+> - :func:`_safe_read_body` — ``path.read_text("utf-8")`` with
+>   ``OSError`` / ``UnicodeDecodeError`` swallowed to ``None``.
+> - :func:`_content_snippet` — line containing the match returned
+>   whole if ``len(line) <= _SNIPPET_MAX_LEN`` (80), else
+>   windowed to 80 chars centered on the match with ``…``
+>   ellipses. Lines are stripped; multi-line bodies pick the line
+>   with the first occurrence.
+> - :func:`_body_excerpt` — first 80 chars of body with YAML
+>   frontmatter stripped (same shape as :func:`_parse_tags`); used
+>   for name-only snippet.
+> - :func:`_normalize_query` — strip + ``" ".join(query.split())``
+>   to collapse internal whitespace (including newlines); empty
+>   result raises :exc:`ToolError`.
+>
+> Wire shape: ``list[dict[str, str]]`` returns are wrapped in
+> ``{"result": [...]}`` per the T11 carry-forward; each row is
+> ``{name, match, snippet}`` with ``match`` ∈ ``{"name",
+> "content", "both"}``. Sort key is name-asc so the result is
+> deterministic regardless of the underlying walk order.
+>
+> Tests: ``tests/test_journal_search.py`` (25 cases). Covers
+> input validation (empty / whitespace-only / ``..`` / ``/``
+> prefix), empty space, no-match space, name-only / content-only
+> / both match kinds, snippet shaping (short-line verbatim,
+> long-line windowed, correct-line selection across multiple
+> lines, frontmatter stripping in body excerpts), name-match
+> against relative path (the operator's daily-journal use case),
+> multi-result ordering (name-asc), prefix filtering,
+> hidden-dir skip (carried from :func:`_iter_md`), literal-
+> substring semantics (regex metachars like ``.*`` don't activate
+> as regex), whitespace-collapsing query (``"the\tbridge\nis"``
+> matches ``"the bridge is"``), the ``rg --json`` path on a real
+> ``rg`` install (skipped when absent), the ``rg`` timeout
+> fallback path, the ``rg`` non-zero-exit fallback path,
+> list-payload wrapping (T11 carry-forward), and a mid-iteration
+> file-disappearance tolerance (``_safe_read_body`` returns
+> ``None`` and the file is skipped).
+>
+> Drive-by: ``flake.nix`` ``devShells.${system}.default`` now
+> includes ``pkgs.ripgrep`` so the rg path runs from ``nix
+> develop``; runtime still doesn't depend on it (the bridge's
+> Python code probes ``shutil.which("rg")`` at boot and
+> degrades cleanly). ``README.md`` journal surface list
+> expanded with the ``pages_touching_topic`` shape (``{name,
+> match, snippet}[]``) and the rg-acceleration note.
+>
+> Live smoke against ``/var/lib/silverbullet/`` with
+> ``MCP_SILVERBULLET_JOURNAL_TOOLS=1``: ``query="DAILY"``
+> returns 130 hits — pure name matches (``Daily Affirmation.md``,
+> ``Daily/2023-10-05.md``, …), pure content matches
+> (``Areas/Open Loops.md`` body mentions "daily journaling"),
+> and ``both`` matches (``Daily/2023-10-05.md`` whose body
+> says "- daily-journal"). Both Python and ``rg`` paths return
+> identical results in ~18ms. The ``pages_touching_topic`` T12
+> skeleton error is gone for good.
 
 ---
 

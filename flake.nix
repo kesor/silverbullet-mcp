@@ -143,6 +143,15 @@
 
       # Development shell. Uses the editable overlay so the source tree
       # is live — same model as the hello-world template.
+      # ``ripgrep`` is the optional acceleration path for
+      # ``mcp_silverbullet.journal._pages_touching_topic`` (T12); the
+      # bridge falls back to a pure-Python substring scan when it is
+      # absent, but on a multi-thousand-page space ``rg`` saves the
+      # body read for non-matching files. Adding it to the dev shell
+      # means live smokes (and any operator session that runs the
+      # bridge from a nix shell) get the fast path. Runtime doesn't
+      # depend on it; the bridge's Python code does
+      # ``shutil.which("rg")`` at boot and degrades gracefully.
       devShells = forAllSystems (
         system:
         let
@@ -155,6 +164,7 @@
             packages = [
               virtualenv
               pkgs.uv
+              pkgs.ripgrep
             ];
             env = {
               UV_NO_SYNC = "1";

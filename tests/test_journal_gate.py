@@ -1,5 +1,5 @@
-"""Layer-1 tests for the journal-tools config gate (T10) and the three
-T11 read tools' boot-time behavior.
+"""Layer-1 tests for the journal-tools config gate (T10) and the
+boot-time inventory of all four journal tools.
 
 The journal surface is an optional, strictly-additive set of four
 direct-FS read tools. It ships only when two env vars agree: the
@@ -14,9 +14,13 @@ The T11 ticket inverted the T10 skeleton-error tests for the three
 read tools (``journal_histogram`` / ``tag_summary`` /
 ``recent_pages``) into ``tests/test_journal_read.py``, where the
 real behaviors (returned shapes, prefix filtering, mtime sorting,
-frontmatter parsing) live. ``pages_touching_topic`` still raises
-``ToolError("… T12")`` until T12 lands; this file keeps the wire
-shape for that one tool under the ``pages_touching_topic`` test.
+frontmatter parsing) live. T12 inverts the last skeleton
+(``pages_touching_topic``) and the real behaviors (name+content
+search, match-kind, snippet shape) live in
+``tests/test_journal_search.py``. The remaining assertion here is
+that ``pages_touching_topic`` round-trips against an empty
+``tmp_path`` with ``is_error=False`` — i.e., it boots cleanly
+alongside the three T11 tools.
 
 Each test reuses the in-memory ``Client(mcp, raise_exceptions=True)``
 pattern from ``tests/test_tools_in_memory.py`` and the
@@ -185,11 +189,10 @@ async def test_build_mcp_registers_journal_tools_when_gate_is_on(
 ) -> None:
     """Gate on = four journal tools present alongside the ``/.fs`` tools.
 
-    The three T11 read tools (``journal_histogram``, ``tag_summary``,
-    ``recent_pages``) round-trip against the empty ``tmp_path`` —
-    they return empty results without raising, proving the T10
-    skeletons have been replaced. ``pages_touching_topic`` (T12) is
-    the remaining skeleton and still raises ``ToolError``.
+    All four journal tools round-trip against the empty ``tmp_path``
+    — they return empty results without raising, proving the T10
+    skeletons have been replaced (T11 replaced three; T12 replaced
+    the fourth, ``pages_touching_topic``).
     """
     server = _build(
         lambda req: httpx.Response(200),
@@ -214,39 +217,16 @@ async def test_build_mcp_registers_journal_tools_when_gate_is_on(
         empty = await client.call_tool("recent_pages", {})
         assert empty.is_error is False
         assert empty.structured_content == {"result": []}
-        # T12: ``pages_touching_topic`` is still a skeleton.
-        skel = await client.call_tool(
-            "pages_touching_topic", {"query": "anything"}
-        )
-        assert skel.is_error is True
-
-
-# --- skeleton tool behavior ------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_pages_touching_topic_skeleton_raises_not_implemented(
-    tmp_path,
-) -> None:
-    """``pages_touching_topic`` (T12) still raises a ``ToolError`` skeleton.
-
-    Going through the wire (not calling the handler directly) so a
-    future SDK rename of the registry attribute doesn't break the
-    test, and so the error shape we assert is the one the operator
-    actually sees.
-    """
-    server = _build(
-        lambda req: httpx.Response(200),
-        journal=JournalConfig(enabled=True, space_path=str(tmp_path)),
-    )
-    async with Client(server, raise_exceptions=True) as client:
+        # T12: ``pages_touching_topic`` no longer raises the
+        # skeleton error — an empty ``tmp_path`` against an empty
+        # query returns the empty result shape (``{"result": []}``,
+        # ``is_error=False``). The shape-and-error assertions for the
+        # real behaviors live in ``tests/test_journal_search.py``.
         result = await client.call_tool(
             "pages_touching_topic", {"query": "anything"}
         )
-    assert result.is_error is True
-    assert "not implemented" in result.content[0].text, (
-        f"pages_touching_topic error text was {result.content[0].text!r}"
-    )
+        assert result.is_error is False
+        assert result.structured_content == {"result": []}
 
 
 # --- register_journal_tools is a no-op when the gate is off -----------

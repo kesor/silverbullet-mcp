@@ -2,15 +2,14 @@
 
 T10 of the map gates the journal surface; T11 implements three of the
 four tools (``journal_histogram``, ``tag_summary``,
-``recent_pages``). T12 will replace the fourth
-(``pages_touching_topic``). The bridge may run on a host that does
-*not* have direct access to the SB space directory (e.g., a sidecar
-container without a volume mount); the journal tools are an optional,
-strictly-additive surface that requires
-``MCP_SILVERBULLET_SPACE_PATH`` and ``MCP_SILVERBULLET_JOURNAL_TOOLS``
-to enable. With either unset or the path unreadable, the bridge boots
-cleanly without the journal tools and the existing ``/.fs``-backed
-tools continue to work.
+``recent_pages``); T12 implements the fourth (``pages_touching_topic``).
+The bridge may run on a host that does *not* have direct access to the
+SB space directory (e.g., a sidecar container without a volume mount);
+the journal tools are an optional, strictly-additive surface that
+requires ``MCP_SILVERBULLET_SPACE_PATH`` and
+``MCP_SILVERBULLET_JOURNAL_TOOLS`` to enable. With either unset or
+the path unreadable, the bridge boots cleanly without the journal
+tools and the existing ``/.fs``-backed tools continue to work.
 
 Two-step gate (resolved at :func:`resolve_journal_config`):
 
@@ -20,7 +19,7 @@ Two-step gate (resolved at :func:`resolve_journal_config`):
    ``os.access(path, os.R_OK)`` — otherwise the gate is off and we
    log a one-line WARN.
 
-The three T11 tools walk the space directory directly:
+All four tools walk the space directory directly:
 
 - :func:`_iter_md` restricts to ``*.md`` files (top level and below),
   skips hidden directories (``*.cache``, ``.git``, ``.ssh`` — the
@@ -37,17 +36,21 @@ The three T11 tools walk the space directory directly:
 - :func:`_bucket_key` prefers the daily-journal filename convention
   (``YYYY-MM-DD.md``) and falls back to the file's mtime when the
   filename doesn't carry a date.
-
-The fourth tool (``pages_touching_topic``) remains a placeholder until
-T12 lands; it raises :exc:`ToolError` so a stray call surfaces loudly.
+- :func:`_pages_touching_topic` (T12) reads every file's body for the
+  snippet anyway, so the ``rg --json`` path (T12, optional
+  acceleration) only saves body reads for files that don't have a
+  content match.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -293,6 +296,204 @@ def _mtime_iso(mtime_ns: int) -> str:
     return ts.isoformat()
 
 
+# --- T12 search internals ---------------------------------------------
+
+
+# Cached at module load: ``shutil.which("rg")`` is what ``rg_available``
+# returns, and ``_rg_content_matches`` uses this as the absolute path.
+# An empty string means "probed and not found" (so the Python fallback
+# path runs without probing again). A monkeypatch to either of these
+# in tests forces the Python path deterministically.
+_RG_BIN: str | None = None
+
+
+def _rg_available() -> bool:
+    """Memoized ``shutil.which("rg")``.
+
+    Returns False (and never re-probes) if ``rg`` isn't on PATH, so the
+    per-call cost is a single attribute lookup. Tests force the Python
+    fallback by setting :data:`_RG_BIN` to ``""`` directly.
+    """
+    global _RG_BIN
+    if _RG_BIN is None:
+        path = shutil.which("rg")
+        _RG_BIN = path if path is not None else ""
+    return bool(_RG_BIN)
+
+
+# Cap on how long the optional ``rg --json`` subprocess may run before
+# the bridge falls back to a pure-Python scan. ``rg`` is fast; if it
+# hasn't returned in 30s on a multi-thousand-page space something is
+# wrong (probably huge minified JSON in the space) and we'd rather
+# fall back than hang the tool call.
+_RG_TIMEOUT_S = 30.0
+
+# Target length of a content-match snippet, in characters. The line
+# containing the match is taken whole if it fits; otherwise the window
+# is centered on the match and truncated with a leading or trailing
+# ellipsis (``…``). Name-only matches get a body excerpt of the same
+# length (no frontmatter).
+_SNIPPET_MAX_LEN = 80
+
+
+def _rg_content_matches(
+    query: str,
+    files: list[tuple[Path, str]],
+) -> dict[str, str] | None:
+    """Return ``{name: first_matching_line}`` via ``rg --json``, or ``None`` on failure.
+
+    ``files`` is the (path, name) tuples from :func:`_iter_md` — the
+    caller has already applied prefix filtering and hidden-dir
+    skipping, so we pass each file as a positional arg rather than
+    letting ``rg`` recurse the whole space.
+
+    Returns ``None`` when ``rg`` errors or times out; the caller falls
+    back to a Python substring scan over every file's body. Returns
+    an empty dict when ``rg`` succeeded but found no matches (so the
+    caller doesn't waste body reads).
+    """
+    if not _rg_available() or not files:
+        return None
+    assert _RG_BIN is not None  # narrowed by _rg_available
+    cmd = [
+        _RG_BIN,
+        "--json",
+        "-i",  # case-insensitive: matches the Python fallback's q.lower() in body.lower()
+        "--no-config",  # don't load the user's ~/.ripgreprc — the bridge is sandboxed
+        "--no-messages",  # suppress rg's stderr noise (parse errors etc.)
+        "--",
+        query,
+    ]
+    cmd.extend(str(path) for path, _name in files)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RG_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        _log.warning(
+            "rg search timed out after %.1fs; falling back to Python",
+            _RG_TIMEOUT_S,
+        )
+        return None
+    except OSError as exc:
+        _log.warning("rg invocation failed: %s; falling back", exc)
+        return None
+    # rg exit codes: 0 = matches, 1 = no matches, 2+ = error.
+    if proc.returncode not in (0, 1):
+        _log.warning(
+            "rg failed (exit %d): %s",
+            proc.returncode,
+            proc.stderr.strip().splitlines()[0] if proc.stderr else "",
+        )
+        return None
+    abs_to_name = {str(path): name for path, name in files}
+    matches: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("type") != "match":
+            continue
+        try:
+            path_text = rec["data"]["path"]["text"]
+            line_text = rec["data"]["lines"]["text"].rstrip("\n")
+        except (KeyError, TypeError):
+            continue
+        name = abs_to_name.get(path_text)
+        if name is None or name in matches:
+            # Either rg returned a path we didn't pass (shouldn't
+            # happen) or we already have an earlier match for this
+            # file. Keep the first so the snippet is deterministic.
+            continue
+        matches[name] = line_text
+    return matches
+
+
+def _safe_read_body(path: Path) -> str | None:
+    """Read the file as UTF-8; ``None`` on read or decode error."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _content_snippet(query_lower: str, body: str, max_len: int) -> str:
+    """Snippet centered on the first case-insensitive occurrence of ``query_lower``.
+
+    The line containing the match is taken whole when it fits in
+    ``max_len``; otherwise a window of ``max_len`` chars is taken
+    centered on the match within that line, with a leading or trailing
+    ellipsis (``…``) when the window clips the line.
+    """
+    body_lower = body.lower()
+    pos = body_lower.find(query_lower)
+    if pos < 0:
+        # Defensive: caller computed ``content_match`` against
+        # ``body_lower``, so this branch only fires if there's a
+        # disagreement between two calls of ``find`` on the same
+        # string — fall back to a body excerpt so the caller still
+        # gets *something* useful.
+        return _body_excerpt(body, max_len)
+    line_start = body.rfind("\n", 0, pos) + 1
+    line_end = body.find("\n", pos)
+    if line_end < 0:
+        line_end = len(body)
+    line = body[line_start:line_end].strip()
+    if len(line) <= max_len:
+        return line
+    match_in_line = pos - line_start
+    half = max_len // 2
+    start = max(0, match_in_line - half)
+    end = start + max_len
+    if end > len(line):
+        end = len(line)
+        start = max(0, end - max_len)
+    snippet = line[start:end].strip()
+    prefix = "… " if start > 0 else ""
+    suffix = " …" if end < len(line) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+def _body_excerpt(body: str, max_len: int) -> str:
+    """First ``max_len`` chars of the body, with YAML frontmatter stripped.
+
+    Used for the ``name``-only match snippet — there's no content
+    occurrence to center on, so we surface the page's opening prose.
+    Stripping frontmatter is consistent with how :func:`_parse_tags`
+    handles the same leading ``---\\n…\\n---\\n`` shape: a reader
+    sees the page content, not the metadata block.
+    """
+    text = body
+    if text.startswith("---"):
+        m = re.search(r"\n---\r?\n", text[3:])
+        if m is not None:
+            text = text[3 + m.end():]
+    text = text.strip().replace("\n", " ")
+    if len(text) > max_len:
+        return text[:max_len].rstrip() + "…"
+    return text
+
+
+def _normalize_query(query: str) -> str:
+    """Strip + collapse whitespace; raise ``ToolError`` on empty input.
+
+    Empty / whitespace-only queries would match every file under the
+    space (case-insensitive substring of ``""`` is always True) — a
+    confusing UX and a performance footgun. We surface it as a
+    ``ToolError`` so the operator sees why the call was refused
+    instead of a multi-thousand-line tool result.
+    """
+    normalized = " ".join(query.split())
+    if not normalized:
+        raise ToolError("query must not be empty")
+    return normalized
+
+
 # --- T11 tool bodies ---------------------------------------------------
 
 
@@ -361,14 +562,84 @@ async def _recent_pages(
     ]
 
 
+# --- T12 tool body -----------------------------------------------------
+
+
+async def _pages_touching_topic(
+    space_root: Path, query: str, prefix: str
+) -> list[dict[str, str]]:
+    """Name+content substring search; returns ``[{name, match, snippet}, ...]``.
+
+    The query is treated as a literal substring (no regex syntax; no
+    ``rg`` ``--type`` heuristics). Case is folded to ASCII before
+    matching on both paths. ``match`` is one of ``"name"`` (the
+    relative path contains the query), ``"content"`` (the body
+    contains the query), or ``"both"``. ``snippet`` is an
+    ``_SNIPPET_MAX_LEN``-char window centered on the content match —
+    or a body excerpt for name-only matches. Results are sorted by
+    relative path so the tool output is deterministic.
+
+    The body is read for every file with a name match OR a content
+    match (we need the body for the snippet). The ``rg --json``
+    acceleration saves the body read for files that have neither
+    match; when ``rg`` is unavailable we read every body's body and
+    substring-check in Python (still fast for ~200-page spaces).
+    """
+    q = _normalize_query(query)
+    q_lower = q.lower()
+    files = list(_iter_md(space_root, prefix))
+
+    # When ``rg`` is on PATH, ask it which files have a content match
+    # *before* reading any bodies. The call returns ``None`` on
+    # ``rg`` failure (we fall through to the Python path), or a dict
+    # ``{name: first_matching_line}`` on success (empty dict = no
+    # matches anywhere).
+    rg_matches: dict[str, str] | None = None
+    if _rg_available():
+        rg_matches = _rg_content_matches(q, files)
+
+    results: list[dict[str, str]] = []
+    for path, name in files:
+        nm = q_lower in name.lower()
+        if rg_matches is not None:
+            # ``rg`` did the body filtering; trust it. We still need
+            # the body for the snippet, so the body read below is
+            # only skipped when *both* checks fail.
+            cm = name in rg_matches
+            if not (nm or cm):
+                continue
+            body = _safe_read_body(path)
+            if body is None:
+                continue
+            snippet = _content_snippet(q_lower, body, _SNIPPET_MAX_LEN) if cm else _body_excerpt(body, _SNIPPET_MAX_LEN)
+        else:
+            # Python fallback: read every body up front to compute cm.
+            # Skipping here is the only win the rg path delivers, so
+            # both branches land on a body read for matched files.
+            body = _safe_read_body(path)
+            if body is None:
+                continue
+            cm = q_lower in body.lower()
+            if not (nm or cm):
+                continue
+            snippet = _content_snippet(q_lower, body, _SNIPPET_MAX_LEN) if cm else _body_excerpt(body, _SNIPPET_MAX_LEN)
+
+        if nm and cm:
+            kind = "both"
+        elif nm:
+            kind = "name"
+        else:
+            kind = "content"
+        results.append({"name": name, "match": kind, "snippet": snippet})
+
+    # ``list[X]`` return types go through a Pydantic ``RootModel`` and
+    # the wire payload is ``{"result": [...]}`` (T11 carry-forward).
+    # Tests assert on that wrapping shape, not on the bare list.
+    results.sort(key=lambda r: r["name"])
+    return results
+
+
 # --- registration ------------------------------------------------------
-
-
-def _not_implemented(ticket: str) -> None:
-    """Placeholder body for ``pages_touching_topic`` until T12 lands."""
-    raise ToolError(
-        f"journal tool not implemented yet; landing in {ticket}"
-    )
 
 
 def register_journal_tools(
@@ -437,17 +708,18 @@ def register_journal_tools(
         title="Pages touching topic",
         description=(
             "Search `*.md` pages under the SB space directory by both "
-            "name and body, case-insensitive substring. Returns one "
-            "entry per match with `name`, the kind of match (`name`, "
-            "`content`, or `both`), and a short Markdown-shaped snippet "
-            "around the body match. Restricted to pages whose relative "
-            "path contains `prefix`."
+            "relative-path and body, case-insensitive substring. "
+            "Returns one entry per match with `name`, the kind of "
+            "match (`name`, `content`, or `both`), and a short "
+            "Markdown-shaped snippet around the body match "
+            "(or a body excerpt for name-only matches). Restricted "
+            "to pages whose relative path contains `prefix`."
         ),
     )
     async def pages_touching_topic(
         query: str, prefix: str = ""
     ) -> list[dict[str, str]]:
-        _not_implemented("T12")
+        return await _pages_touching_topic(root, query, prefix)
 
 
 __all__ = [
