@@ -214,6 +214,16 @@ INFO/WARN line.
 
    If a quick-tunnel URL rotates, the bearer stays; re-paste the new URL.
 
+   For a full Cloudflare Access + Managed OAuth + cloudflared setup
+   (named tunnel, public hostname, per-user JWT validation against the
+   Cloudflare team JWKS), see
+   [`docs/cloudflare-setup.md`](docs/cloudflare-setup.md). It covers
+   the nginx config that copies `Cf-Access-Jwt-Assertion` into
+   `Authorization: Bearer`, rewrites the `Host` header so the bridge's
+   MCP transport-security check passes, and the Access app config
+   (Managed OAuth, DCR redirect-URI allowlist, bypass for the
+   discovery endpoint).
+
 ## Use from a Pi coding agent session
 
 The repo ships with a project-local `.mcp.json` so a Pi session
