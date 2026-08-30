@@ -81,7 +81,10 @@ Charted; no tickets resolved yet. Frontier tickets are open below.
 
 <!--
 Each ticket is sized to one 100K-token session. Mark with label
-`wayfinder:<type>`. Claim by setting assignee when starting work.
+`wayfinder:<type>`. Claim by setting an `Assignee:` line at the top
+of the ticket's block (no real "assignee" field exists in this local
+tracker; the line IS the claim — concurrent sessions skip any ticket
+that already has one).
 Tickets wire blocking edges in a second pass (the tracker is a single
 file; "blocking" is rendered by ticket ordering and an explicit
 "Blocks:" line per ticket).
@@ -91,6 +94,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK (the agent does it)
+> **Assignee**: claude (claimed 2026-01-15)
 > **Question**: Lay down the directory layout, `pyproject.toml` with
 > pinned deps, an empty `src/mcp_silverbullet/` package, a `uv.lock`
 > generated via `uv lock`, a `.gitignore`, and the smoke-test entry
