@@ -7,7 +7,7 @@ side-car on loopback; it does not provision tunnels.
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
-v1.2 map (agent-facing QOL + bullet primitives, four open tickets after T23+T24+T25+T26): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.2 map (agent-facing QOL + bullet primitives, three open tickets after T23+T24+T25+T26+T28): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ## What it exposes
 
@@ -21,7 +21,7 @@ Nine tools and one resource template:
 - `patch_page_replace(name, find, new_string, replace_all=False, if_match?, dry_run=False)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the T23 ack envelope. `dry_run=True` (T26) returns the same `{dry_run, original, patched, diff}` preview as the others.
 - `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the destination's T23 ack envelope (the same-name no-op returns the source's)
 - `delete_page(name, if_match?)` — hard delete; returns `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo timestamps / size per SB's contract)
-- `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA). T28 widens to the full meta shape.
+- `list_pages(prefix?)` — returns `[{name, etag, size_bytes, last_modified_ms, created_ms}][]` (T28 widened the per-row shape from the v1.1 `[{name, etag}]` to the same envelope family the read/write tools use; sends `X-Sync-Mode: 1` so SB 2.x returns JSON from `GET /.fs` instead of 307-redirecting to the SPA). On this SB build the list payload omits the `etag` field, so etags are `null` unless the operator opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` (one GET per row; partial failures leave the affected row's etag as `null` rather than failing the whole call).
 - `silverbullet://page/{name}` — JSON envelope `{body, etag, size_bytes, last_modified_ms}` (same shape as `read_page`); MIME type is `application/json` in T24 (was `text/markdown` in v1.1)
 
 Every write tool honors `if_match` (`"*"` to require existence,
@@ -93,10 +93,11 @@ DELETE response doesn't echo the `X-*` headers per the design doc
 
 The seven write tools (`write_page`, `delete_page`,
 `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-`move_page`) and the two read surfaces (`read_page`,
-`silverbullet://page/{name}`) all return this same envelope family.
-`list_pages` keeps its v1.1 `[{name, etag}]` shape for v1.2-rc1;
-T28 widens it in the same map.
+`move_page`), the two read surfaces (`read_page`,
+`silverbullet://page/{name}`), and `list_pages` (T28) all
+return this same envelope family. `list_pages` returns one
+envelope per row (no `body` field per row — use `read_page`
+for the body).
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
 
@@ -268,6 +269,7 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_ALLOWED_HOSTS` | *(unset → SDK loopback default)* | Extra `Host` values, comma-separated |
 | `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
 | `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the four journal tools above; requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
+| `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages` (T28). Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. Partial failures (404 / 412 / 5xx / timeout on one page) leave that row's etag as `null` rather than failing the whole call. |
 
 Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`
 (e.g. `http://127.0.0.1:63000`) and `MCP_SILVERBULLET_LIVE_SB_TOKEN`

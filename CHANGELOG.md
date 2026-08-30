@@ -90,6 +90,40 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
   [README § v1.2 wire-shape changes](README.md#v12-wire-shape-changes)
   for the full migration note.
 
+- **T28 (BREAKING): `list_pages`'s return type widened from
+  `[{name, etag}]` (v1.1 minimal subset) to the same envelope
+  family the read and write tools use.** Each row is now:
+
+  ```jsonc
+  {
+    "name": "<page>",
+    "etag": "\"abc123\"",        // null on this SB build (list payload omits it)
+    "size_bytes": 1024,           // UTF-8 byte count; null if missing/malformed
+    "last_modified_ms": 1700000000123,  // epoch ms; null if missing/malformed
+    "created_ms": 1700000000000         // epoch ms; null if missing/malformed
+  }
+  ```
+
+  Migration: replace
+  `for row in result["result"]: name = row["name"]; etag = row["etag"]`
+  with the same loop reading the same `name` / `etag` fields
+  (their positions haven't moved) or read `size_bytes` /
+  `last_modified_ms` / `created_ms` to skip the per-page
+  `read_page` v1.1 callers did to learn those facts. See
+  [README § v1.2 wire-shape changes](README.md#v12-wire-shape-changes).
+
+  **Optional per-page etag-hydration** (T28's opt-in):
+  `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` enables one GET
+  per row whose list-payload etag is `null`, hydrating the etag
+  from the response's `ETag` header. Default off (the v1.1
+  behaviour). Partial failures (one page 404'ing / 412'ing /
+  5xx'ing / timing out during hydration) leave that row's etag
+  as `null` rather than failing the whole call — the operator
+  can retry the list later or `read_page` a specific page for
+  the etag. Hydration is sequential (one GET at a time, no
+  fan-out) to bound the concurrent connection count against
+  loopback SB.
+
 ### Added
 
 - **`page_exists(name)`** — cheap existence check (T25); issues

@@ -59,7 +59,7 @@ SB_URL = "http://sb.test"
 RESOURCE_URL = "http://bridge.test/mcp"
 
 
-def _build(handler) -> MCPServer:
+def _build(handler, *, hydrate_etags: bool = False) -> MCPServer:
     """Build an MCP server whose underlying SB transport is ``handler``.
 
     ``handler`` is an ``httpx.MockTransport`` callable — it receives
@@ -67,6 +67,11 @@ def _build(handler) -> MCPServer:
     ``httpx.Response``. The same trick ``tests/test_sb_client.py`` uses
     to test the outbound half; here it lets the in-memory MCP client
     exercise the full tool pipeline without a real SilverBullet.
+
+    ``hydrate_etags`` flips the T28 opt-in: when ``True``, the
+    ``list_pages`` tool issues one GET per row to hydrate the etag
+    field (the v1 default keeps it off; tests that exercise
+    hydration set it explicitly).
     """
     transport = httpx.MockTransport(handler)
     sb = SBClient.__new__(SBClient)
@@ -75,7 +80,12 @@ def _build(handler) -> MCPServer:
         headers={"Authorization": f"Bearer {TOKEN}"},
         transport=transport,
     )
-    return build_mcp(sb, token=TOKEN, resource_url=RESOURCE_URL)
+    return build_mcp(
+        sb,
+        token=TOKEN,
+        resource_url=RESOURCE_URL,
+        list_pages_hydrate_etags=hydrate_etags,
+    )
 
 
 def _text(result) -> str:
@@ -2913,6 +2923,25 @@ async def test_patch_page_replace_ack_envelope_when_etag_header_missing() -> Non
 
 @pytest.mark.asyncio
 async def test_list_pages_returns_file_metas_on_200() -> None:
+    """``list_pages`` widens to the T23 envelope family (T28).
+
+    v1 returned ``list[{name, etag}]`` (the minimal subset);
+    v1.2 T28 widens to the same envelope family the read and
+    write tools use — ``list[{name, etag, size_bytes,
+    last_modified_ms, created_ms}]``. The list payload carries
+    ``size`` from SB; ``created`` / ``lastModified`` are
+    absent from the test payload so the corresponding fields
+    surface as ``None`` per the defensive-parsing contract
+    (``_parse_int_header`` returns ``None`` for missing /
+    malformed header values, same as the read / write paths).
+
+    Hydration is **off by default** — the new field tuple
+    includes the etag field, but on this SB build the list
+    payload doesn't carry one (the v1 map's T10 decision
+    documented this), so every row's ``etag`` is ``None``
+    unless the operator opts in to
+    ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1``.
+    """
     payload = [
         {"name": "index", "etag": '"a"', "size": 12},
         {"name": "page-2", "etag": None, "size": 7},
@@ -2928,14 +2957,28 @@ async def test_list_pages_returns_file_metas_on_200() -> None:
         result = await client.call_tool("list_pages", {})
 
     assert result.is_error is False
-    # The tool returns ``list[dict[str, str | None]]``; the SDK
-    # serialises that as structured content (``structured_content`` in
-    # Python, ``structuredContent`` on the wire). Asserting on the
-    # structured payload avoids string-encoding fragility.
+    # The tool returns ``list[dict]``; the SDK wraps that as
+    # ``{"result": [...]}`` per the SDK's ``RootModel`` shape
+    # on ``list`` returns. Asserting on the structured payload
+    # avoids string-encoding fragility (the values include
+    # epoch-ms integers and ``None`` placeholders that wouldn't
+    # round-trip through JSON text cleanly).
     assert result.structured_content == {
         "result": [
-            {"name": "index", "etag": '"a"'},
-            {"name": "page-2", "etag": None},
+            {
+                "name": "index",
+                "etag": '"a"',
+                "size_bytes": 12,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "page-2",
+                "etag": None,
+                "size_bytes": 7,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
         ]
     }
 
@@ -2943,9 +2986,9 @@ async def test_list_pages_returns_file_metas_on_200() -> None:
 @pytest.mark.asyncio
 async def test_list_pages_filters_by_prefix() -> None:
     payload = [
-        {"name": "index", "etag": None},
-        {"name": "journal/2026-01-01", "etag": None},
-        {"name": "journal/2026-01-02", "etag": None},
+        {"name": "index", "etag": None, "size": 1},
+        {"name": "journal/2026-01-01", "etag": None, "size": 2},
+        {"name": "journal/2026-01-02", "etag": None, "size": 3},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2956,10 +2999,29 @@ async def test_list_pages_filters_by_prefix() -> None:
         result = await client.call_tool("list_pages", {"prefix": "journal/"})
 
     assert result.is_error is False
+    # T28 widened each row to the full envelope family; only
+    # rows matching ``prefix`` are returned. ``etag`` is
+    # ``None`` here because hydration is off by default
+    # (the SB list payload omits the field on this build; an
+    # operator who needs the etag opts in to
+    # ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1``, see
+    # the test_list_pages_hydrates_etags_* tests below).
     assert result.structured_content == {
         "result": [
-            {"name": "journal/2026-01-01", "etag": None},
-            {"name": "journal/2026-01-02", "etag": None},
+            {
+                "name": "journal/2026-01-01",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "journal/2026-01-02",
+                "etag": None,
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
         ]
     }
 
@@ -2975,6 +3037,411 @@ async def test_list_pages_5xx_returns_tool_error() -> None:
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool list_pages: silverbullet error: 500"
+
+
+# --- list_pages hydration (T28 opt-in) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_off_by_default_keeps_etag_none() -> None:
+    """T28 default: hydration off → ``etag=None`` for every row.
+
+    The operator who doesn't need ``if_match`` round-trips from a
+    list call shouldn't pay the N+1 cost. The list payload's
+    ``etag`` field is ``None`` on this SB build; with
+    ``hydrate_etags=False`` (the default), the tool returns the
+    list as-is. A future SB build that emits ``etag`` in the list
+    payload would short-circuit the hydration walker and surface
+    the real etag; this test pins down the *current* SB-build
+    behaviour so a regression that flips the default on
+    silently is caught loudly.
+    """
+    payload = [
+        {"name": "index", "size": 1},
+        {"name": "page-2", "size": 2},
+    ]
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        # Only the ``GET /.fs`` list call should happen — no per-
+        # page GETs. The test would fail if hydration ran by
+        # default because the handler would see more requests
+        # than just the list call.
+        return httpx.Response(
+            200,
+            content=__import__("json").dumps(payload).encode(),
+        )
+
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return recording(request)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    # Exactly one ``GET /.fs`` (the list call). No
+    # ``GET /.fs/{name}`` hydration calls.
+    assert seen == [("GET", "/.fs")]
+    # All rows have ``etag=None`` (the SB payload omits the
+    # field; hydration is off so we don't fetch it).
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "index",
+                "etag": None,
+                "size_bytes": 1,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "page-2",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydrates_etags_when_opted_in() -> None:
+    """Opt-in hydration: per-page GET replaces ``etag=None``.
+
+    With ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1`` (modelled
+    here as ``hydrate_etags=True`` on the bridge factory), the
+    ``list_pages`` tool issues one ``GET /.fs/{name}`` per row
+    whose list-payload etag is ``None``. The hydrated etag
+    comes from the response's ``ETag`` header; the other
+    meta fields (``size_bytes`` / ``last_modified_ms`` /
+    ``created_ms``) come from the list payload directly and
+    don't change on hydration (T28 keeps the list-side values
+    authoritative for those fields; hydration is etag-only).
+
+    Pins down the request ordering: ``GET /.fs`` first, then
+    one ``GET /.fs/{name}`` per row, in the order the list
+    returned them. A future refactor that fan-outs with
+    ``asyncio.gather`` would change the request count to N
+    (not N+1) and the ordering to non-deterministic; this
+    test catches that loudly.
+    """
+    list_payload = [
+        {"name": "index", "size": 1, "created": 1700000000000},
+        {"name": "page-2", "size": 2, "created": 1700000001000},
+    ]
+
+    # Per-page ETag values keyed by page name. The hydration
+    # walker issues one GET per page and surfaces each row's
+    # ``ETag`` as the etag field.
+    per_page_etags = {
+        "index": '"hydrated-a"',
+        "page-2": '"hydrated-b"',
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        # Per-page GET — match against the path after ``/.fs/``.
+        name = request.url.path[len("/.fs/"):]
+        etag = per_page_etags[name]
+        return httpx.Response(
+            200,
+            text="body bytes we don't want",
+            headers={
+                "ETag": etag,
+                "X-Content-Length": "999",
+                "X-Last-Modified": "1700000009999",
+            },
+        )
+
+    seen: list[tuple[str, str]] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return handler(request)
+
+    server = _build(recording, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    # The list call is first, followed by one per-page GET
+    # per row, in order. ``asyncio.gather`` would parallelise
+    # the per-page GETs but produce the same set of paths; we
+    # assert on the set, not the order beyond the initial
+    # list call, to avoid flakiness on a parallel future
+    # implementation.
+    paths = [path for _, path in seen]
+    assert paths[0] == "/.fs"
+    assert sorted(paths[1:]) == ["/.fs/index", "/.fs/page-2"]
+    # Each row's etag is the hydrated value; the size /
+    # timestamps come from the list payload (not the per-page
+    # GET — hydration is etag-only).
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "index",
+                "etag": '"hydrated-a"',
+                "size_bytes": 1,
+                "last_modified_ms": 1700000009999,
+                "created_ms": 1700000000000,
+            },
+            {
+                "name": "page-2",
+                "etag": '"hydrated-b"',
+                "size_bytes": 2,
+                "last_modified_ms": 1700000009999,
+                "created_ms": 1700000001000,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_skips_rows_with_list_payload_etag() -> None:
+    """Future-proofing: a row whose list payload carries ``etag`` is not re-fetched.
+
+    SB builds that emit ``etag`` in the list payload (a future
+    fix for the gap T28 documents) shouldn't pay the per-page
+    round trip — the hydration walker checks
+    ``meta.etag is not None`` and skips the GET. The current
+    SB build always emits ``None`` here, so this test simulates
+    the future shape to lock down the short-circuit.
+    """
+    list_payload = [
+        # Row 1: etag already present — hydration skips it.
+        {"name": "index", "etag": '"from-list"', "size": 1},
+        # Row 2: etag is null — hydration fires.
+        {"name": "page-2", "etag": None, "size": 2},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        # Only ``page-2`` should reach here.
+        assert request.url.path == "/.fs/page-2"
+        return httpx.Response(
+            200,
+            text="body",
+            headers={"ETag": '"hydrated-page-2"'},
+        )
+
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "index",
+                "etag": '"from-list"',
+                "size_bytes": 1,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "page-2",
+                "etag": '"hydrated-page-2"',
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_survives_per_page_404() -> None:
+    """One page 404'ing during hydration doesn't fail the whole list.
+
+    ``read_page_meta_safe`` swallows the per-page 404 and
+    returns ``None``; the row stays in the result with
+    ``etag=None``. The agent sees a list with one row whose
+    etag is unknown rather than an exception that aborts the
+    whole call. The other rows' etags are still hydrated.
+    """
+    list_payload = [
+        {"name": "index", "size": 1},
+        {"name": "deleted", "size": 2},  # 404 on hydrate
+        {"name": "page-3", "size": 3},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        if request.url.path == "/.fs/deleted":
+            # Page was deleted between the list and hydrate.
+            return httpx.Response(404, text="page not found")
+        # The other two pages hydrate cleanly.
+        name = request.url.path[len("/.fs/"):]
+        return httpx.Response(
+            200, text="body", headers={"ETag": f'"{name}-etag"'}
+        )
+
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "index",
+                "etag": '"index-etag"',
+                "size_bytes": 1,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "deleted",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "page-3",
+                "etag": '"page-3-etag"',
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_survives_per_page_5xx() -> None:
+    """A transient 5xx on one hydration GET doesn't fail the list.
+
+    Same resilience contract as the 404 case: a single page's
+    SB hiccup leaves the row's etag as ``None`` rather than
+    aborting the whole list. The agent can retry the list
+    later if it wants the missing etag.
+    """
+    list_payload = [
+        {"name": "index", "size": 1},
+        {"name": "flaky", "size": 2},  # 503 on hydrate
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        if request.url.path == "/.fs/flaky":
+            return httpx.Response(503, text="upstream gone")
+        return httpx.Response(
+            200, text="body", headers={"ETag": '"index-etag"'}
+        )
+
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    rows = result.structured_content["result"]
+    assert rows[0]["etag"] == '"index-etag"'
+    assert rows[1]["etag"] is None
+    assert rows[1]["name"] == "flaky"
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_survives_per_page_timeout() -> None:
+    """A timeout on one hydration GET doesn't fail the list.
+
+    Same resilience contract: ``read_page_meta_safe`` swallows
+    ``httpx.TimeoutException`` and returns ``None``. The row
+    stays in the result with ``etag=None``. Without this, a
+    slow page in a 200-page space would turn a 1-second
+    ``list_pages`` into a 30-second hung call when SB is under
+    load.
+    """
+    list_payload = [
+        {"name": "index", "size": 1},
+        {"name": "slow", "size": 2},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        if request.url.path == "/.fs/slow":
+            raise httpx.ReadTimeout("simulated")
+        return httpx.Response(
+            200, text="body", headers={"ETag": '"index-etag"'}
+        )
+
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+    rows = result.structured_content["result"]
+    assert rows[0]["etag"] == '"index-etag"'
+    assert rows[1]["etag"] is None
+    assert rows[1]["name"] == "slow"
+
+
+@pytest.mark.asyncio
+async def test_list_pages_hydration_runs_after_prefix_filter() -> None:
+    """Hydration fires only on the post-prefix-filter rows.
+
+    ``prefix`` filtering happens *after* the list call (the
+    bridge has to list the whole space and filter in Python
+    per the v1 design — server-side Space Lua search is out of
+    scope per T4 of the prior map). When hydration is on, the
+    walker should only hit the rows that survived the prefix
+    filter — visiting a row the agent's about to discard
+    anyway would be wasted round trips. Locks down the
+    ordering: filter first, hydrate second.
+    """
+    list_payload = [
+        {"name": "index", "size": 1},
+        {"name": "journal/2026-01-01", "size": 2},
+        {"name": "journal/2026-01-02", "size": 3},
+    ]
+
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        name = request.url.path[len("/.fs/"):]
+        return httpx.Response(
+            200, text="body", headers={"ETag": f'"{name}-etag"'}
+        )
+
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_pages", {"prefix": "journal/"}
+        )
+
+    assert result.is_error is False
+    # No GET for ``/.fs/index`` — hydration skipped it because
+    # the prefix filter discarded it. Only the two ``journal/``
+    # rows reached the hydration walker.
+    assert "/.fs/index" not in seen_paths
+    assert "/.fs/journal/2026-01-01" in seen_paths
+    assert "/.fs/journal/2026-01-02" in seen_paths
+    # The result is just the filtered rows.
+    names = [r["name"] for r in result.structured_content["result"]]
+    assert names == ["journal/2026-01-01", "journal/2026-01-02"]
 
 
 # --- move_page --------------------------------------------------------

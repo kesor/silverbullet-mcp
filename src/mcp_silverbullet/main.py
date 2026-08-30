@@ -15,7 +15,11 @@ from dataclasses import dataclass
 
 from mcp.server.transport_security import TransportSecuritySettings
 
-from mcp_silverbullet.journal import JournalConfig, resolve_journal_config
+from mcp_silverbullet.journal import (
+    JournalConfig,
+    _is_truthy,
+    resolve_journal_config,
+)
 from mcp_silverbullet.sb_client import SBClient
 from mcp_silverbullet.server import build_mcp
 
@@ -36,6 +40,7 @@ class Settings:
     port: int
     allowed_hosts: tuple[str, ...]
     journal: JournalConfig
+    list_pages_hydrate_etags: bool
 
 
 def load_settings(environ: dict[str, str] | None = None) -> Settings:
@@ -63,6 +68,16 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         sb_token = sb_token.strip()
     host = (env.get("MCP_SILVERBULLET_HOST") or _DEFAULT_HOST).strip()
     resource_default = f"http://{host}:{port}/mcp"
+    # Truthy parse mirrors :func:`resolve_journal_config`'s
+    # ``MCP_SILVERBULLET_JOURNAL_TOOLS`` style: ``1`` / ``true`` /
+    # ``yes`` / ``on`` enable; everything else (including empty
+    # string and unset) disables. Reusing :func:`_is_truthy` keeps
+    # the two env vars parse-consistent so an operator who's used
+    # ``JOURNAL_TOOLS=1`` doesn't have to relearn the shape for
+    # ``LIST_PAGES_HYDRATE_ETAGS``.
+    list_pages_hydrate_etags = _is_truthy(
+        env.get("MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS", "")
+    )
     return Settings(
         token=token,
         sb_url=(env.get("MCP_SILVERBULLET_SB_URL") or _DEFAULT_SB_URL).rstrip("/"),
@@ -74,6 +89,7 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         port=port,
         allowed_hosts=allowed,
         journal=resolve_journal_config(env),
+        list_pages_hydrate_etags=list_pages_hydrate_etags,
     )
 
 
@@ -109,6 +125,7 @@ async def serve(settings: Settings | None = None) -> None:
             token=settings.token,
             resource_url=settings.resource_url,
             journal=settings.journal,
+            list_pages_hydrate_etags=settings.list_pages_hydrate_etags,
         )
         print(
             f"mcp-silverbullet listening on http://{settings.host}:{settings.port}/mcp "

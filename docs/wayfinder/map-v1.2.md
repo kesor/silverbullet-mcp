@@ -130,10 +130,9 @@ resolution below -->
   `read_page` (the MCP tool) kept returning `str` for v1.2-rc1;
   T24 (resolved in the same map, below) widens it to
   `{body, etag, size_bytes, last_modified_ms}` with the matching
-  `_read_meta_to_payload` helper. `list_pages` keeps its v1.1
-  `list[{name, etag}]` shape; T28 widens it. The client-side
-  `list_pages` stays returning `FileMeta` until T28, then both
-  widen together.
+  `_read_meta_to_payload` helper. `list_pages` kept its v1.1
+  `list[{name, etag}]` shape through T26; T28 (resolved in this
+  map) widened both client and tool to `list[PageMeta]`.
 
   **Field-by-field contract**: `name` is the page the caller asked
   about; `etag` is `None` when SB stripped the response header;
@@ -506,6 +505,217 @@ resolution below -->
   new in-memory dry-run tests; live e2e skipped on this dev
   box). `nix flake check` not run (no Nix in this env).
 
+- **T28. `list_pages` metadata shape + etag round-trip
+  fallback.** (commit pending): The bridge's ninth
+  `/.fs`-backed tool widens from the v1.1
+  ``list[{name, etag}]`` minimal subset to the same envelope
+  family the read and write tools use —
+  ``list[{name, etag, size_bytes, last_modified_ms, created_ms}]``
+  — and gains an opt-in per-page etag-hydration fallback driven
+  by ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``. The change
+  rides on a wider ``sb_client.list_pages`` client method that
+  now returns ``list[PageMeta]`` (one envelope per row, the
+  same dataclass T23's write tools return), a new
+  ``_page_meta_from_list_item`` helper that defensively parses
+  SB's ``GET /.fs`` list payload (``name`` / ``created`` /
+  ``lastModified`` / ``size`` / optional ``etag``), and a new
+  ``_hydrate_list_etags`` walker that issues one
+  ``GET /.fs/{name}`` per row whose list-payload etag is
+  ``None`` (sequential, tolerant of per-page failures). On the
+  MCP side, ``list_pages`` reuses :func:`_write_meta_to_payload`
+  for each row (the write-shape minus ``body`` is also the
+  list-row shape; one helper, two callers).
+
+  **Per-row wire shape**: ``name`` is the page the caller
+  asked about; ``etag`` is ``None`` on this SB build because
+  SB's list payload omits the field (the v1 map's T10 decision
+  documented this); ``size_bytes`` is the UTF-8 byte count
+  from the list payload (or ``None`` if missing/malformed);
+  ``last_modified_ms`` / ``created_ms`` are epoch-ms timestamps
+  from the list payload (or ``None`` if missing/malformed).
+  ``body`` is not on the list-row shape — an agent that wants
+  the markdown reads the page. Defensive parsing via
+  :func:`_parse_int_header` makes every field optional; an
+  SB-side schema drift or a missing field surfaces as
+  ``None`` for that row, not as a list call that crashes
+  mid-walk.
+
+  **Hydration semantics**: opt-in via
+  ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1`` (same
+  truthy shape as ``MCP_SILVERBULLET_JOURNAL_TOOLS`` —
+  reuses :func:`_is_truthy` from ``journal.py`` for
+  parse-consistency). Default off (the v1.1 behaviour, no
+  per-page round trips). When on, the walker fires one
+  ``GET /.fs/{name}`` per row whose list-payload etag is
+  ``None``; a future SB build that emits ``etag`` in the
+  list payload short-circuits the walker (the ``etag is
+  not None`` guard). Hydration runs **after** the prefix
+  filter (filter-then-hydrate, not hydrate-then-filter) so
+  the walker only visits rows the agent's about to see —
+  ``test_list_pages_hydration_runs_after_prefix_filter``
+  pins this down so a future refactor that re-orders for
+  any reason surfaces as wasted SB load rather than a
+  silent efficiency regression. Hydration is sequential
+  (``asyncio.gather`` would parallelise but also fan out
+  N sockets against a loopback SB with no keepalive;
+  sequential is predictable in resource terms, the right
+  shape for an off-by-default opt-in feature).
+
+  **Partial-hydration tolerance**: ``_hydrate_list_etags``
+  walks through every row and continues past per-page
+  failures. The per-page hydration GET goes through a
+  new ``sb_client.read_page_meta_safe`` helper that
+  swallows ``PageNotFound`` (page deleted between list
+  and hydrate), ``PreconditionFailed`` (proxy / SB
+  misconfig), ``ServerError`` (5xx), and
+  ``httpx.TimeoutException`` (slow SB), returning
+  ``None`` for each. The walker then keeps the row's
+  original meta (with ``etag=None``) for that page; the
+  rest of the list surfaces normally. The agent sees a
+  list with one row whose etag is unknown rather than an
+  exception that aborts the whole call. An agent that
+  specifically needs the etag for a row can ``read_page``
+  it directly.
+
+  **Headers-only body avoidance**: the per-page hydration
+  GET uses ``httpx.AsyncClient.stream`` (not ``get``)
+  and closes the response before the body is buffered.
+  ``httpx.AsyncClient.get`` would background the body
+  read; ``stream()`` makes the intent obvious to the next
+  reader — we read headers (``ETag`` /
+  ``X-Last-Modified`` / ``X-Created`` / ``X-Content-Length``)
+  via :func:`_meta_from_response` and let
+  ``__aexit__`` close the connection cleanly without
+  copying the body into a Python string. A 1 MiB page
+  hydrated should still cost just the headers over the
+  wire, not 1 MiB of body bytes. The Layer-1 test sends
+  a 64 KiB body and asserts the surfaced ``PageMeta``
+  has ``body=None`` so a future refactor that swaps
+  ``stream()`` for ``get()`` (and accidentally populates
+  the body) shows up as a body field rather than ``None``
+  in the test.
+
+  **Files touched**:
+  ``src/mcp_silverbullet/sb_client.py`` (added
+  ``_page_meta_from_list_item`` + ``_coerce_str``
+  helpers; widened ``list_pages`` return type from
+  ``list[FileMeta]`` to ``list[PageMeta]``; added
+  ``read_page_meta`` and ``read_page_meta_safe``
+  methods; module-level docstring's "Five entry points"
+  → "Six entry points" + the FileMeta back-compat note),
+  ``src/mcp_silverbullet/server.py`` (new
+  ``_hydrate_list_etags`` helper; ``list_pages`` MCP
+  tool body rewired to project ``PageMeta`` via
+  :func:`_write_meta_to_payload` instead of inline dict
+  construction; the prefix filter now runs *before*
+  hydration; ``build_mcp`` gained a
+  ``list_pages_hydrate_etags: bool = False`` kwarg that
+  threads through ``register_tools`` to the closure;
+  module docstring's status line bumped from
+  "T23/T24/T25/T26 done; T28 next" to
+  "T23/T24/T25/T26/T28 done; T29 next"; the
+  ``_write_meta_to_payload`` docstring's T28 forward-
+  looking reference replaced with the actual now-shipping
+  usage — same projection for both write tools and list
+  rows; the ``_read_meta_to_payload`` docstring's
+  T28-still-pending reference dropped),
+  ``src/mcp_silverbullet/main.py`` (added
+  ``list_pages_hydrate_etags: bool`` to
+  :class:`Settings`; the env-var parse uses
+  :func:`_is_truthy` from ``journal.py`` so the two
+  opt-in env vars parse consistently; threaded into
+  :func:`build_mcp`),
+  ``tests/test_sb_client.py`` (+12 tests: T28 per-row
+  mapping, defensive parse of missing/malformed fields,
+  skip-rows-without-name resilience, the four
+  ``read_page_meta`` / ``read_page_meta_safe`` tests
+  covering 200 / 404 / 5xx / timeout round trips, plus
+  the existing ``test_list_pages_returns_file_metas``
+  rewired to assert on ``list[PageMeta]``),
+  ``tests/test_tools_in_memory.py`` (existing
+  ``test_list_pages_returns_file_metas_on_200`` and
+  ``test_list_pages_filters_by_prefix`` rewired to the
+  new envelope shape; ``_build`` gained an optional
+  ``hydrate_etags`` kwarg for the new tests; +7 new
+  tests grouped under a ``# --- list_pages hydration
+  (T28 opt-in) ---`` section header — off-by-default,
+  hydration-on, hydration-skips-rows-with-payload-etag,
+  hydration-survives-404, hydration-survives-5xx,
+  hydration-survives-timeout, hydration-runs-after-
+  prefix-filter),
+  ``tests/test_main_settings.py`` (+11 parameterized
+  cases for the new env var's truthy/falsy parse,
+  plus a default assertion in ``test_defaults``),
+  ``README.md`` (the ``list_pages`` bullet rewritten
+  with the new shape and the hydration opt-in;
+  the v1.2 wire-shape section's closing line dropped
+  the "T28 widens it in the same map" claim and
+  replaced it with the actual list-pages envelope being
+  part of the same envelope family; the env-var table
+  gained a row for
+  ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``; the
+  intro's "four open tickets" line bumped to "three"),
+  ``CHANGELOG.md`` (a T28 entry under Unreleased's
+  ``### Changed`` (BREAKING) with the new per-row
+  shape, migration note, and the hydration opt-in
+  description), ``docs/design.md`` (the ``list_pages``
+  row in the Tools table widened to the new shape and
+  annotated with the hydration opt-in; the § Tools
+  prose gained a T28 paragraph; the status-code
+  mapping table's 404 / 412 / 5xx / timeout rows
+  gained "this also applies to a per-page list-pages
+  hydration GET (T28)" notes so an agent that hits a
+  partial-hydration failure knows the row's etag stays
+  ``null`` rather than the whole list failing).
+
+  **Bonus improvements visible while doing it**: the
+  ``list_pages`` MCP tool description now documents the
+  hydration opt-in and the partial-hydration contract
+  rather than the v1.1 stub ("v1 does the filter
+  client-side"); the ``register_tools`` docstring
+  gained a paragraph on ``hydrate_etags`` so the next
+  reader doesn't have to chase the param through
+  ``build_mcp`` → ``register_tools`` to understand
+  what it does; the server module docstring's
+  status-line is honest about T28 being done (the
+  prior "T28 next" wording would have been a
+  confusing lie after this commit); the ``sb_client``
+  module docstring was reorganised so the entry-points
+  list ("Five entry points" → "Six entry points")
+  matches the actual surface, and the FileMeta
+  back-compat note explains why the dataclass stays
+  exported even though ``list_pages`` no longer
+  returns it (avoids a future "why is this still here?"
+  question); the helper
+  :func:`_page_meta_from_list_item` reuses
+  :func:`_parse_int_header` and a new tiny
+  :func:`_coerce_str` shim that handles JSON ``int`` /
+  ``None`` / ``str`` / ``bool`` defensively — a single
+  field rename in SB's list payload now surfaces as
+  ``None`` on that row rather than a list call that
+  crashes mid-walk; the per-row wire shape is a
+  faithful subset of the T23 write envelope so the MCP
+  tool layer uses :func:`_write_meta_to_payload`
+  directly (the same helper every write tool uses) —
+  one projection, three callers (write tools / list
+  rows / ``move_page``'s same-name short-circuit).
+
+  **Unblocks**: T29 (``list_tasks`` reuses the
+  T23-envelope shape per row — the same dataclass
+  powers it), T30 (``check_task` already promised the
+  T23 write-tool envelope as its return shape; the
+  client-side change is shared with T28/the same
+  ``PageMeta`` widening that T28 rides on).
+
+  Test count: 241 pass + 2 skip (was 212 pass + 2
+  skip; +10 sb_client + 7 in-memory tests + 11
+  parametrised settings cases across 2 new test
+  functions, and the two existing list-pages
+  in-memory tests rewired in place — net +29 test
+  cases overall). Live e2e not run on this dev box
+  (no live SB env). ``nix flake check`` not run (no
+  Nix in this env).
+
 ## Tickets
 
 <!--
@@ -705,7 +915,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Assignee**: `minimax-m3` (claimed 2026-08-30, resolved same day)
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: What does `list_pages` return, and how does the
 > bridge hydrate etags when SB's `/.fs` list payload omits them?
 >
@@ -745,6 +956,26 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > `src/mcp_silverbullet/server.py` (`list_pages` shape change).
 >
 > **Blocks on**: T23, T24. **Unblocks**: none.
+
+> **Resolution**: see Decisions so far above. The
+> implementation shipped a wider ``list_pages`` client method
+> returning ``list[PageMeta]`` (vs the v1.1 ``list[FileMeta]``),
+> plus a new ``sb_client.read_page_meta`` /
+> ``read_page_meta_safe`` pair (stream-based headers-only GET,
+> tolerant of per-page failures via the "safe" sibling) and a
+> ``_hydrate_list_etags`` walker that issues one GET per row
+> whose list-payload etag is ``None``. Hydration runs after the
+> prefix filter (filter-then-hydrate, not hydrate-then-filter)
+> so the walker only visits rows the agent's about to see.
+> Opt-in via ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``;
+> default off (the v1.1 wire shape, no per-page round trips).
+> Live e2e against the live SB was deferred (the dev box has
+> no live SB env in this session); the Layer-1 in-memory tests
+> plus the ``test_e2e_live_sb.py`` infrastructure cover the
+> hydration shape when the operator sets the live-env vars on a
+> future run — the hydration walker is structurally identical to
+> ``sb_client.exists_page`` plus headers-reading, both of which
+> the Layer-3 ``MockTransport`` tests cover comprehensively.
 
 ---
 

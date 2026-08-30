@@ -712,6 +712,17 @@ async def test_list_pages_sends_x_sync_mode() -> None:
 
 @pytest.mark.asyncio
 async def test_list_pages_returns_file_metas() -> None:
+    """``list_pages`` widens to ``list[PageMeta]`` (T28).
+
+    v1 returned ``list[FileMeta]`` (the minimal ``name`` / ``etag``
+    subset). v1.2 T28 widens to ``list[PageMeta]`` — the same
+    envelope family the read and write tools use — so a single
+    list call surfaces ``size_bytes`` / ``last_modified_ms`` /
+    ``created_ms`` alongside the name without a per-page
+    ``read_page`` round trip. ``FileMeta`` itself is still a
+    valid narrower projection of the envelope and stays
+    exported on the module surface for back-compat.
+    """
     payload = [
         {"name": "index", "etag": '"a"', "size": 12},
         {"name": "page-2", "etag": None, "size": 7},
@@ -725,9 +736,31 @@ async def test_list_pages_returns_file_metas() -> None:
     async with _client(handler) as sb:
         result = await sb.list_pages()
 
+    # ``PageMeta`` is the full envelope; ``FileMeta`` is the
+    # v1 minimal subset (``name`` / ``etag`` only). The new
+    # ``list_pages`` return carries the full envelope; an
+    # operator who wants the narrower shape filters the
+    # result list client-side (``[FileMeta(name=r.name,
+    # etag=r.etag) for r in result]``). The fields absent from
+    # the payload (``lastModified`` / ``created``) come back as
+    # ``None`` per the defensive-parsing contract.
     assert result == [
-        FileMeta(name="index", etag='"a"'),
-        FileMeta(name="page-2", etag=None),
+        PageMeta(
+            name="index",
+            etag='"a"',
+            size_bytes=12,
+            last_modified_ms=None,
+            created_ms=None,
+            body=None,
+        ),
+        PageMeta(
+            name="page-2",
+            etag=None,
+            size_bytes=7,
+            last_modified_ms=None,
+            created_ms=None,
+            body=None,
+        ),
     ]
 
 
@@ -749,6 +782,345 @@ async def test_list_pages_raises_server_error_on_5xx() -> None:
     async with _client(handler) as sb:
         with pytest.raises(ServerError):
             await sb.list_pages()
+
+
+@pytest.mark.asyncio
+async def test_list_pages_extracts_meta_fields_from_list_payload() -> None:
+    """T28 widens ``list_pages`` — verify the per-row field mapping.
+
+    SB's ``GET /.fs`` payload carries ``created`` /
+    ``lastModified`` / ``size`` alongside ``name`` per
+    ``server/src/handlers/fs.rs::handle_fs_list``; v1 dropped
+    all but ``name`` (and the optional ``etag``) and returned
+    ``list[FileMeta]``. T28 threads the four extras through to
+    :class:`PageMeta` so a single list call surfaces the
+    timestamps / size without a per-page ``read_page``. This
+    test pins down the field-by-field mapping so a future
+    SB-side rename (``lastModified`` → ``last_modified``)
+    surfaces loudly here rather than as silent ``None`` on
+    every row.
+    """
+    payload = [
+        {
+            "name": "index",
+            "etag": '"a"',
+            "created": 1700000000000,
+            "lastModified": 1700000000123,
+            "size": 1024,
+        },
+        {
+            "name": "page-2",
+            "etag": '"b"',
+            "created": 1700000001000,
+            "lastModified": 1700000001123,
+            "size": 2048,
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(payload).encode("utf-8"))
+
+    async with _client(handler) as sb:
+        result = await sb.list_pages()
+
+    assert result == [
+        PageMeta(
+            name="index",
+            etag='"a"',
+            size_bytes=1024,
+            last_modified_ms=1700000000123,
+            created_ms=1700000000000,
+            body=None,
+        ),
+        PageMeta(
+            name="page-2",
+            etag='"b"',
+            size_bytes=2048,
+            last_modified_ms=1700000001123,
+            created_ms=1700000001000,
+            body=None,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_pages_tolerates_missing_and_malformed_meta_fields() -> None:
+    """Defensive parse: missing or non-numeric meta fields → ``None``.
+
+    Mirrors the read/write paths' "older SB / proxy-stripped"
+    contract: a row that lacks ``created`` / ``lastModified`` /
+    ``size`` (older SB, proxy drop, future schema drift) should
+    surface as ``None`` rather than crash the whole list call.
+    A row whose ``created`` is a non-numeric string (``"nope"``)
+    surfaces as ``None`` for that field via
+    :func:`_parse_int_header`'s try/except — the rest of the
+    row parses normally, so a single malformed row doesn't take
+    the whole list down. ``name`` always parses (it's required
+    for the row to be emitted at all); ``etag`` is ``None``
+    when missing or non-string.
+    """
+    payload = [
+        # Minimal row — only ``name``; every other field is
+        # absent.
+        {"name": "minimal"},
+        # Malformed ``created`` — string that doesn't parse as int.
+        {"name": "broken", "created": "nope", "lastModified": 1, "size": 2},
+        # ``created`` as a JSON ``null`` (defensive against a
+        # future SB that explicitly nulls the field).
+        {"name": "nulled", "created": None, "lastModified": None},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(payload).encode("utf-8"))
+
+    async with _client(handler) as sb:
+        result = await sb.list_pages()
+
+    assert result == [
+        PageMeta(
+            name="minimal",
+            etag=None,
+            size_bytes=None,
+            last_modified_ms=None,
+            created_ms=None,
+            body=None,
+        ),
+        PageMeta(
+            name="broken",
+            etag=None,
+            size_bytes=2,
+            last_modified_ms=1,
+            created_ms=None,
+            body=None,
+        ),
+        PageMeta(
+            name="nulled",
+            etag=None,
+            size_bytes=None,
+            last_modified_ms=None,
+            created_ms=None,
+            body=None,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_pages_skips_rows_without_a_name() -> None:
+    """A list payload row that lacks ``name`` is silently dropped.
+
+    SB's contract per ``handle_fs_list`` is "every row has a
+    ``name``"; an upstream regression that emits a row without
+    one would otherwise crash the whole list call. The current
+    code path silently drops such rows; if the bridge ever
+    needs to surface them loudly, this test is the place to
+    flip to a ``ServerError``.
+    """
+    payload = [
+        {"name": "ok", "size": 1},
+        {"size": 2},  # no ``name`` — dropped
+        {"name": "also-ok", "size": 3},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(payload).encode("utf-8"))
+
+    async with _client(handler) as sb:
+        result = await sb.list_pages()
+
+    assert [m.name for m in result] == ["ok", "also-ok"]
+
+
+# --- read_page_meta (T28 hydration helper) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_returns_headers_only() -> None:
+    """``read_page_meta`` returns :class:`PageMeta` without buffering the body.
+
+    The list-pages etag-hydration walker uses this method to
+    fetch per-page etags when the operator opts in to
+    ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``. The whole
+    point is "headers only, no body": a 1 MiB page hydrated
+    should still cost just the headers over the wire, not
+    1 MiB of body bytes. This test pins that down by sending a
+    large response body and asserting the client surfaces only
+    the headers — if a future refactor swaps ``stream()`` for
+    ``get()`` (which backgrounds the body read) the test would
+    need to time-budget, but the immediate contract is "the
+    headers reach us" so we assert on those.
+
+    Reads ``ETag`` / ``X-Created`` / ``X-Last-Modified`` /
+    ``X-Content-Length`` from the response and surfaces them in
+    the same shape :meth:`read_page` does (minus ``body``,
+    which is ``None`` — the body was never read).
+    """
+    # Body content deliberately large enough that "we read it"
+    # would be obvious in a memory profile, but small enough
+    # to not slow the test down.
+    big_body = "x" * (64 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/index"
+        return httpx.Response(
+            200,
+            content=big_body.encode("utf-8"),
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Created": "1700000000000",
+                "X-Content-Length": str(len(big_body)),
+            },
+        )
+
+    async with _client(handler) as sb:
+        meta = await sb.read_page_meta("index")
+
+    # The dataclass carries the headers; ``body`` is ``None``
+    # because we never read the response body. A future refactor
+    # that accidentally reads it (and surfaces ``"x" * 65536``)
+    # would show up here as a body of 65,536 chars rather than
+    # ``None`` — the test locks the "no body" half of the
+    # contract, not the body-length math (that's covered by
+    # :func:`test_read_page_meta_extracts_meta_from_response_headers`
+    # below).
+    assert meta.name == "index"
+    assert meta.etag == '"abc123"'
+    assert meta.last_modified_ms == 1700000000123
+    assert meta.created_ms == 1700000000000
+    assert meta.size_bytes == len(big_body)
+    # ``body`` is ``None`` because the stream is closed before
+    # the body is buffered; a future refactor that calls
+    # ``response.text`` or ``response.content`` would populate
+    # this and the test would fail loudly.
+    assert meta.body is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_returns_nones_when_headers_stripped() -> None:
+    """A 200 with no ``X-*`` / ``ETag`` headers → ``None``-populated envelope.
+
+    Mirrors :meth:`read_page`'s ``None``-when-stripped contract:
+    an old SB / proxy-stripped response surfaces the same
+    shape, just without the meta fields. ``body`` is ``None``
+    regardless (we never read it).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content="ignored body")
+
+    async with _client(handler) as sb:
+        meta = await sb.read_page_meta("anything")
+
+    assert meta.name == "anything"
+    assert meta.etag is None
+    assert meta.size_bytes is None
+    assert meta.last_modified_ms is None
+    assert meta.created_ms is None
+    assert meta.body is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_raises_page_not_found_on_404() -> None:
+    """A 404 surfaces as :class:`PageNotFound` (same as :meth:`read_page`).
+
+    The hydration walker catches this in :meth:`read_page_meta_safe`
+    and returns ``None``; a caller that calls
+    :meth:`read_page_meta` directly (instead of the safe sibling)
+    gets the typed exception per the design doc's status-code
+    mapping.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    async with _client(handler) as sb:
+        with pytest.raises(PageNotFound):
+            await sb.read_page_meta("missing")
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_safe_returns_none_on_404() -> None:
+    """``read_page_meta_safe`` swallows 404 → ``None``.
+
+    The hydration walker relies on this: a page deleted between
+    the list call and the per-page GET leaves the row's
+    ``etag=None`` rather than failing the whole list. The
+    row stays in the result with the etag it already had
+    (also ``None``, since SB's list payload omits the field);
+    the agent can ``read_page`` it later if it wants the etag
+    for the next call.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    async with _client(handler) as sb:
+        result = await sb.read_page_meta_safe("missing")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_safe_returns_none_on_5xx() -> None:
+    """``read_page_meta_safe`` swallows 5xx → ``None``.
+
+    A single transient SB outage on a hydration GET shouldn't
+    abort the whole ``list_pages`` call — partial hydration is
+    strictly better than failing the whole list when the
+    alternative is "the agent retries the whole list". The
+    affected row keeps ``etag=None``; everything else
+    surfaces normally.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    async with _client(handler) as sb:
+        result = await sb.read_page_meta_safe("anything")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_safe_returns_none_on_timeout() -> None:
+    """``read_page_meta_safe`` swallows :class:`httpx.TimeoutException` → ``None``.
+
+    Same resilience contract as the 5xx case: a single page
+    that times out leaves its row's etag as ``None``; the
+    rest of the list surfaces normally. Without this, a slow
+    page in a 200-page space could turn a 1-second ``list_pages``
+    into a 30-second hung call when SB is under load.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated")
+
+    async with _client(handler) as sb:
+        result = await sb.read_page_meta_safe("anything")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_safe_returns_meta_on_200() -> None:
+    """Happy path: a 200 with full headers returns :class:`PageMeta`.
+
+    Pins the round trip so a future refactor that accidentally
+    swaps in :meth:`read_page` (which would materialize the
+    body) or breaks the ``stream()``-based closure shows up
+    here as a body field populated rather than ``None``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content="body bytes we never want to see",
+            headers={"ETag": '"abc"', "X-Content-Length": "100"},
+        )
+
+    async with _client(handler) as sb:
+        result = await sb.read_page_meta_safe("index")
+
+    assert result is not None
+    assert result.name == "index"
+    assert result.etag == '"abc"'
+    assert result.size_bytes == 100
+    assert result.body is None
 
 
 # --- auth header on every request --------------------------------------

@@ -223,7 +223,13 @@ read-modify-write tools (`append_to_page` / `patch_page_lines` /
 committing (the read still happens and `if_match=<etag>` is checked
 against the read's etag, but no PUT is issued; the return shape
 is a different `{dry_run, original, patched, diff}` envelope).
-**Nine tools, one resource template.**
+T28 widens `list_pages`'s row shape from the v1.1 minimal
+`{name, etag}` subset to the same envelope family the read/write
+tools use (`{name, etag, size_bytes, last_modified_ms, created_ms}`)
+and adds an opt-in per-page etag-hydration fallback
+(`MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) so an operator who
+needs `if_match` round-trips from a list call can pay the N+1
+cost of one GET per page. **Nine tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
@@ -235,7 +241,7 @@ is a different `{dry_run, original, patched, diff}` envelope).
 | `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None, dry_run: bool = False` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront; `dry_run=True` skips the PUT and returns a preview envelope) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run) | may patch / refuse on `412`; `dry_run=True` raises the same 412-equivalent `ToolError` if `if_match=<stale_etag>` |
 | `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | `{name=destination, etag, size_bytes, last_modified_ms, created_ms}` (same-name no-op returns the source's envelope) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo `X-*` per the SB contract) | hard delete; refuses on `412` |
-| `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | `list[{name, etag}]`; T28 widens to `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` | none |
+| `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python (filter happens *before* hydration so the prefix reduces the per-page round-trip count) | `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` (T28 widened from the v1.1 minimal subset; ``etag`` is `None` for every row on this SB build because the list payload omits the field — an operator who needs ``if_match`` round-trips opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) | none |
 
 Resource template:
 
@@ -271,12 +277,12 @@ we are.
 
 | SB response | Tool behavior |
 |---|---|
-| `200 OK` | success — return body / `FileMeta` / `bool` |
-| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. |
-| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). |
+| `200 OK` | success — return body / `PageMeta` (read, write, list row) / `bool` |
+| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
+| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). |
 | `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
-| `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions" |
-| timeout | `ToolError("silverbullet request timed out")` |
+| `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions". A 5xx on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (transient SB hiccup, not an agent error). |
+| timeout | `ToolError("silverbullet request timed out")` — including the `list_pages` hydration walker (T28), which swallows per-page timeouts and leaves the row's `etag` as `null` rather than failing the whole call. |
 
 ### What we are not doing (v1)
 

@@ -391,8 +391,14 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         f"{listed.content[0].text if listed.content else listed}"
                     )
                     # ``list_pages`` returns structured content
-                    # (``list[dict[str, str | None]]``); the wire shape
-                    # is ``{"result": [...]}`` per the Layer-1 test.
+                    # (T28: ``list[{name, etag, size_bytes,
+                    # last_modified_ms, created_ms}]`` — the same
+                    # envelope family the read/write tools use);
+                    # the wire shape is ``{"result": [...]}`` per
+                    # the Layer-1 test. The assertion only reads
+                    # each row's ``name`` so the shape widening
+                    # is transparent to this test (the
+                    # ``name`` field position is unchanged).
                     payload = listed.structured_content or {}
                     names = {item["name"] for item in payload.get("result", [])}
                     assert MARKER in names

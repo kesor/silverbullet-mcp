@@ -18,9 +18,9 @@ Four entry points:
   :class:`PageMeta` with the deleted body's ETag and ``None`` for
   size / timestamps (DELETE doesn't echo ``X-*`` per the design
   doc).
-- :func:`list_pages` — ``GET /.fs`` — still returns
-  ``list[FileMeta]`` (the minimal subset) until T28 widens both
-  client and tool to ``list[PageMeta]``.
+- :func:`list_pages` — ``GET /.fs`` — returns
+  ``list[PageMeta]`` (T28 widens from the v1 minimal
+  ``list[FileMeta]``; same envelope family as read + write).
 
 A fifth entry point, added in v1.2:
 
@@ -29,6 +29,20 @@ A fifth entry point, added in v1.2:
   :class:`ServerError` on 5xx so the caller can distinguish
   "doesn't exist" from "SB is broken". Body bytes are never
   materialized; this is a cheap existence check, not a read.
+
+A sixth entry point, also v1.2 T28:
+
+- :func:`read_page_meta` — ``GET /.fs/{name}`` via
+  ``httpx.AsyncClient.stream`` — returns :class:`PageMeta`
+  *without* materializing the body. The list-pages etag-hydration
+  walker uses this to fetch per-page etags when the operator opts
+  in via
+  ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``; the SB list
+  payload omits the etag field on this build, so a per-page GET
+  is the only way to surface one. The "safe" sibling
+  :func:`read_page_meta_safe` swallows transient failures so a
+  single page 404'ing / 412'ing / timing out doesn't abort the
+  whole list_pages call.
 
 The status-code mapping lives in :func:`_raise_for_status` and matches
 the table in ``docs/design.md`` § Tools. The PUT envelope carries the
@@ -39,6 +53,13 @@ out for writes (``X-Source: external``, ``X-Permission: rw``,
 ``If-None-Match``) so SB's attribution log distinguishes bridge
 writes from editor / sync writes, and so future SB versions that
 honor request-side meta can read it without a bridge change.
+
+``FileMeta`` (the v1 minimal ``name`` / ``etag`` subset) is kept
+on the module surface for back-compat — T28 widened
+:func:`list_pages` to return :class:`PageMeta`, but the
+dataclass itself is still a valid projection of the full envelope
+and a future caller may want the narrower shape without paying
+for the four extra fields.
 
 The GET and PUT response ``X-*`` headers (``X-Created``,
 ``X-Last-Modified``, ``X-Content-Length``) plus ``ETag`` flow into
@@ -122,13 +143,18 @@ class ServerError(SBError):
 
 @dataclass(frozen=True)
 class FileMeta:
-    """Subset of SB's ``FileMeta`` we actually surface.
+    """Minimal subset of SB's ``FileMeta`` we surfaced pre-T28.
 
     SB returns more fields (``createdAt``, ``lastModified``, ``size``,
-    ``contentType``); v1 only needs ``name`` for ``list_pages`` and
+    ``contentType``); v1 only needed ``name`` for ``list_pages`` and
     ``etag`` for the optional ``If-Match`` round-trip. v1.2's T28
-    will widen this to the full :class:`PageMeta` shape; until then
-    it stays the minimal subset.
+    widened ``list_pages`` to return :class:`PageMeta` (the same
+    envelope family the read/write tools use); ``FileMeta`` itself
+    stays on the module surface for back-compat — a caller that
+    wants the narrower shape filters the wider list client-side
+    (``[FileMeta(name=r.name, etag=r.etag) for r in
+    sb.list_pages()]``) rather than going through a separate
+    client method.
     """
 
     name: str
@@ -139,13 +165,13 @@ class FileMeta:
 class PageMeta:
     """Single-source-of-truth acknowledgement shape for read + write tools.
 
-    v1.2 T23 (write tools) and T24 (read tools) both return this shape
-    so an agent that just made a write knows ``size_bytes`` /
-    ``last_modified_ms`` / ``created_ms`` without a follow-up read, and
-    a read returns the same envelope so a caller doesn't have to learn
-    two shapes. T28 widens :class:`FileMeta` to this same shape so
-    ``list_pages`` also returns ``list[PageMeta]`` — one envelope, every
-    tool.
+    v1.2 T23 (write tools), T24 (read tools), and T28 (``list_pages``
+    rows) all return this shape so an agent that just made a write
+    knows ``size_bytes`` / ``last_modified_ms`` / ``created_ms``
+    without a follow-up read, a read returns the same envelope so a
+    caller doesn't have to learn two shapes, and a list call
+    returns ``list[PageMeta]`` so the same envelope powers all
+    three surfaces — one dataclass, every tool.
 
     The MCP tool layer subsets this shape per ticket: T23's write
     tools emit ``{name, etag, size_bytes, last_modified_ms, created_ms}``
@@ -462,18 +488,36 @@ class SBClient:
         # first (``read_page`` will surface them).
         return _meta_from_response(response, name)
 
-    async def list_pages(self) -> list[FileMeta]:
-        """Return ``FileMeta`` for every page in the space.
+    async def list_pages(self) -> list[PageMeta]:
+        """Return :class:`PageMeta` for every page in the space.
 
-        SB returns a JSON array of ``FileMeta`` objects (**only** when
+        SB returns a JSON array of file-meta objects (**only** when
         the request carries ``X-Sync-Mode`` — without it, SB
-        307-redirects ``GET /.fs`` to the SPA UI). v1 only threads
-        ``name`` and ``etag`` through to MCP; the rest is ignored
-        (avoids a Pydantic model we'd have to keep in sync with the
-        upstream server). v1.2 T28 widens the tool-shape return to
-        ``list[PageMeta]`` (full meta); the client-side
-        ``list_pages`` stays returning ``FileMeta`` (the minimal
-        subset) until T28, then both client and tool widen together.
+        307-redirects ``GET /.fs`` to the SPA UI). The list payload
+        per ``server/src/handlers/fs.rs::handle_fs_list`` carries
+        ``name`` / ``created`` / ``lastModified`` / ``contentType`` /
+        ``size`` / ``perm``; on this SB build it does **not** carry an
+        ``etag`` field (the v1 map's T10 decision documented this), so
+        ``etag`` is ``None`` for every row until SB starts emitting
+        one. The bridge threads ``name`` / ``created`` /
+        ``lastModified`` / ``size`` / ``etag`` into the
+        :class:`PageMeta` shape; ``contentType`` and ``perm`` are
+        dropped (no caller has asked for them; surfacing them would
+        grow the wire shape without a use case). T28 widens this
+        from the v1.1 ``list[FileMeta]`` (the minimal ``name`` /
+        ``etag`` subset) to ``list[PageMeta]`` (the same envelope
+        family the read and write tools use), so a single tool now
+        returns everything the agent would otherwise have to
+        ``read_page`` for. The MCP tool layer subsets ``PageMeta``
+        down to the T23 wire shape (no ``body``) per row.
+
+        See :meth:`read_page_meta` for the per-page etag-hydration
+        fallback (opt-in via the bridge's
+        ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`` env var) —
+        the list payload's missing ``etag`` field is a per-build
+        gap, not a permanent one, and an operator who needs an
+        ``if_match`` round-trip can pay the N+1 cost of a per-page
+        GET to hydrate it.
         """
         response = await self._client.get(
             "/.fs", headers={"X-Sync-Mode": "1"}
@@ -484,24 +528,75 @@ class SBClient:
             # SB contract is "array of FileMeta"; anything else is a
             # server-side bug we'd want to know about loudly.
             raise ServerError(f"unexpected /.fs response: {type(data).__name__}")
-        # The space's ``/.fs`` list payload actually carries
-        # ``created`` / ``lastModified`` / ``contentType`` / ``size``
-        # / ``perm`` per ``server/src/handlers/fs.rs`` — v1 only
-        # surfaces ``name`` and ``etag``, so the rest is dropped
-        # here. ``etag`` is ``None`` on this SB build (it isn't
-        # included in the sync-mode list payload), which means
-        # ``write_page(..., if_match=<etag>)`` has no round-trip path
-        # until SB starts emitting an ``etag`` field; the
-        # ``list_pages`` tool still surfaces every name, which is
-        # what the tool consumer wants in v1. T28 widens this and
-        # adds an opt-in ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``
-        # env var so the operator who needs etag round-trips pays the
-        # N+1 cost.
         return [
-            FileMeta(name=item["name"], etag=item.get("etag"))
+            _page_meta_from_list_item(item)
             for item in data
             if isinstance(item, dict) and "name" in item
         ]
+
+    async def read_page_meta(self, name: str) -> PageMeta:
+        """Fetch a page's metadata *without* materializing the body.
+
+        Issues ``GET /.fs/{name}`` and reads only the response
+        headers (``ETag`` / ``X-Created`` / ``X-Last-Modified`` /
+        ``X-Content-Length``) — the body is closed before it's
+        buffered, so the round trip costs the network headers but
+        not the body bytes. This is the per-page hydration path the
+        ``list_pages`` tool uses when the operator opts in to
+        ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS``: SB's list
+        payload omits ``etag`` on this build, so the bridge falls
+        back to one GET per page to surface the etag an agent
+        would otherwise need a full :func:`read_page` for.
+
+        The same status-code mapping as :func:`read_page` applies:
+        404 → :class:`PageNotFound`, 5xx → :class:`ServerError`,
+        etc. A 200 with no ``X-*`` headers surfaces as the same
+        ``None``-populated envelope a fully-stripped response
+        would — the call is metadata-first; the body is never
+        seen, let alone parsed.
+
+        ``httpx.AsyncClient.stream`` is the right primitive here
+        over a plain ``get``: it returns an :class:`httpx.Response`
+        with the headers already populated (so we can read
+        ``ETag`` / ``X-*`` immediately), and we can ``aclose()`` it
+        before httpx buffers the body. A plain ``get`` would buffer
+        the body in the background; closing mid-read still works
+        (httpx drops the connection) but the explicit stream +
+        ``aclose`` makes the intent obvious to the next reader and
+        avoids any background-task leak on a slow SB.
+        """
+        async with self._client.stream("GET", f"/.fs/{name}") as response:
+            # ``response.headers`` is populated as soon as the
+            # response-line + headers are received; we don't read
+            # ``response.text`` / ``response.content`` so the body
+            # is never buffered. The ``__aexit__`` on
+            # ``httpx.Response`` (the async stream manager) closes
+            # the connection cleanly on the way out, dropping the
+            # unconsumed body — the body's been on the wire but
+            # httpx never copies it into a Python string.
+            _raise_for_status(response)
+            return _meta_from_response(response, name, body=None)
+
+    async def read_page_meta_safe(self, name: str) -> PageMeta | None:
+        """Like :meth:`read_page_meta`, but swallows transient failures.
+
+        Used by the list-pages etag-hydration walker: a single page
+        404'ing (deleted between list and hydrate), 412'ing (a
+        proxy / SB misconfiguration), or timing out shouldn't
+        abort the whole ``list_pages`` call. On any of those
+        failures the helper returns ``None`` so the caller can
+        keep the row's ``etag=None`` from the list payload rather
+        than surfacing the failure to the agent. A 200 returns the
+        full :class:`PageMeta` for the caller to merge.
+        """
+        try:
+            return await self.read_page_meta(name)
+        except (PageNotFound, PreconditionFailed, ServerError, httpx.TimeoutException):
+            # 5xx / 412 / timeout / 404 — any of these is
+            # page-local; the surrounding list_pages call should
+            # still return a complete list (with this row's
+            # etag left as None).
+            return None
 
 
 def _meta_from_response(
@@ -530,6 +625,81 @@ def _meta_from_response(
         created_ms=_parse_int_header(response.headers.get("X-Created")),
         body=body,
     )
+
+
+def _page_meta_from_list_item(item: dict[str, object]) -> PageMeta:
+    """Build a :class:`PageMeta` from one row of SB's ``GET /.fs`` list payload.
+
+    The list payload's keys per ``server/src/handlers/fs.rs`` are
+    ``name`` / ``created`` / ``lastModified`` / ``contentType`` /
+    ``size`` / ``perm`` (and ``etag`` on SB builds that emit one).
+    We map them onto :class:`PageMeta` field-for-field:
+
+    - ``name`` → ``name``
+    - ``created`` → ``created_ms`` (epoch ms, per SB's
+      ``FileMeta.created`` shape)
+    - ``lastModified`` → ``last_modified_ms`` (epoch ms)
+    - ``size`` → ``size_bytes`` (UTF-8 byte count, matches
+      SB's ``FileMeta.size``)
+    - ``etag`` → ``etag`` (string with surrounding quotes, same
+      shape as the GET / PUT response headers — ``None`` on this
+      SB build, which is what triggers the etag-hydration fallback
+      in :meth:`SBClient.read_page_meta_safe`)
+
+    ``contentType`` and ``perm`` are intentionally dropped: no
+    caller has asked for them, surfacing them would grow the wire
+    shape without a use case, and they're already documented at
+    the SB level (operators who need them can read individual
+    pages or query SB directly).
+
+    Every field is defensive-parsed via :func:`_parse_int_header`
+    for integers and ``or None`` for strings — a misconfigured
+    proxy, an SB-side schema drift, or a future SB that emits a
+    non-numeric ``created`` should surface as ``None`` rather than
+    a crash that takes the whole list call down. The "honest
+    None" shape matches the read / write paths: an agent that
+    gets a ``list_pages` row with ``created_ms=None`` knows SB
+    didn't carry the field for this row, same as a read with
+    ``X-Created`` stripped.
+    """
+    name = item.get("name")
+    etag = item.get("etag")
+    return PageMeta(
+        name=name if isinstance(name, str) else "",
+        etag=etag if isinstance(etag, str) else None,
+        size_bytes=_parse_int_header(_coerce_str(item.get("size"))),
+        last_modified_ms=_parse_int_header(_coerce_str(item.get("lastModified"))),
+        created_ms=_parse_int_header(_coerce_str(item.get("created"))),
+        body=None,
+    )
+
+
+def _coerce_str(value: object) -> str | None:
+    """Coerce a JSON-decoded value to ``str`` for :func:`_parse_int_header`.
+
+    ``json.loads`` decodes JSON numbers as Python ``int`` /
+    ``float`` and JSON strings as ``str``. SB sends epoch-ms
+    integers for ``created`` / ``lastModified`` / ``size`` so
+    :func:`_parse_int_header` expects ``str``; this helper
+    bridges the type without making the caller think about it
+    (``int`` becomes the decimal string, ``None`` stays
+    ``None``, anything else is coerced via ``str(value)`` which
+    is good enough for the malformed-value case — the int parse
+    downstream will reject the result and surface ``None``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        # ``bool`` is a subclass of ``int``; ``str(True)`` is
+        # ``"True"`` which the int parse rejects → ``None``.
+        # Defensive against a future SB that emits a JSON bool for
+        # one of these fields.
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
 
 
 def _parse_int_header(value: str | None) -> int | None:
