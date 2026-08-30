@@ -195,6 +195,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
+> **Assignee**: claude (claimed 2026-08-27, in progress)
+> **Status**: 🚧 in progress
 > **Question**: Stand the bridge up on a free port via
 > `mcp.streamable_http_app()` + uvicorn, point `Client(url)` at it,
 > and verify: bearer auth happy path; missing-token → `401` +
