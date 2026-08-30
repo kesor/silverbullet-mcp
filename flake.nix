@@ -74,7 +74,7 @@
                   tests =
                     let
                       # Venv containing the project + the `test` extra
-                      # (pytest, pytest-asyncio, respx from
+                      # (pytest, pytest-asyncio from
                       # [project.optional-dependencies] test).
                       testVenv = final.mkVirtualEnv "mcp-silverbullet-pytest-env" workspace.deps.all;
                     in

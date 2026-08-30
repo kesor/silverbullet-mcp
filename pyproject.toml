@@ -25,8 +25,6 @@ dependencies = [
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
-  # respx lets us mock httpx transports in Layer 3 tests (no real SB needed).
-  "respx>=0.21",
 ]
 
 # Build-system-only deps that the editable devShell needs. uv2nix's

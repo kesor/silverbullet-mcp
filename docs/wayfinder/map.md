@@ -26,7 +26,7 @@ The artefact is **this repo, runnable end-to-end**. No new design
 decisions to lock — those were settled in the prior map; the input here
 is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
-### 🏁 Status: destination shifted (again).
+### 🏁 Status: destination reached.
 
 T1–T8 resolved (runnable bridge). T9 closed as superseded:
 the operator redirected to a *direct-FS journal surface*
@@ -36,7 +36,8 @@ degrade gracefully. New tickets T10–T13 define the
 foundation (config gate), read tools (histogram / tag_summary
 / recent_pages), search (`pages_touching_topic`), and a
 live-space test. The new destination is **the bridge +
-gated journal surface** (T10–T13).
+gated journal surface** (T10–T13). With T13 resolved, every
+open ticket is closed and the map is done.
 
 ## Notes
 
@@ -125,6 +126,8 @@ gated journal surface** (T10–T13).
 - [T10. Journal-tools config gate (foundation)](#t10-journal-tools-config-gate-foundation) (commit `46d81`): new module `src/mcp_silverbullet/journal.py` (gate + four skeleton tools); `Settings.journal` resolved by `load_settings`; `build_mcp(..., journal=...)` calls `register_journal_tools` only when `JournalConfig.enabled`. Three-gate check (truthy opt-in / non-empty path / readable) → INFO log on open, WARN on requested-but-unusable, silent on off. Skeleton tools raise `ToolError("journal tool not implemented yet; landing in T11/T12")` so a stray call surfaces loudly. Drive-by: `sb_client.list_pages` now sends `X-Sync-Mode: 1` so SB 2.x's `handle_fs_list` returns JSON instead of 307-redirecting to the SPA (prior map's T3 mock-only coverage missed it; T6 smoke parked it as "effectively moot" once the journal surface replaced the original search tool). New `tests/test_journal_gate.py` (11 cases). 54 passed (with live env) / 53 passed + 1 skipped (without); `nix flake check` green.
 - [T11. Read tools (histogram / tag_summary / recent_pages)](#t11-read-tools-histogram--tag_summary--recent_pages): three of the four T10 skeletons replaced with real implementations in `src/mcp_silverbullet/journal.py`. New helpers: `_validate_prefix` (rejects `..` / leading `/` with a `ToolError`), `_iter_md` (`rglob("*.md")` filtered to skip hidden directory segments), `_bucket_key` (basename regex `^\d{4}-\d{2}-\d{2}` → `YYYY-MM`, else UTC mtime), `_parse_tags` (hand-rolled frontmatter scanner for `tags: scalar` OR `tags:\n  - item\n  - item` — no PyYAML dep), `_unquote`, `_mtime_iso` (UTC ISO-8601), `PageRef` dataclass. New tests `tests/test_journal_read.py` (19 cases); inverted the T10 skeleton-error tests in `tests/test_journal_gate.py` so only `pages_touching_topic` (T12) still raises the skeleton error. Three SDK-shape carry-forwards worth flagging: (1) `dict[str, X]` return types emit the dict directly via a `RootModel` (no `{"result": …}` wrap); (2) `list[X]` returns *are* wrapped in `{"result": …}`; (3) `ToolError` raised from a tool handler is wire-level `is_error=True` with the message prefixed `"Error executing tool <name>: "`. Live smoke against `/var/lib/silverbullet/`: histogram returns the real distribution (`2023-10: 18`, `2024-09: 7`, …), `tag_summary` top tags are `daily: 75`, `quick: 36`, `daily-journal: 33`, `contact: 20`, …, `recent_pages(limit=5, prefix="Daily")` returns the five newest `Daily/*.md`. 72 passed + 1 skip (T7 env-gated); `nix flake check` green.
 - [T12. `pages_touching_topic` (search by name + content)](#t12-pages_touching_topic-search-by-name--content): last T10 skeleton replaced with a real name+content substring search in `src/mcp_silverbullet/journal.py`. Optional `rg --json` acceleration (when on PATH; `_RG_BIN` cache, `_RG_TIMEOUT_S` 30s, `--no-config --no-messages -i`); falls back to pure-Python substring scan on `rg` failure / timeout / absence. New helpers: `_rg_available`, `_rg_content_matches`, `_safe_read_body`, `_content_snippet`, `_body_excerpt`, `_normalize_query`. Name match is against the **relative path** (the ticket said "basename" but the done-when example `query="DAILY"` finding `Daily/*.md` requires the relative path; this matches the `prefix` filter's behavior for consistency). Snippet shape: line containing the match returned whole if it fits in 80 chars, else windowed to 80 chars centered on the match with `…` ellipses. Empty / whitespace-only queries raise `ToolError`. Empty space returns `[]`. Results sorted by name-asc. New tests `tests/test_journal_search.py` (25 cases): input validation (empty / whitespace / `..` / `/` prefix), name-only / content-only / both match kinds, snippet shaping (short-line verbatim, long-line windowed, correct-line selection, frontmatter stripping in body excerpts), prefix filtering, hidden-dir skip, literal-substring semantics (no regex metachar activation), whitespace-collapsing query, `rg`-available path, `rg` timeout fallback, `rg` non-zero-exit fallback, list-payload wrapping, mid-iteration file disappearance. Live smoke against `/var/lib/silverbullet/` with `MCP_SILVERBULLET_JOURNAL_TOOLS=1`: 130 hits on `query="DAILY"` covering all three match kinds (pure name, pure content, both), Python path ≈ rg path ≈ 18ms each. `flake.nix` dev shell now carries `pkgs.ripgrep` so the rg path runs from `nix develop`; runtime still doesn't depend on it. 96 passed + 1 skip (T7 env-gated).
+- [T13. Live-space test for the journal tools](#t13-live-space-test-for-the-journal-tools) (commit pending): new file `tests/test_e2e_live_journal.py` (165 lines, 1.15s) skips unless `MCP_SILVERBULLET_LIVE_SPACE_PATH` is set, points at a readable directory, and asserts the three T11/T12 surface shapes against the live space. Boots a fresh `serve()` task on a free port (same uvicorn shape T7 uses), `ClientSession.initialize()` → `list_tools()` (asserts all four journal tools are registered) → `journal_histogram()` (non-empty dict, ≥1 YYYY-MM key newer than `2023-10`) → `tag_summary()` (`"daily"` present) → `recent_pages(limit=5, prefix="Daily")` (5 rows, all under `Daily/`, each carrying `{name, mtime_iso, size_bytes}` with ISO-8601 ending `+00:00`). SB URL pointed at `http://127.0.0.1:1` (nothing listening) — the journal tools never call into SB, so a regression that routed a journal call through SB would surface as a connect-timeout error rather than silent 200. Wire-shape assertions match the Layer-1 carry-forwards: `dict[str, int]` returns are bare dicts, `list[dict]` returns are wrapped in `{"result": [...]}`. Read-only — no marker file, no cleanup, no finally-block delete. Unset env → skip with a clear `pytest.skip(...)` message naming the env var and pointing at an absolute path. With env set: live test passes in 1.15s; without: 96 pass + 2 skip (T7 and T13 both skip). `nix flake check` and `nix develop … pytest` both green.
+- **Drive-by dep cleanup**: removed `respx>=0.21` from `[project.optional-dependencies] test` in `pyproject.toml` (a `grep -rn "respx" tests/ src/` returns nothing — the dep was cargo-culted into the test extra at T1 and never used; T11 and T12 use `httpx.MockTransport` directly via Layer-1 mocks). `uv lock` then drops `respx` plus its transitive `httpx` / `httpcore` / `certifi` from `uv.lock` (-57 lines, 4 packages). Flake comment updated to match. `nix flake check` and the dev-shell pytest both stay green (39 packages resolved, down from 42).
 
 ## Tickets
 
@@ -735,7 +738,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: open
+> **Assignee**: pi (claimed 2026-08-29, resolved same day)
+> **Status**: ✅ resolved
 > **Blocks on**: T11, T12.
 > **Question**: How do we exercise the journal tools against
 > the live space at `/var/lib/silverbullet/`?
@@ -757,6 +761,41 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > this dev box's space, the three assertions pass; with the
 > var unset, the test skips with a clear message. Existing
 > Layer-1 + Layer-2 + T7 e2e tests still pass.
+> **Resolution**: New file `tests/test_e2e_live_journal.py`
+> (165 lines, 1.15s) follows the T7 boot shape: spawn a fresh
+> `serve()` task on a free port, talk Streamable HTTP via
+> `streamable_http_client`, `ClientSession.initialize()` and call
+> the journal tools over the wire. The test reads
+> `MCP_SILVERBULLET_LIVE_SPACE_PATH` from env; the `pytest.skip`
+> message names the env var and points at an absolute path so
+> the operator knows what to set. Three guards: empty / unset,
+> not a directory, not readable (all skip cleanly — the test
+> never fails on a misconfigured dev box). The SB URL is pointed
+> at `http://127.0.0.1:1` (nothing listening) so a regression
+> that routed a journal call through SB would surface as a
+> connect-timeout error rather than silent 200 — the journal
+> surface and the `/.fs`-backed tools are decoupled by
+> construction. Wire-shape assertions match the Layer-1
+> carry-forwards (T11): `dict[str, int]` returns are bare dicts
+> (no `{"result": …}` wrap); `list[dict]` returns are wrapped in
+> `{"result": [...]}`. The four-tool inventory assertion
+> (`{journal_histogram, tag_summary, recent_pages, pages_touching_topic}
+> ⊆ list_tools().names`) catches a future gate regression
+> (e.g. someone moves a tool out of `register_journal_tools`)
+> before the live smoke would notice. Read-only — no marker
+> file, no `try/finally` cleanup, no `DELETE` call. README
+> gained a paragraph under "Live pytest" documenting the env
+> var and pointing at `/var/lib/silverbullet/` as an example.
+> Drive-by dep cleanup: `respx>=0.21` removed from the `test`
+> extra (a `grep -rn "respx" tests/ src/` returns nothing — it
+> was cargo-culted into the dep list at T1 and never imported;
+> the Layer-1 mock layer uses `httpx.MockTransport` directly);
+> `uv lock` drops it and its transitive `httpx` / `httpcore` /
+> `certifi` (-57 lines / 4 packages); `flake.nix` comment
+> updated. `nix flake check` and dev-shell pytest both green
+> (39 packages resolved, down from 42). 96 pass + 2 skip
+> without live env; 98 pass + 0 skip with both `LIVE_SPACE_PATH`
+> and `LIVE_SB_*` set; live journal test alone runs in 1.15s.
 
 ## Not yet specified
 

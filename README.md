@@ -145,6 +145,13 @@ Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`
 (e.g. `http://127.0.0.1:63000`) and `MCP_SILVERBULLET_LIVE_SB_TOKEN`
 (empty string is fine if SB has no auth). Unset → tests skip.
 
+Live pytest against the journal surface (T13): set
+`MCP_SILVERBULLET_LIVE_SPACE_PATH` to the absolute path of an SB
+space directory (e.g. `/var/lib/silverbullet`). The journal test
+exercises `journal_histogram` / `tag_summary` / `recent_pages`
+against that directory and is independent of any running SB. Unset →
+test skips.
+
 ## Dev
 
 ```bash
