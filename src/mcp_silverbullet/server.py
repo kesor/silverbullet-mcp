@@ -12,15 +12,22 @@ tool shape (``read_page`` and the ``silverbullet://page/{name}``
 resource template) to match. T25 adds ``page_exists`` for a
 ninth ``/.fs``-backed tool — a cheap ``GET`` that returns
 ``bool`` so an agent can answer "does this page exist?" without
-paying for the full read body. T28 widens ``list_pages``. The
-bridge still registers nine ``/.fs``-backed tools
-(``read_page`` / ``page_exists`` / ``write_page`` /
-``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
-``patch_page_replace`` / ``move_page`` / ``list_pages``) plus one
-resource template (``silverbullet://page/{name}``). Each tool
-closes over a single :class:`SBClient` opened at boot; SB's typed
-exceptions translate to :mcp_exc:`ToolError` with the exact wording
-from ``docs/design.md`` § Tools § Status-code mapping, all funneled
+paying for the full read body. T26 adds a ``dry_run=True`` knob
+to the three read-modify-write tools (``append_to_page`` /
+``patch_page_lines`` / ``patch_page_replace``) so an agent can
+preview a patch without committing; the read still happens and
+``if_match=<etag>`` is checked against the read's etag (a stale
+etag raises 412-equivalent ``ToolError`` so the caller doesn't
+think a doomed write would have succeeded), but no PUT is
+issued. T28 widens ``list_pages``. The bridge still registers
+nine ``/.fs``-backed tools (``read_page`` / ``page_exists`` /
+``write_page`` / ``delete_page`` / ``append_to_page`` /
+``patch_page_lines`` / ``patch_page_replace`` / ``move_page`` /
+``list_pages``) plus one resource template
+(``silverbullet://page/{name}``). Each tool closes over a single
+:class:`SBClient` opened at boot; SB's typed exceptions translate
+to :mcp_exc:`ToolError` with the exact wording from
+``docs/design.md`` § Tools § Status-code mapping, all funneled
 through :func:`_translate_sb_errors`.
 
 T10 of the v1.1 map adds an optional, gated journal surface
@@ -36,12 +43,13 @@ client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24/T25 done; T28 next).
+agent-facing QOL tickets (T23/T24/T25/T26 done; T28 next).
 """
 
 from __future__ import annotations
 
 import contextlib
+import difflib
 from collections.abc import AsyncIterator
 
 import httpx2 as httpx
@@ -244,6 +252,82 @@ def _apply_line_patch(
     return "\n".join(patched)
 
 
+def _validate_if_match_on_read(
+    etag: str | None,
+    if_match: str | None,
+) -> None:
+    """Raise 412-equivalent ``ToolError`` if ``if_match`` is a stale etag.
+
+    On the live write path, ``If-Match`` is forwarded to the PUT and
+    SB is the source of truth: the read's etag is not consulted (the
+    design doc § SilverBullet client contract documents ``If-Match``
+    on the PUT row, not the GET row, and the bridge's wire envelope
+    threads the *caller's* ``if_match`` arg through verbatim).
+
+    On the T26 dry-run path no PUT happens, so SB never gets to
+    enforce the precondition — but the whole point of dry-run is
+    "would this write succeed?" If the precondition wouldn't, the
+    dry-run envelope should say so before the caller commits. This
+    helper is the bridge-side mirror of SB's PUT-side check: if
+    ``if_match`` is a concrete etag (not ``"*"``, which means
+    "require existence" and is a different shape — it would be
+    honoured by the read itself returning 404 if the page were
+    missing, not by an etag comparison), and the read's etag
+    disagrees, raise the same wording the live path would surface
+    when SB returned 412. Centralized so the next patch tool that
+    grows ``dry_run`` doesn't have to re-derive the rule.
+    """
+    if if_match is None or if_match == "*":
+        # ``if_match="*"`` is "require existence" — the read path
+        # 404s on a missing page, so the precondition is already
+        # enforced upstream of this helper. ``None`` means
+        # "unconditional" and never raises here.
+        return
+    if etag != if_match:
+        raise ToolError(
+            "precondition failed; check if_match/if_none_match"
+        )
+
+
+def _dry_run_payload(original: str, patched: str) -> dict[str, object]:
+    """Build the T26 dry-run envelope for a read-modify-write tool.
+
+    Wire shape: ``{dry_run: True, original: str, patched: str, diff: str}``.
+    The ``diff`` is a unified diff from :func:`difflib.unified_diff`,
+    matching the standing preference "``diff_pages`` is line-based by
+    default" in the v1.2 map's Notes — token-level / word-level diff
+    is a v1.3 refinement, not v1.2.
+
+    The inputs are split on ``"\\n"`` (not
+    :py:meth:`str.splitlines`, which also normalises ``\\r\\n`` and
+    friends) to match how SB stores text (LF only). Each output
+    line from ``difflib`` gets a single ``"\\n"`` appended so the
+    concatenated diff is well-formed: ``lineterm=""`` strips the
+    doubled-newline ``difflib`` would otherwise produce, and the
+    trailing-newline indicator (``" "`` as the final context line
+    when a file lacks a trailing ``\\n``) survives correctly.
+    ``difflib.unified_diff`` returns an empty iterator when the two
+    inputs are identical, so a no-op patch produces ``diff=""`` —
+    the caller reads that as "would have changed nothing" without
+    parsing the ``original`` / ``patched`` bodies.
+    """
+    return {
+        "dry_run": True,
+        "original": original,
+        "patched": patched,
+        "diff": "".join(
+            line + "\n"
+            for line in difflib.unified_diff(
+                original.split("\n"),
+                patched.split("\n"),
+                fromfile="original",
+                tofile="patched",
+                lineterm="",
+            )
+        ),
+    }
+
+
 def build_mcp(
     sb_client: SBClient,
     *,
@@ -268,15 +352,16 @@ def build_mcp(
         The URL Grok reaches the bridge at. Used for the
         ``WWW-Authenticate`` header and the discovery document. v1
         default is the loopback default; the operator overrides when
-        the bridge sits behind a tunnel (``MCP_SILVERBULLET_RESOURCE_URL``
-        is the planned env var, T6 will set the exact contract).
+        the bridge sits behind a tunnel via the
+        ``MCP_SILVERBULLET_RESOURCE_URL`` env var (resolved by
+        :func:`mcp_silverbullet.main.load_settings`).
     name
         Server name advertised on the wire.
     journal
         Already-resolved journal gate config. ``None`` means the gate
         is off (no journal tools registered). When the gate is on,
         the bridge registers the four journal-surface tools in
-        addition to the three ``/.fs``-backed tools and the resource
+        addition to the nine ``/.fs``-backed tools and the resource
         template; when off, only the latter are exposed. Resolved by
         :func:`mcp_silverbullet.main.load_settings` from the two
         ``MCP_SILVERBULLET_JOURNAL_*`` env vars; tests construct one
@@ -292,14 +377,18 @@ def build_mcp(
     mcp = MCPServer(
         name=name,
         instructions=(
-            "Read, write, append to, patch, move, delete, list, "
-            "and check existence of SilverBullet pages. Nine tools "
-            "(`read_page`, `page_exists`, `write_page`, "
-            "`append_to_page`, `patch_page_lines`, "
-            "`patch_page_replace`, `move_page`, `delete_page`, "
-            "`list_pages`) plus one resource template "
-            "`silverbullet://page/{name}` for attaching page "
-            "bodies to conversation context."
+            "Read, write, delete, append to, patch, move, list, "
+            "and check existence of SilverBullet pages. Nine "
+            "tools (`read_page`, `page_exists`, `write_page`, "
+            "`delete_page`, `append_to_page`, "
+            "`patch_page_lines`, `patch_page_replace`, "
+            "`move_page`, `list_pages`) plus one resource "
+            "template `silverbullet://page/{name}` for attaching "
+            "page bodies to conversation context. The three "
+            "read-modify-write tools (`append_to_page`, "
+            "`patch_page_lines`, `patch_page_replace`) accept "
+            "`dry_run=True` (T26) to preview the patch without "
+            "committing."
         ),
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
@@ -473,13 +562,24 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "the body hash to match (protects against concurrent "
             "appends landing out of order). 404-equivalent ToolError "
             "if the page is missing; 412 if the precondition fails; "
-            "413 if the combined body exceeds 4 MiB."
+            "413 if the combined body exceeds 4 MiB. "
+            "`dry_run=True` (T26) returns `{dry_run: True, "
+            "original: str, patched: str, diff: str}` without "
+            "writing — the read still happens, the in-memory patch "
+            "is computed, `if_match=<etag>` is checked against the "
+            "read's etag (a stale etag raises 412-equivalent "
+            "ToolError so the caller doesn't think a doomed write "
+            "would have succeeded), and the tool reports back what "
+            "would have changed. `dry_run=True` with `if_match=\"*\"` "
+            "is the same as a live `if_match=\"*\"`: a missing page "
+            "404s on the read."
         ),
     )
     async def append_to_page(
         name: str,
         text: str,
         if_match: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, object]:
         # An empty append is almost certainly a caller bug (the
         # caller meant to write something and forgot to fill it in);
@@ -490,12 +590,24 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         if not text:
             raise ToolError("text must not be empty")
         async with _translate_sb_errors(name):
-            body = (await sb_client.read_page(name)).body or ""
+            page = await sb_client.read_page(name)
+            body = page.body or ""
             new_body = (
                 body + "\n" + text
                 if body and not body.endswith("\n")
                 else body + text
             )
+            if dry_run:
+                # T26: validate ``if_match`` against the read's etag
+                # *here* because no PUT happens to do it on the
+                # server. ``if_match="*"`` means "require existence"
+                # — the read 404s on a missing page, so the helper
+                # no-ops. ``if_match=None`` is unconditional. A
+                # concrete-etag mismatch raises the same 412 wording
+                # the live path would surface when SB returned 412,
+                # so the agent sees one shape across both paths.
+                _validate_if_match_on_read(page.etag, if_match)
+                return _dry_run_payload(body, new_body)
             meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
@@ -524,7 +636,20 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "start_line`, and `end_line` past the last line all "
             "raise `ToolError` with the page's line count; 404 if "
             "the page is missing; 412 if the precondition fails; "
-            "413 if the patched body exceeds 4 MiB."
+            "413 if the patched body exceeds 4 MiB. "
+            "`dry_run=True` (T26) returns `{dry_run: True, "
+            "original: str, patched: str, diff: str}` without "
+            "writing — the read still happens, the in-memory patch "
+            "is computed (including the trailing-newline "
+            "preservation rule above), `if_match=<etag>` is checked "
+            "against the read's etag (a stale etag raises "
+            "412-equivalent ToolError so the caller doesn't think a "
+            "doomed write would have succeeded), and the tool "
+            "reports back what would have changed. The pre-read "
+            "input-validation errors above still fire on dry-run — "
+            "a caller that passes an inverted range shouldn't get a "
+            "vague \"would have failed\" back, they get the same "
+            "specific ToolError the live path would surface."
         ),
     )
     async def patch_page_lines(
@@ -533,6 +658,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         end_line: int,
         new_content: str,
         if_match: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, object]:
         # Cheap, no-read input validation first: a non-positive
         # start_line or an inverted range can't be helped by reading
@@ -574,6 +700,14 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             # trailing newline either way.
             if had_trailing_newline and new_body:
                 new_body += "\n"
+            if dry_run:
+                # T26: same ``if_match``-on-read validation as
+                # ``append_to_page``. The dry-run envelope surfaces
+                # the *post-shaping* ``new_body`` (with trailing
+                # newline re-attached), so the diff an agent sees
+                # is exactly the body that would have been written.
+                _validate_if_match_on_read(page.etag, if_match)
+                return _dry_run_payload(body, new_body)
             meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
@@ -603,7 +737,20 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "write acknowledgement `{name, etag, size_bytes, "
             "last_modified_ms, created_ms}` (T23). 404 if the page "
             "is missing; 412 if the precondition fails; 413 if the "
-            "patched body exceeds 4 MiB."
+            "patched body exceeds 4 MiB. "
+            "`dry_run=True` (T26) returns `{dry_run: True, "
+            "original: str, patched: str, diff: str}` without "
+            "writing — the read still happens, the in-memory patch "
+            "is computed, `if_match=<etag>` is checked against the "
+            "read's etag (a stale etag raises 412-equivalent "
+            "ToolError so the caller doesn't think a doomed write "
+            "would have succeeded), and the tool reports back what "
+            "would have changed. The pre-read input-validation "
+            "errors above (``find`` not in body, multiple matches "
+            "with ``replace_all=False``) still fire on dry-run — a "
+            "caller that passes a bad ``find`` shouldn't get a "
+            "vague \"would have failed\" back, they get the same "
+            "specific ToolError the live path would surface."
         ),
     )
     async def patch_page_replace(
@@ -612,6 +759,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         new_string: str,
         replace_all: bool = False,
         if_match: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, object]:
         # Cheap, no-read input validation first. ``find == ""`` would
         # match between every character (``"abc".replace("", "X")``
@@ -641,6 +789,15 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             new_body = body.replace(
                 find, new_string, -1 if replace_all else 1
             )
+            if dry_run:
+                # T26: ``if_match`` is validated against the read's
+                # etag here because no PUT happens. ``find not in
+                # body`` and the multiple-match-with-default errors
+                # above already raised, so by this point we know
+                # the patch would have changed something — the
+                # dry-run envelope surfaces the result.
+                _validate_if_match_on_read(page.etag, if_match)
+                return _dry_run_payload(body, new_body)
             meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )

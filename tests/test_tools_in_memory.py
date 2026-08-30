@@ -1047,6 +1047,648 @@ async def test_append_to_page_ack_envelope_when_etag_header_missing() -> None:
     }
 
 
+# --- dry_run (T26) ----------------------------------------------------
+#
+# T26 adds a ``dry_run=True`` knob to the three read-modify-write
+# tools. The dry-run path: reads the page, computes the patched body
+# in-memory, validates ``if_match=<etag>`` against the read's etag
+# (since no PUT happens to do it on the server), and returns
+# ``{dry_run: True, original: str, patched: str, diff: str}``. No
+# PUT is issued; the original page is left untouched. Pre-read input
+# validation (empty ``find``, ``text must not be empty``, etc.) still
+# fires on dry-run — the caller gets the same specific ToolError the
+# live path would surface, not a vague "would have failed".
+#
+# The next three sections add the per-tool happy-path + error-path
+# coverage for ``dry_run=True``. Layer-3 (`sb_client`) coverage is
+# implicit: dry-run never reaches ``sb_client.write_page``, so the
+# outbound-half tests in ``test_sb_client.py`` already lock the
+# "no PUT is issued" contract by absence.
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_returns_envelope_without_writing() -> None:
+    """``dry_run=True`` on ``append_to_page`` → preview envelope, no PUT.
+
+    Tracks every method the bridge issues so we can assert: (a) the
+    read happened (it has to — the tool needs the body to compute
+    ``new_body``), (b) no PUT was issued (the whole point of dry-run),
+    (c) the envelope contains the original body, the patched body,
+    and a unified diff. The diff is a single-line context diff:
+    ``--- original\\n+++ patched\\n@@ -1 +1 @@\\n-hello\\n+world\\n``.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello\n")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "world", "dry_run": True},
+        )
+
+    assert result.is_error is False
+    # No PUT issued on the dry-run path — ``writes`` stays empty.
+    assert writes == []
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+    assert payload["original"] == "hello\n"
+    # Body already ends in ``\\n``; no extra separator is inserted.
+    assert payload["patched"] == "hello\nworld"
+    # Diff is the unified diff of the change. The context line
+    # ``hello`` (unchanged) is preserved, and ``world`` is added.
+    # ``difflib.unified_diff`` produces lines without a trailing
+    # ``\\n`` (we set ``lineterm=""`` and add ``\\n`` ourselves for
+    # line consistency); the diff is therefore ``--- original\\n
+    # +++ patched\\n@@ -1,2 +1,2 @@\\n hello\\n-\\n+world\\n``.
+    # We assert on the structural pieces rather than the whole
+    # string so a future ``difflib`` upgrade that tweaks the
+    # header format doesn't break this test.
+    diff = payload["diff"]
+    assert "--- original\n" in diff
+    assert "+++ patched\n" in diff
+    assert " hello\n" in diff  # the unchanged context line
+    assert "+world\n" in diff  # the added line
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_inserts_separator_when_body_lacks_newline() -> None:
+    """Dry-run's ``patched`` body has the same separator rule the live path does.
+
+    ``append_to_page`` with body ``"goodbye"`` + text ``"hello"`` →
+    live path writes ``"goodbye\\nhello"``. Dry-run must surface the
+    same ``"goodbye\\nhello"`` as the patched body so the agent's
+    preview matches the post-write reality.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="goodbye")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "hello", "dry_run": True},
+        )
+
+    assert writes == []  # no PUT on dry-run
+    payload = result.structured_content or {}
+    assert payload["original"] == "goodbye"
+    assert payload["patched"] == "goodbye\nhello"
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_matching_if_match_succeeds() -> None:
+    """``if_match=<correct_etag>`` + ``dry_run=True`` → dry-run envelope.
+
+    On the live path, ``if_match`` is forwarded to the PUT; on the
+    dry-run path no PUT happens, so the bridge validates the etag
+    against the *read's* etag itself. A matching etag passes the
+    check and the dry-run envelope is returned.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="hello\n", headers={"ETag": '"v1"'}
+            )
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {
+                "name": "index",
+                "text": "world",
+                "if_match": '"v1"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    assert writes == []
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+    assert payload["patched"] == "hello\nworld"
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_stale_if_match_raises_412_tool_error() -> None:
+    """``if_match=<stale_etag>`` + ``dry_run=True`` → 412-equivalent ToolError.
+
+    The whole point of dry-run is "would this write succeed?". If
+    ``if_match`` is stale, the live path would surface 412 from SB;
+    the dry-run path surfaces the same 12-toolerror wording so the
+    caller doesn't think a doomed write would have landed.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="hello\n", headers={"ETag": '"v1"'}
+            )
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {
+                "name": "index",
+                "text": "world",
+                "if_match": '"stale"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool append_to_page: "
+        "precondition failed; check if_match/if_none_match"
+    )
+    # Stale etag means no write would have happened anyway — but
+    # critically, we still don't issue the PUT. The whole point of
+    # dry-run is no writes, full stop.
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_star_if_match_404s_on_missing_page() -> None:
+    """``if_match="*"`` + ``dry_run=True`` on missing page → 404-toolerror.
+
+    ``if_match="*"`` means "require existence" (different shape from
+    an etag check). The live path enforces this on the PUT side;
+    the dry-run path enforces it the same way the live read does —
+    a missing page 404s on the read itself, before any etag check.
+    The dry-run never reaches the etag-validate helper for ``"*"``
+    (``_validate_if_match_on_read`` short-circuits on ``"*"``), so
+    the read's 404 is what surfaces.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404, text="page not found")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {
+                "name": "missing",
+                "text": "world",
+                "if_match": "*",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool append_to_page: page not found: missing"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_append_to_page_dry_run_empty_text_still_errors() -> None:
+    """The ``text must not be empty`` pre-read error fires on dry-run too.
+
+    The pre-read input validation is not optional on the dry-run
+    path — a caller that passes ``text=""`` gets the same specific
+    ToolError the live path would surface, not a vague "would have
+    failed" back. This locks the contract "same preconditions the
+    live path would" from the T26 ticket.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello\n")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "", "dry_run": True},
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool append_to_page: text must not be empty"
+    )
+    # We don't even get to the read step when ``text`` is empty —
+    # the pre-read check fires first, so no GET was issued either.
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_lines_dry_run_returns_envelope_without_writing() -> None:
+    """``dry_run=True`` on ``patch_page_lines`` → preview envelope, no PUT.
+
+    The dry-run envelope surfaces the *post-shaping* ``new_body``
+    (with the trailing newline re-attached if the body had one), so
+    the diff the agent sees is exactly the body that would have been
+    written. The body here is ``"a\\nb\\nc\\nd"`` (no trailing
+    newline); replacing lines 2-3 with ``"B\\nC"`` patches to
+    ``"a\\nB\\nC\\nd"`` (also no trailing newline).
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="a\nb\nc\nd")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "index",
+                "start_line": 2,
+                "end_line": 3,
+                "new_content": "B\nC",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    assert writes == []  # no PUT on dry-run
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+    assert payload["original"] == "a\nb\nc\nd"
+    assert payload["patched"] == "a\nB\nC\nd"
+    # The diff should show two lines changing (b→B, c→C); the
+    # surrounding lines (a, d) are untouched context.
+    assert "--- original" in payload["diff"]
+    assert "+++ patched" in payload["diff"]
+    assert "-b" in payload["diff"]
+    assert "-c" in payload["diff"]
+    assert "+B" in payload["diff"]
+    assert "+C" in payload["diff"]
+
+
+@pytest.mark.asyncio
+async def test_patch_page_lines_dry_run_preserves_trailing_newline() -> None:
+    """Dry-run's patched body has the same trailing-newline shape the live path does.
+
+    ``patch_page_lines`` is editor-shaped: a trailing newline on the
+    source page is re-attached to the patched body iff the result is
+    non-empty. Dry-run must surface the *post-shaping* body (so the
+    diff matches what would actually have been written); here the
+    source ends in ``\\n``, the patched body is also non-empty, so
+    the trailing newline is re-attached.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="a\nb\n")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "index",
+                "start_line": 2,
+                "end_line": 2,
+                "new_content": "X",
+                "dry_run": True,
+            },
+        )
+
+    assert writes == []
+    payload = result.structured_content or {}
+    # ``had_trailing_newline=True`` and ``new_body="a\nX"`` (non-empty)
+    # → re-attach ``\\n`` → ``"a\\nX\\n"`` is what the live path
+    # would write, so it's what dry-run reports.
+    assert payload["original"] == "a\nb\n"
+    assert payload["patched"] == "a\nX\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_page_lines_dry_run_stale_if_match_raises_412_tool_error() -> None:
+    """``if_match=<stale_etag>`` + ``dry_run=True`` → 412-equivalent ToolError."""
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="a\nb\nc", headers={"ETag": '"v1"'}
+            )
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "index",
+                "start_line": 1,
+                "end_line": 1,
+                "new_content": "A",
+                "if_match": '"stale"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool patch_page_lines: "
+        "precondition failed; check if_match/if_none_match"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_lines_dry_run_out_of_bounds_still_errors() -> None:
+    """The post-read out-of-bounds error fires on dry-run too.
+
+    Pre-read errors (``start_line < 1``, inverted range) and post-read
+    errors (``end_line > line_count``) both still fire on dry-run —
+    the caller gets the same specific ToolError the live path would
+    surface, not a vague "would have failed" back. (The pre-read
+    errors are covered by the existing live-path tests; this one
+    covers the post-read case which depends on the read having
+    happened.)
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="a\nb")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "index",
+                "start_line": 5,
+                "end_line": 6,
+                "new_content": "X",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool patch_page_lines: "
+        "line range 5..6 out of bounds for page with 2 lines"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_returns_envelope_without_writing() -> None:
+    """``dry_run=True`` on ``patch_page_replace`` → preview envelope, no PUT.
+
+    Body ``"hello world"`` + ``find="world"`` + ``new_string="SB"`` →
+    live path writes ``"hello SB"``. Dry-run surfaces the same
+    ``"hello SB"`` as the patched body.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello world")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "world",
+                "new_string": "SB",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    assert writes == []
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+    assert payload["original"] == "hello world"
+    assert payload["patched"] == "hello SB"
+    # Body has no trailing ``\\n``, so the ``-`` (removed) line and
+    # ``+`` (added) line are the only line content of the diff hunk;
+    # the diff is ``-hello world\\n+hello SB\\n``.
+    diff = payload["diff"]
+    assert "-hello world\n" in diff
+    assert "+hello SB\n" in diff
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_replace_all_does_not_write() -> None:
+    """``replace_all=True`` + ``dry_run=True`` → all-occurrences preview, no PUT.
+
+    Confirms the ``dry_run`` branch threads the ``replace_all`` knob
+    through to the in-memory ``str.replace`` the same way the live
+    path does. Body ``"aXbXc"`` + ``find="X"`` + ``new_string="Y"``
+    + ``replace_all=True`` → ``"aYbYc"``.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="aXbXc")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "X",
+                "new_string": "Y",
+                "replace_all": True,
+                "dry_run": True,
+            },
+        )
+
+    assert writes == []
+    payload = result.structured_content or {}
+    assert payload["patched"] == "aYbYc"
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_stale_if_match_raises_412_tool_error() -> None:
+    """``if_match=<stale_etag>`` + ``dry_run=True`` → 412-equivalent ToolError."""
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="hello world", headers={"ETag": '"v1"'}
+            )
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "world",
+                "new_string": "SB",
+                "if_match": '"stale"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool patch_page_replace: "
+        "precondition failed; check if_match/if_none_match"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_find_not_found_still_errors() -> None:
+    """``find not in body`` + ``dry_run=True`` → ``find not found in body`` ToolError.
+
+    The post-read ``find not in body`` error fires on dry-run too.
+    The pre-read ``find must not be empty`` error is covered by the
+    existing live-path tests (it's a pre-read check that fires before
+    any HTTP traffic; same code path on dry-run).
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello world")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "absent",
+                "new_string": "X",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool patch_page_replace: find not found in body"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_multiple_matches_default_errors() -> None:
+    """``replace_all=False`` + multiple matches + ``dry_run=True`` → same error as live.
+
+    The multiple-match-with-default-replace_all check fires on
+    dry-run too — a caller who flips ``replace_all=True`` blindly
+    hoping to recover from a typo gets the same loud failure they
+    would have gotten with the default. (Confirmed by the existing
+    ``test_patch_page_replace_multiple_matches_with_default_errors``
+    test on the live path; this just locks the contract on the
+    dry-run branch.)
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="abc abc abc")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "abc",
+                "new_string": "X",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool patch_page_replace: "
+        "find matched 3 times; pass replace_all=True or narrow find"
+    )
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_patch_page_replace_dry_run_no_change_diff_is_empty() -> None:
+    """A no-op patch (``new_string == find``) → empty diff in the dry-run envelope.
+
+    An agent that builds a patch and gets back the same body sees
+    ``diff=""`` — ``difflib.unified_diff`` returns nothing when the
+    two inputs are identical. The agent can use the empty diff as a
+    signal that the patch would have been a no-op, without parsing
+    the original/patched bodies to find out.
+    """
+    writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello world")
+        writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index",
+                "find": "world",
+                "new_string": "world",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    assert writes == []
+    payload = result.structured_content or {}
+    assert payload["original"] == "hello world"
+    assert payload["patched"] == "hello world"
+    assert payload["diff"] == ""
+
+
 # --- patch_page_lines --------------------------------------------------
 
 

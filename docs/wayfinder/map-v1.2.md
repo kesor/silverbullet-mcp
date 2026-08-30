@@ -381,6 +381,131 @@ resolution below -->
   new sb_client tests + 6 new in-memory tests; `nix flake
   check` green).
 
+- **T26. `dry_run=True` on the three patch tools.** (commit pending):
+  `append_to_page`, `patch_page_lines`, and `patch_page_replace`
+  each grew a `dry_run: bool = False` knob. When `dry_run=True`
+  the tool reads the page, computes the patched body in-memory
+  the same way the live path does (same separator rule for
+  `append_to_page`, same trailing-newline preservation for
+  `patch_page_lines`, same `replace_all` semantics for
+  `patch_page_replace`), and returns a different envelope from
+  the T23 write ack: `{dry_run: True, original: str, patched:
+  str, diff: str}` where `diff` is a `difflib.unified_diff` from
+  `original` to `patched` (empty string for a no-op patch). No
+  PUT is issued on the dry-run path — the original page is left
+  untouched, and the Layer-1 test mock asserts on `writes == []`
+  to lock that contract.
+
+  **`if_match` enforcement on dry-run**: on the live path
+  `if_match` is forwarded to the PUT and SB is the source of
+  truth. On the dry-run path no PUT happens, so the new helper
+  `_validate_if_match_on_read` mirrors SB's PUT-side check
+  against the *read's* etag: a stale etag raises the same
+  412-equivalent `ToolError("precondition failed; check
+  if_match/if_none_match")` as the live path so the agent sees
+  one shape across both paths. `if_match="*"` (require
+  existence) is enforced the same way the live read does — a
+  missing page 404s on the read itself, before any etag check;
+  `_validate_if_match_on_read` short-circuits on `"*"` because
+  the read 404s upstream. `if_match=None` (unconditional) is
+  short-circuited too. All pre-read input-validation errors
+  (`text must not be empty`, `find must not be empty`, inverted
+  range, post-read out-of-bounds, `find not in body`, multiple
+  matches with `replace_all=False`) still fire on dry-run —
+  callers with a bad input get the same specific `ToolError` the
+  live path would surface, not a vague preview.
+
+  **`_dry_run_payload` helper**: builds the envelope via
+  `difflib.unified_diff` with `lineterm=""` and a post-process
+  `line + "\n"` so the concatenated diff is well-formed
+  regardless of the inputs' trailing-newline shape. Inputs are
+  split on `"\n"` (not `splitlines`, which also normalises
+  `\r\n`) to match how SB stores text. The diff is *unified*
+  per the v1.2 standing preference "`diff_pages` is line-based
+  by default" — token-level / word-level is a v1.3 refinement.
+
+  **Wire shape**: same envelope on all three tools. The
+  diff-side piece is identical to what `diff_pages` (T27) will
+  produce for the line-based case, so a future agent that
+  composes "preview via dry_run, then commit" doesn't have to
+  switch shape mid-conversation.
+
+  **Files touched**: `src/mcp_silverbullet/server.py` (new
+  `_validate_if_match_on_read` and `_dry_run_payload` helpers;
+  the three patch handlers each got a `dry_run: bool = False`
+  parameter; the descriptions were widened to document the dry-
+  run shape, the if_match-on-read validation, and the
+  pre-read-input-still-fires-on-dry-run contract; the module
+  docstring bumped the "T23/T24/T25 done; T28 next" status to
+  "T23/T24/T25/T26 done; T28 next" and added a paragraph
+  documenting the dry-run knob; the `instructions` string was
+  reordered to match the canonical tool order and gained a
+  sentence about the dry-run knob; the `build_mcp` docstring's
+  stale "T6 will set the exact contract" carry-forward was
+  replaced with the actual current env-var reference, and
+  "three `/.fs`-backed tools" was bumped to "nine" to match the
+  rest of the module),
+  `tests/test_tools_in_memory.py` (+16 tests grouped under a
+  single `# --- dry_run (T26) ---` section header so the
+  cross-cutting feature reads as one chunk: per-tool happy-path
+  with `writes == []` assertion, `if_match` matching etag,
+  `if_match` stale etag (412-toolerror), `if_match="*"` on a
+  missing page (404-toolerror), pre-read input-validation
+  errors firing on dry-run, the post-shaping `new_body`
+  semantics for `patch_page_lines` (trailing newline re-
+  attached iff body had one), `replace_all=True` threading, and
+  a no-op-patch `diff=""` case),
+  `tests/test_e2e_live_sb.py` (a dry-run round-trip block added
+  to the existing live-SB test that previews an append via
+  `append_to_page(dry_run=True)`, asserts on the envelope's
+  `dry_run` / `original` / `patched` / `diff` fields, and then
+  confirms a follow-up `read_page` shows the page body is
+  unchanged — the whole point of dry-run verified end-to-end
+  against a real SB; env-gated per the v1 T7 carry-forward),
+  `README.md` (each of the three tool bullets in "What it
+  exposes" got a `dry_run=False` annotation plus a one-line
+  description; the v1.2 wire-shape sections gained a new
+  `### Dry-run mode (T26)` block with the envelope shape,
+  semantic guarantees, and migration note; the v1.2 map
+  status line in the intro was updated from "six open tickets
+  after T23+T24" to "four open tickets after T23+T24+T25+T26"),
+  `CHANGELOG.md` (a `dry_run=True` entry under Unreleased's
+  `### Added` with the envelope shape and migration notes),
+  `docs/design.md` (§ Tools table: the three patch-tool rows
+  gained `dry_run: bool = False` in their input column and a
+  parenthetical in the returns column noting the dry-run
+  envelope; § Tools prose bumped to mention T26 alongside T25;
+  the resource template description / status-code mapping table
+  were unrelated to T26 and left alone).
+
+  **Bonus improvements visible while doing it**: the
+  `instructions` string's tool list was reordered to match the
+  module docstring's canonical order (registration order, not
+  alphabet) and grew a sentence about the dry-run knob, so the
+  MCP discovery document a Grok client sees now advertises
+  "the three read-modify-write tools accept `dry_run=True`";
+  the `build_mcp` docstring's stale v1 "T6 will set the exact
+  contract" reference and "three `/.fs`-backed tools" wording
+  were corrected to the v1.2 reality; the module docstring's
+  status line bumped from "T23/T24/T25 done; T28 next" to
+  "T23/T24/T25/T26 done; T28 next"; the `_dry_run_payload`
+  helper uses `lineterm=""` plus a `line + "\n"` post-process
+  instead of the naive `splitlines(keepends=True)` /
+  `"\n".join(difflib.unified_diff(..., lineterm="\n"))` pattern
+  that produced double-`\n` lines and run-together lines when
+  the input lacked a trailing newline (verified by an
+  exploration script before picking the cleaner shape).
+
+  **Unblocks**: T27 (`diff_pages` can reuse `_dry_run_payload`
+  for its line-based unified-diff case — same shape, same
+  `difflib` plumbing), T30 (`check_task`'s read-before-write
+  step could surface a dry-run preview the same way, although
+  T30's ticket doesn't currently promise one).
+
+  Test count: 212 pass + 2 skip (was 196 pass + 2 skip; +16
+  new in-memory dry-run tests; live e2e skipped on this dev
+  box). `nix flake check` not run (no Nix in this env).
+
 ## Tickets
 
 <!--
@@ -500,11 +625,11 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T26. `dry_run=True` on the patch tools
+### T26. `dry_run=True` on the patch tools ✅
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: How do the patch tools expose a preview mode?
 >
 > **Context**: An agent that wants to verify "this `patch_page_replace`

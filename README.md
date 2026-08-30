@@ -7,7 +7,7 @@ side-car on loopback; it does not provision tunnels.
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
-v1.2 map (agent-facing QOL + bullet primitives, six open tickets after T23+T24): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.2 map (agent-facing QOL + bullet primitives, four open tickets after T23+T24+T25+T26): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ## What it exposes
 
@@ -16,9 +16,9 @@ Nine tools and one resource template:
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
 - `write_page(name, content, if_match?)` — create/update; returns `{name, etag, size_bytes, last_modified_ms, created_ms}` (T23 acknowledgement envelope)
-- `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the T23 ack envelope
-- `patch_page_lines(name, start_line, end_line, new_content, if_match?)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the T23 ack envelope
-- `patch_page_replace(name, find, new_string, replace_all=False, if_match?)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the T23 ack envelope
+- `append_to_page(name, text, if_match?, dry_run=False)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the T23 ack envelope. With `dry_run=True` (T26) returns `{dry_run, original, patched, diff}` without writing — the read still happens and `if_match=<etag>` is checked against the read's etag so a stale etag raises 412-equivalent `ToolError` (the agent sees the same wording as the live path).
+- `patch_page_lines(name, start_line, end_line, new_content, if_match?, dry_run=False)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the T23 ack envelope. `dry_run=True` (T26) returns the same `{dry_run, original, patched, diff}` preview as `append_to_page`.
+- `patch_page_replace(name, find, new_string, replace_all=False, if_match?, dry_run=False)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the T23 ack envelope. `dry_run=True` (T26) returns the same `{dry_run, original, patched, diff}` preview as the others.
 - `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the destination's T23 ack envelope (the same-name no-op returns the source's)
 - `delete_page(name, if_match?)` — hard delete; returns `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo timestamps / size per SB's contract)
 - `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA). T28 widens to the full meta shape.
@@ -99,6 +99,50 @@ The seven write tools (`write_page`, `delete_page`,
 T28 widens it in the same map.
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
+
+### Dry-run mode (T26)
+
+The three read-modify-write tools — `append_to_page`,
+`patch_page_lines`, `patch_page_replace` — accept a
+`dry_run: bool = False` knob. When `dry_run=True`:
+
+- The tool still reads the page (it needs the body to compute the
+  patched version).
+- The in-memory patch is computed the same way the live path
+  computes it (same separator rule for `append_to_page`, same
+  trailing-newline preservation for `patch_page_lines`, same
+  `replace_all` semantics for `patch_page_replace`).
+- No PUT is issued — the page is left untouched.
+- `if_match=<etag>` is checked against the **read's** etag. A
+  stale etag raises 412-equivalent `ToolError("precondition failed;
+  check if_match/if_none_match")` so the agent sees the same
+  shape as the live path, not a vague "would have failed".
+- `if_match="*"` (require existence) is enforced the same way the
+  live read does — a missing page 404s on the read itself, before
+  any etag check.
+- All the pre-read input-validation errors still fire on dry-run
+  (`text must not be empty`, `find must not be empty`, inverted
+  range, etc.) — a caller with a bad `find` gets the same specific
+  `ToolError` the live path would surface, not a vague preview.
+
+The return shape on `dry_run=True` is a different envelope from
+T23's write ack:
+
+```jsonc
+{
+  "dry_run": true,                 // always true on the dry-run path
+  "original": "<markdown>",        // the body the tool read
+  "patched": "<markdown>",         // the body that would have been written
+  "diff": "--- original\n+++ patched\n@@ -1 +1 @@\n-hello\n+world\n"
+  // unified diff from ``difflib.unified_diff``; ``""`` for a no-op patch
+}
+```
+
+`original` and `patched` are the markdown bodies (UTF-8 strings,
+possibly empty). `diff` is a unified diff between them, suitable
+for showing a human what the patch would change. The agent can
+choose to apply the patch by calling the tool again with
+`dry_run=False`, or surface the diff to the user for confirmation.
 
 ## Optional: journal surface (T10–T12)
 

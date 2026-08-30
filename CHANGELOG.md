@@ -105,6 +105,47 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
   composing `read_page → catch 404` to answer the same question,
   swap to `page_exists` for a body-free round trip.
 
+- **`dry_run=True` knob on the three read-modify-write tools
+  (T26).** `append_to_page(name, text, if_match?, dry_run=False)`,
+  `patch_page_lines(name, start_line, end_line, new_content,
+  if_match?, dry_run=False)`, and `patch_page_replace(name, find,
+  new_string, replace_all=False, if_match?, dry_run=False)` now
+  accept `dry_run=True` to preview a patch without committing. The
+  read still happens (the tool needs the body to compute the
+  patched version), the in-memory patch is computed the same way
+  the live path computes it (same separator rule, same trailing-
+  newline preservation, same `replace_all` semantics), and the
+  tool returns a different envelope from the T23 write ack:
+
+  ```jsonc
+  {
+    "dry_run": true,                 // always true on the dry-run path
+    "original": "<markdown>",        // the body the tool read
+    "patched": "<markdown>",         // the body that would have been written
+    "diff": "--- original\n+++ patched\n@@ -1 +1 @@\n-hello\n+world\n"
+    // unified diff from ``difflib.unified_diff``; "" for a no-op patch
+  }
+  ```
+
+  `if_match=<etag>` is checked against the read's etag on the
+  dry-run path because no PUT happens to do it on the server; a
+  stale etag raises the same 412-equivalent `ToolError("precondition
+  failed; check if_match/if_none_match")` as the live path so the
+  agent sees one shape across both paths. `if_match="*"` (require
+  existence) is enforced the same way the live read does — a
+  missing page 404s on the read itself, before any etag check. All
+  the pre-read input-validation errors still fire on dry-run (`text
+  must not be empty`, `find must not be empty`, inverted range,
+  etc.) — a caller with a bad input gets the same specific
+  `ToolError` the live path would surface.
+
+  Migration: none at the call-site for the live path (default
+  `dry_run=False` preserves existing behavior). To use the new
+  mode, pass `dry_run=True` and read the four-field envelope
+  instead of the T23 write-ack shape. No PUT is ever issued on the
+  dry-run path — verified by the Layer-1 test mock that asserts
+  on the request methods the bridge issues.
+
 ## [v1.1] — full CRUD + editing
 
 Build map: [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).

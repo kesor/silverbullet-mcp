@@ -321,6 +321,41 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     )
                     assert reset.is_error is False, reset
 
+                    # ``dry_run=True`` (T26) round-trip against the
+                    # live SB: preview a patch that would append
+                    # ``"appended\\n"``, confirm the dry-run envelope
+                    # says so, and confirm a follow-up read shows the
+                    # page is unchanged. The whole point of dry-run
+                    # is no writes; a read after the dry-run must show
+                    # the body still equals ``body``.
+                    dry_appended = await session.call_tool(
+                        "append_to_page",
+                        {
+                            "name": MARKER,
+                            "text": "appended\n",
+                            "dry_run": True,
+                        },
+                    )
+                    assert dry_appended.is_error is False, dry_appended
+                    dpayload = dry_appended.structured_content or {}
+                    assert dpayload.get("dry_run") is True
+                    assert dpayload.get("original") == body
+                    assert dpayload.get("patched") == body + "appended\n"
+                    assert "+appended" in dpayload.get("diff", "")
+                    after_dry_append = await session.call_tool(
+                        "read_page", {"name": MARKER}
+                    )
+                    assert after_dry_append.is_error is False, (
+                        "dry-run must not delete the page"
+                    )
+                    # ``patched`` is what would have been written;
+                    # ``original`` is what the page actually still
+                    # has. Dry-run no write → ``original`` is the
+                    # post-read-back body.
+                    assert (after_dry_append.structured_content or {}).get(
+                        "body"
+                    ) == body
+
                     # Ticket asked for 412 on If-Match. HTTP If-Match: *
                     # requires the page to exist (should 200 here).
                     # A stale etag should 412 — this live SB ignores
