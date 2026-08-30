@@ -26,6 +26,7 @@ when ``MCP_SILVERBULLET_LOG_LEVEL=debug``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -101,34 +102,30 @@ def redact_headers(headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
     return out
 
 
-def install_httptools_debug_hook() -> None:
-    """Wrap uvicorn's httptools ``data_received`` to log unparseable payloads.
+def _client_addr(protocol: Any) -> str:  # noqa: ANN401
+    client = getattr(protocol, "client", None)
+    if client:
+        return f"{client[0]}:{client[1]}"
+    return "unknown"
 
-    Safe to call more than once (idempotent). No-op if uvicorn's
-    httptools protocol isn't importable (h11-only install).
-    """
-    try:
-        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-    except ImportError:
-        _LOG.debug("httptools protocol not installed; skip inbound dump hook")
-        return
-    if getattr(HttpToolsProtocol.data_received, "_mcp_sb_wrapped", False):
-        return
-    orig = HttpToolsProtocol.data_received
+
+def _wrap_data_received(cls: type, orig: Callable[..., None]) -> None:
+    """Log first-bytes classification, then call uvicorn's handler."""
 
     def data_received(self: Any, data: bytes) -> None:  # noqa: ANN401
         kind = classify_inbound(data)
+        client = _client_addr(self)
+        # Always log at DEBUG so a quiet-looking service still
+        # shows *something* on every TCP payload. Non-HTTP/1 is
+        # WARNING so it sits next to uvicorn's opaque line.
+        _LOG.debug(
+            "inbound %s from %s (%d bytes): %s",
+            kind,
+            client,
+            len(data),
+            preview_bytes(data),
+        )
         if kind != "http1-request":
-            client = (
-                f"{self.client[0]}:{self.client[1]}"
-                if getattr(self, "client", None)
-                else "unknown"
-            )
-            # WARNING (not DEBUG) so a single ``LOG_LEVEL=debug`` boot
-            # still surfaces the classification next to uvicorn's
-            # "Invalid HTTP request received" line. http1-request
-            # chunks stay quiet here — the ASGI middleware covers
-            # those.
             _LOG.warning(
                 "non-HTTP/1 inbound from %s (%s, %d bytes): %s",
                 client,
@@ -139,11 +136,83 @@ def install_httptools_debug_hook() -> None:
         orig(self, data)
 
     data_received._mcp_sb_wrapped = True  # type: ignore[attr-defined]
-    HttpToolsProtocol.data_received = data_received  # type: ignore[method-assign]
-    _LOG.info(
-        "installed httptools inbound dump; non-HTTP/1 first-bytes "
-        "will log as mcp_silverbullet.http WARNING"
-    )
+    cls.data_received = data_received  # type: ignore[method-assign]
+
+
+def install_http_debug_hooks() -> None:
+    """Wrap uvicorn HTTP/1 implementations to log unparseable payloads.
+
+    This uvicorn build defaults to **h11** when httptools isn't
+    installed (the nix/uv env we ship). Wrapping only httptools
+    is a no-op in that case — the operator still sees uvicorn's
+    empty ``Invalid HTTP request received`` line. Hook both.
+
+    Safe to call more than once (idempotent).
+    """
+    hooked: list[str] = []
+    try:
+        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+    except ImportError:
+        HttpToolsProtocol = None  # type: ignore[misc, assignment]
+    else:
+        if not getattr(HttpToolsProtocol.data_received, "_mcp_sb_wrapped", False):
+            _wrap_data_received(HttpToolsProtocol, HttpToolsProtocol.data_received)
+            hooked.append("httptools")
+
+    try:
+        from uvicorn.protocols.http.h11_impl import H11Protocol
+    except ImportError:
+        H11Protocol = None  # type: ignore[misc, assignment]
+    else:
+        if not getattr(H11Protocol.data_received, "_mcp_sb_wrapped", False):
+            _wrap_data_received(H11Protocol, H11Protocol.data_received)
+            hooked.append("h11")
+        if not getattr(H11Protocol.handle_events, "_mcp_sb_wrapped", False):
+            _wrap_h11_handle_events(H11Protocol)
+            hooked.append("h11.handle_events")
+
+    if hooked:
+        _LOG.info(
+            "installed inbound dump hooks (%s); non-HTTP/1 first-bytes "
+            "log as mcp_silverbullet.http WARNING",
+            ", ".join(hooked),
+        )
+    else:
+        _LOG.warning(
+            "could not hook uvicorn HTTP protocols; Invalid HTTP request "
+            "lines will stay opaque"
+        )
+
+
+def _wrap_h11_handle_events(cls: type) -> None:
+    """Surface h11's RemoteProtocolError next to uvicorn's empty warning."""
+    import h11
+
+    orig = cls.handle_events
+
+    def handle_events(self: Any) -> None:  # noqa: ANN401
+        conn = self.conn
+        orig_next = conn.next_event
+
+        def next_event() -> Any:  # noqa: ANN401
+            try:
+                return orig_next()
+            except h11.RemoteProtocolError as exc:
+                _LOG.warning(
+                    "h11 rejected request from %s: %s",
+                    _client_addr(self),
+                    exc,
+                )
+                raise
+
+        conn.next_event = next_event
+        try:
+            orig(self)
+        finally:
+            conn.next_event = orig_next
+
+    handle_events._mcp_sb_wrapped = True  # type: ignore[attr-defined]
+    cls.handle_events = handle_events  # type: ignore[method-assign]
 
 
 class RequestDumpMiddleware:

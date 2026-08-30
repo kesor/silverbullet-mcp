@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from mcp_silverbullet.http_debug import (
     classify_inbound,
+    install_http_debug_hooks,
     preview_bytes,
     redact_headers,
 )
@@ -51,3 +52,12 @@ def test_preview_truncates() -> None:
     text = preview_bytes(blob, limit=10)
     assert text.endswith("…")
     assert "xxxxxxxxxx" in text or "x" * 10 in text
+
+
+def test_install_hooks_wraps_h11() -> None:
+    """This env ships uvicorn with h11, not httptools."""
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+
+    install_http_debug_hooks()
+    assert getattr(H11Protocol.data_received, "_mcp_sb_wrapped", False)
+    install_http_debug_hooks()  # idempotent

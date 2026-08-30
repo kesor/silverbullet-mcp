@@ -26,7 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from mcp_silverbullet.http_debug import (
     RequestDumpMiddleware,
-    install_httptools_debug_hook,
+    install_http_debug_hooks,
 )
 from mcp_silverbullet.journal import (
     JournalConfig,
@@ -320,7 +320,7 @@ async def serve(settings: Settings | None = None) -> None:
     logging.getLogger("uvicorn").setLevel(settings.log_level)
     logging.getLogger("uvicorn.error").setLevel(settings.log_level)
     if settings.log_level == "DEBUG":
-        install_httptools_debug_hook()
+        install_http_debug_hooks()
         logging.info(
             "debug logging on (MCP_SILVERBULLET_LOG_LEVEL=%s); "
             "non-HTTP/1 first-bytes and sanitized request metadata "
