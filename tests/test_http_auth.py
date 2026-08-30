@@ -324,3 +324,171 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                         "size_bytes": None,
                         "last_modified_ms": None,
                     }
+
+
+# --- JWT mode (v1.4) ---------------------------------------------------
+
+
+@pytest.fixture
+def jwks_server_url(monkeypatch):
+    """Serve a one-key JWKS doc over an in-memory ``PyJWKClient`` patch.
+
+    Mirrors the ``jwks_server_url`` fixture in
+    ``test_verifier_jwt.py`` — extracted here so the HTTP
+    wire tests don't have to import the verifier-internal
+    fixtures. The returned URL is a placeholder; the
+    monkey-patched ``PyJWKClient.fetch_data`` returns the
+    in-memory JWKS regardless of which URL the verifier
+    requests.
+    """
+    import base64
+    import json
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+    numbers = (
+        serialization.load_pem_public_key(public_pem.encode())
+        .public_numbers()
+    )
+
+    def _b64u(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    jwk = {
+        "kty": "RSA",
+        "kid": "test-key-1",
+        "alg": "RS256",
+        "use": "sig",
+        "n": _b64u(numbers.n),
+        "e": _b64u(numbers.e),
+    }
+
+    def fake_fetch_data(self) -> dict:
+        return {"keys": [jwk]}
+
+    monkeypatch.setattr(
+        "jwt.PyJWKClient.fetch_data", fake_fetch_data, raising=True
+    )
+    return "https://test.local/.well-known/jwks.json", private_pem
+
+
+def _build_jwt_app(jwks_url: str) -> MCPServer:
+    """Build a bridge wired with a :class:`JWTVerifier` against the fake JWKS."""
+    from mcp_silverbullet.verifier import JWTVerifier
+
+    sb = SBClient.__new__(SBClient)
+    sb._client = httpx.AsyncClient(
+        base_url="http://sb.test",
+        headers={"Authorization": "Bearer unused"},
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, text="placeholder")
+        ),
+    )
+    mcp = build_mcp(
+        sb,
+        verifier=JWTVerifier(
+            issuer="https://acme.cloudflareaccess.com",
+            audience="00000000000000000000000000000000",
+            jwks_url=jwks_url,
+        ),
+        resource_url=RESOURCE_URL,
+    )
+    return mcp.streamable_http_app(host=APP_HOST)
+
+
+@pytest.mark.asyncio
+async def test_jwt_mode_accepts_valid_jwt_and_rejects_expired(
+    jwks_server_url,
+) -> None:
+    """End-to-end: a valid CF-Access-shaped JWT round-trips through the bridge.
+
+    Mirrors the static-mode ``test_full_initialize_then_read_page_roundtrip_over_http``
+    but in JWT mode: the bridge validates the bearer against
+    the (mocked) JWKS, surfaces the principal, and serves the
+    MCP wire. Asserts both the happy path (valid JWT → 200)
+    and the rejection path (expired JWT → 401, same shape as
+    any other verifier rejection).
+    """
+    import time
+
+    import jwt as pyjwt
+
+    jwks_url, private_pem = jwks_server_url
+    app = _build_jwt_app(jwks_url)
+    async with app.router.lifespan_context(app):
+        now = int(time.time())
+        valid_token = pyjwt.encode(
+            {
+                "iss": "https://acme.cloudflareaccess.com",
+                "aud": "00000000000000000000000000000000",
+                "sub": "user-uuid-1234",
+                "iat": now,
+                "exp": now + 300,
+            },
+            private_pem,
+            algorithm="RS256",
+            headers={"kid": "test-key-1"},
+        )
+        http_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://bridge.test",
+            headers={"Authorization": f"Bearer {valid_token}"},
+        )
+        async with http_client:
+            async with streamable_http_client(
+                url=f"{RESOURCE_URL}",
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    init = await session.initialize()
+                    assert init.server_info.name == "mcp-silverbullet"
+                    tools = await session.list_tools()
+                    # The 14-tool surface is the same in JWT mode
+                    # as in static mode — auth mode doesn't gate
+                    # tools, just the principal.
+                    assert len(tools.tools) == 14
+
+            # Rejection path: expired JWT. ``exp`` 60s past, default
+            # leeway is 30s, so this is firmly outside the window.
+            expired_token = pyjwt.encode(
+                {
+                    "iss": "https://acme.cloudflareaccess.com",
+                    "aud": "00000000000000000000000000000000",
+                    "sub": "user-uuid-1234",
+                    "iat": now - 600,
+                    "exp": now - 60,
+                },
+                private_pem,
+                algorithm="RS256",
+                headers={"kid": "test-key-1"},
+            )
+            response = await http_client.post(
+                "/mcp",
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {expired_token}",
+                },
+                content=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            )
+            assert response.status_code == 401
+            www_auth = response.headers.get("WWW-Authenticate", "")
+            assert 'error="invalid_token"' in www_auth

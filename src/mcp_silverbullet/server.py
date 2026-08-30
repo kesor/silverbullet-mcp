@@ -124,6 +124,7 @@ from mcp_silverbullet.sb_client import (
     ServerError,
 )
 from mcp_silverbullet.verifier import StaticTokenVerifier
+from mcp.server.auth.provider import TokenVerifier
 
 
 # Where the bridge thinks it lives. ``resource_server_url`` is the
@@ -789,10 +790,39 @@ async def _hydrate_list_etags(
     return out
 
 
+def _resolve_verifier(
+    verifier: TokenVerifier | None, token: str | None
+) -> TokenVerifier:
+    """Coalesce the two auth kwargs into a single :class:`TokenVerifier`.
+
+    Precedence: explicit ``verifier`` wins (v1.4 production path,
+    set by ``main.build_verifier`` from the operator's env).
+    Fallback: construct a :class:`StaticTokenVerifier` from
+    ``token`` so v1.x tests (and the ``mcp dev`` CLI session)
+    that still pass ``token=...`` keep working.
+
+    Both unset is a programming error: ``build_mcp`` is the only
+    caller of this helper and every v1.x / v1.4 call site sets
+    one or the other. We raise rather than construct a no-op
+    verifier so a misconfigured boot surfaces as an
+    ``AttributeError`` at boot time, not as silent
+    unauthenticated traffic at request time.
+    """
+    if verifier is not None:
+        return verifier
+    if token:
+        return StaticTokenVerifier(token)
+    raise ValueError(
+        "build_mcp requires either `verifier` (v1.4) or "
+        "`token` (v1.x compat) to be set; neither was provided"
+    )
+
+
 def build_mcp(
     sb_client: SBClient,
     *,
-    token: str,
+    verifier: TokenVerifier | None = None,
+    token: str | None = None,
     resource_url: str = _DEFAULT_RESOURCE_URL,
     name: str = "mcp-silverbullet",
     journal: JournalConfig | None = None,
@@ -806,10 +836,24 @@ def build_mcp(
         The outbound ``SBClient`` opened at boot. Held by closure; the
         server doesn't reopen it. v1 has no per-request token refresh,
         so a single client for the process lifetime is correct.
+    verifier
+        The inbound :class:`TokenVerifier` that validates the
+        ``Authorization: Bearer …`` header on each request. v1.4
+        accepts either a :class:`JWTVerifier` (default mode;
+        validates per-user tokens against the operator's IdP JWKS)
+        or a :class:`StaticTokenVerifier` (v1.x compat; compares
+        against a single shared secret). Resolved by
+        :func:`mcp_silverbullet.main.build_verifier` from the
+        operator's ``MCP_SILVERBULLET_AUTH_MODE`` env var; tests
+        construct a verifier directly.
     token
-        The shared bearer secret. Same value as ``MCP_SILVERBULLET_TOKEN``
-        and ``SB_AUTH_TOKEN``. Compared constant-time against the
-        inbound ``Authorization: Bearer …`` header.
+        Backwards-compatible alias for ``verifier``: when
+        ``verifier`` is unset and ``token`` is set, the bridge
+        constructs a :class:`StaticTokenVerifier` from
+        ``token`` so v1.x test code (which calls
+        ``build_mcp(sb, token="secret")``) keeps working
+        unchanged. v1.4 production code should pass
+        ``verifier`` explicitly.
     resource_url
         The URL Grok reaches the bridge at. Used for the
         ``WWW-Authenticate`` header and the discovery document. v1
@@ -902,7 +946,7 @@ def build_mcp(
             "contract as the patch tools, with `state` in "
             "{\"done\", \"todo\", \"cancelled\"}."
         ),
-        token_verifier=StaticTokenVerifier(token),
+        token_verifier=_resolve_verifier(verifier, token),
         auth=AuthSettings(
             issuer_url=resource_url,  # type: ignore[arg-type]
             resource_server_url=resource_url,  # type: ignore[arg-type]

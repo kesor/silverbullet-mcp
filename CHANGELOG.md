@@ -8,7 +8,81 @@ Versions correspond to the build-map (wayfinder) charts under
 `docs/wayfinder/`. The map for an in-flight version lists the open
 tickets; this file records what's already shipped.
 
-## [Unreleased] — v1.3 (agent-grade discovery + edit hygiene)
+## [Unreleased] — v1.4 (JWT inbound auth)
+
+Build map: [`docs/wayfinder/map-v1.4.md`](docs/wayfinder/map-v1.4.md).
+**Status: T37 + T38 shipped; v1.4 destination reached** — the
+inbound auth surface widened from "one shared secret" to a JWT
+mode that validates per-user tokens against an IdP's JWKS
+(default config targets Cloudflare Access; the v1.x
+static-token mode stays available via
+`MCP_SILVERBULLET_AUTH_MODE=static`).
+
+v1.3 closed on 2026-08-30; v1.4 takes the bridge from
+"single-user behind a tunnel" to "per-user authenticated by
+whatever IdP the operator wires up". The bridge now exposes
+`AccessToken.subject` on every authenticated request (CF
+Access user UUID by default; the IdP's `sub` claim for
+Auth0/Okta/Google-IAP), ready for future scope-gating and
+per-user SB credentials to thread off of.
+
+### Added
+
+- **JWT inbound auth (v1.4 default)** — new
+  `:class:`mcp_silverbullet.verifier.JWTVerifier`` that
+  validates per-user tokens against the operator's IdP
+  JWKS (default config targets Cloudflare Access;
+  ``iss`` + ``aud`` + ``exp`` + ``iat`` checked per
+  RFC 7519, leeway 30s for clock-skew tolerance,
+  ``RS256`` algorithm pinned to refuse the
+  algorithm-confusion downgrade attack). The
+  successful verification populates
+  ``AccessToken.subject`` (CF Access user UUID; the
+  IdP's ``sub`` claim for Auth0/Okta/Google-IAP)
+  plus the full claim dict on ``AccessToken.claims``
+  for downstream per-user work. Five new env vars:
+  ``MCP_SILVERBULLET_AUTH_MODE`` (default ``jwt``;
+  set to ``static`` for the v1.x surface),
+  ``MCP_SILVERBULLET_JWT_ISSUER``, ``_AUDIENCE``,
+  ``_JWKS_URL``, ``_ALGORITHMS`` (default
+  ``RS256``), ``_LEEWAY_SECONDS`` (default ``30``).
+  The ``MCP_SILVERBULLET_TOKEN`` env var is no
+  longer required (the bridge logs "ignored in JWT
+  mode" at boot if it's still set from a prior
+  v1.x upgrade). Backwards-compat:
+  ``AUTH_MODE=static`` + ``MCP_SILVERBULLET_TOKEN``
+  keeps the v1.x shared-secret surface alive (used
+  by ``mcp dev`` CLI sessions). ``build_mcp``
+  accepts a ``verifier=`` kwarg (v1.4 production
+  path) and a ``token=`` kwarg (v1.x compat); the
+  v1.x path goes through a ``_resolve_verifier``
+  shim that constructs a ``StaticTokenVerifier``
+  from ``token`` if ``verifier`` is unset.
+  Migration: existing ``mcp dev`` and
+  ``MCP_SILVERBULLET_TOKEN`` setups keep working
+  unchanged; production deployments behind
+  Cloudflare Access (or any OIDC IdP) get per-user
+  ``subject`` for free.
+
+  - **`JWTVerifier`** —
+    ``src/mcp_silverbullet/verifier.py``.
+    PyJWKClient-backed key cache (5-min default
+    lifespan; auto-refetched on cache miss);
+    ``algorithms=`` allow-list (default
+    ``("RS256",)``); ``issuer=``, ``audience=``,
+    ``leeway_seconds=``, ``required_claims=``
+    constructor knobs for IdP variations.
+  - **`select_verifier`** — factory that maps the
+    ``MCP_SILVERBULLET_AUTH_MODE`` env contract to
+    a verifier instance, fails loud on missing
+    required fields.
+  - **`build_verifier`** —
+    ``src/mcp_silverbullet/main.py``. Thin wrapper
+    over ``select_verifier`` that handles the
+    ``None``-vs-empty-string distinction
+    ``load_settings`` produces.
+
+## [v1.3] — agent-grade discovery + edit hygiene
 
 Build map: [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
 **Status: T31 / T31a / T31b / T32 / T33 / T34 / T35 / T36

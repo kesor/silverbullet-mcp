@@ -3,6 +3,13 @@
 T1 shipped a hello-print smoke. T6 replaces it with the real boot:
 read env, open the outbound SB client, mount the inbound MCP app, bind
 uvicorn via ``MCPServer.run_streamable_http_async``.
+
+v1.4 widens the inbound auth surface from a single shared secret to
+a JWT mode that validates per-user tokens against an IdP's JWKS
+(default config targets Cloudflare Access; the static-token mode
+stays available for ``mcp dev`` and other non-IdP setups). The
+verifier selection lives in :mod:`mcp_silverbullet.verifier`; this
+module just plumbs the env vars through ``load_settings``.
 """
 
 from __future__ import annotations
@@ -11,8 +18,10 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from mcp.server.auth.provider import TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
 
 from mcp_silverbullet.journal import (
@@ -22,10 +31,33 @@ from mcp_silverbullet.journal import (
 )
 from mcp_silverbullet.sb_client import SBClient
 from mcp_silverbullet.server import build_mcp
+from mcp_silverbullet.verifier import select_verifier
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8000
 _DEFAULT_SB_URL = "http://127.0.0.1:3000"
+
+# Default auth mode. v1.4 flips the default from the v1.x static
+# shared secret to JWT — the bridge is meant to sit behind
+# Cloudflare Access in production, and the JWT path gives per-user
+# ``subject`` on every request. Operators who haven't migrated
+# yet opt back into the v1.x surface with
+# ``MCP_SILVERBULLET_AUTH_MODE=static`` plus the same
+# ``MCP_SILVERBULLET_TOKEN`` they used to set.
+_DEFAULT_AUTH_MODE = "jwt"
+
+# Default JWT signing algorithms. CF Access only issues RS256; we
+# pin it here so a misconfigured operator can't accidentally
+# accept HS256 tokens (algorithm-confusion attack). Operators
+# running Auth0 / Google-IAP / Okta pass their IdP's algorithm
+# via ``MCP_SILVERBULLET_JWT_ALGORITHMS`` (comma-separated).
+_DEFAULT_JWT_ALGORITHMS: tuple[str, ...] = ("RS256",)
+
+# Default clock-skew tolerance for ``jwt.decode``. CF Access
+# recommends 30s; we mirror that across all IdPs because the
+# alternative (a 0s leeway) fails tokens from hosts with even
+# modest NTP drift.
+_DEFAULT_JWT_LEEWAY_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -41,17 +73,121 @@ class Settings:
     allowed_hosts: tuple[str, ...]
     journal: JournalConfig
     list_pages_hydrate_etags: bool
+    # v1.4: JWT-mode config. ``auth_mode`` selects between
+    # ``"jwt"`` (default) and ``"static"`` (v1.x compat). The
+    # JWT fields are only consulted when ``auth_mode == "jwt"``;
+    # setting them in static mode is a silent no-op (the
+    # ``select_verifier`` function raises if the chosen mode's
+    # required fields are missing).
+    auth_mode: str
+    jwt_issuer: str | None
+    jwt_audience: str | None
+    jwt_jwks_url: str | None
+    jwt_algorithms: tuple[str, ...]
+    jwt_leeway_seconds: int
+
+
+def _parse_csv(raw: str) -> tuple[str, ...]:
+    """Split a comma-separated env value into a tuple of stripped entries.
+
+    Empty entries (``"a,,b"``, ``","``, all-whitespace) are dropped
+    so a trailing comma doesn't produce a phantom algorithm name.
+    The bridge never wants a silent empty-string algorithm in the
+    PyJWT allow-list (PyJWT would treat it as "any algorithm", which
+    is the same algorithm-confusion footgun the default rejects).
+    """
+    return tuple(entry.strip() for entry in raw.split(",") if entry.strip())
 
 
 def load_settings(environ: dict[str, str] | None = None) -> Settings:
-    """Parse process env. Raises :class:`SystemExit` on missing token."""
+    """Parse process env. Raises :class:`SystemExit` on misconfiguration."""
     env = os.environ if environ is None else environ
-    token = (env.get("MCP_SILVERBULLET_TOKEN") or "").strip()
-    if not token:
+    auth_mode = (
+        env.get("MCP_SILVERBULLET_AUTH_MODE") or _DEFAULT_AUTH_MODE
+    ).strip().lower()
+    if auth_mode not in ("jwt", "static"):
         raise SystemExit(
-            "MCP_SILVERBULLET_TOKEN is required "
-            "(shared bearer secret for inbound MCP and, by default, outbound SB)"
+            f"MCP_SILVERBULLET_AUTH_MODE must be 'jwt' or 'static', "
+            f"got {auth_mode!r}"
         )
+
+    # ``token`` is still parsed in both modes so the existing
+    # env contract keeps working: static mode uses it as the
+    # bearer secret; JWT mode ignores it (the v1.4 default)
+    # but the var is still settable for ``mcp dev`` sessions
+    # that flip back to static mode.
+    token = (env.get("MCP_SILVERBULLET_TOKEN") or "").strip()
+    if auth_mode == "static" and not token:
+        raise SystemExit(
+            "MCP_SILVERBULLET_AUTH_MODE=static requires "
+            "MCP_SILVERBULLET_TOKEN to be set"
+        )
+    if auth_mode == "jwt" and not token:
+        # JWT mode doesn't need a static token, but logging a
+        # notice at boot is friendlier than silently dropping
+        # it — operators often leave the var set from prior
+        # v1.x boots and wonder why it's not in use.
+        logging.basicConfig(level=logging.INFO, force=True)
+        logging.info(
+            "MCP_SILVERBULLET_TOKEN is set but ignored in JWT mode; "
+            "the bridge validates tokens against the IdP's JWKS "
+            "(MCP_SILVERBULLET_JWT_ISSUER / _AUDIENCE / _JWKS_URL). "
+            "To switch back to v1.x static-token auth, set "
+            "MCP_SILVERBULLET_AUTH_MODE=static."
+        )
+
+    jwt_issuer = (
+        (env.get("MCP_SILVERBULLET_JWT_ISSUER") or "").strip() or None
+    )
+    jwt_audience = (
+        (env.get("MCP_SILVERBULLET_JWT_AUDIENCE") or "").strip() or None
+    )
+    jwt_jwks_url = (
+        (env.get("MCP_SILVERBULLET_JWT_JWKS_URL") or "").strip() or None
+    )
+    jwt_algos_raw = (
+        env.get("MCP_SILVERBULLET_JWT_ALGORITHMS") or ""
+    ).strip()
+    jwt_algorithms = (
+        _parse_csv(jwt_algos_raw) if jwt_algos_raw else _DEFAULT_JWT_ALGORITHMS
+    )
+    jwt_leeway_raw = (
+        env.get("MCP_SILVERBULLET_JWT_LEEWAY_SECONDS") or ""
+    ).strip()
+    try:
+        jwt_leeway_seconds = (
+            int(jwt_leeway_raw) if jwt_leeway_raw else _DEFAULT_JWT_LEEWAY_SECONDS
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"MCP_SILVERBULLET_JWT_LEEWAY_SECONDS must be an integer, "
+            f"got {jwt_leeway_raw!r}"
+        ) from exc
+    if jwt_leeway_seconds < 0:
+        raise SystemExit(
+            f"MCP_SILVERBULLET_JWT_LEEWAY_SECONDS must be non-negative, "
+            f"got {jwt_leeway_seconds}"
+        )
+
+    # Surface the JWT-mode-misconfiguration case eagerly so the
+    # operator sees the missing-var message at boot, not on the
+    # first authenticated request.
+    if auth_mode == "jwt":
+        missing = [
+            name
+            for name, value in (
+                ("MCP_SILVERBULLET_JWT_ISSUER", jwt_issuer),
+                ("MCP_SILVERBULLET_JWT_AUDIENCE", jwt_audience),
+                ("MCP_SILVERBULLET_JWT_JWKS_URL", jwt_jwks_url),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "MCP_SILVERBULLET_AUTH_MODE=jwt requires: "
+                + ", ".join(missing)
+            )
+
     port_raw = (env.get("MCP_SILVERBULLET_PORT") or str(_DEFAULT_PORT)).strip()
     try:
         port = int(port_raw)
@@ -90,6 +226,12 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         allowed_hosts=allowed,
         journal=resolve_journal_config(env),
         list_pages_hydrate_etags=list_pages_hydrate_etags,
+        auth_mode=auth_mode,
+        jwt_issuer=jwt_issuer,
+        jwt_audience=jwt_audience,
+        jwt_jwks_url=jwt_jwks_url,
+        jwt_algorithms=jwt_algorithms,
+        jwt_leeway_seconds=jwt_leeway_seconds,
     )
 
 
@@ -108,6 +250,26 @@ def _transport_security(
     return TransportSecuritySettings(allowed_hosts=hosts)
 
 
+def build_verifier(settings: Settings) -> TokenVerifier:
+    """Select the inbound verifier from the parsed settings.
+
+    Thin wrapper over :func:`mcp_silverbullet.verifier.select_verifier`
+    that handles the ``None``-vs-empty-string distinction
+    ``load_settings`` produces for the optional JWT columns. Kept
+    separate from :func:`load_settings` so the selection logic is
+    unit-testable without re-parsing env vars.
+    """
+    return select_verifier(
+        auth_mode=settings.auth_mode,
+        static_token=settings.token or None,
+        jwt_issuer=settings.jwt_issuer,
+        jwt_audience=settings.jwt_audience,
+        jwt_jwks_url=settings.jwt_jwks_url,
+        jwt_algorithms=settings.jwt_algorithms,
+        jwt_leeway_seconds=settings.jwt_leeway_seconds,
+    )
+
+
 async def serve(settings: Settings | None = None) -> None:
     # Configure root logging first so the journal gate's INFO/WARN
     # lines (emitted from inside ``load_settings`` /
@@ -120,16 +282,17 @@ async def serve(settings: Settings | None = None) -> None:
     )
     settings = settings if settings is not None else load_settings()
     async with SBClient(settings.sb_url, settings.sb_token) as sb:
+        verifier = build_verifier(settings)
         mcp = build_mcp(
             sb,
-            token=settings.token,
+            verifier=verifier,
             resource_url=settings.resource_url,
             journal=settings.journal,
             list_pages_hydrate_etags=settings.list_pages_hydrate_etags,
         )
         print(
             f"mcp-silverbullet listening on http://{settings.host}:{settings.port}/mcp "
-            f"(SB {settings.sb_url})",
+            f"(SB {settings.sb_url}, auth={settings.auth_mode})",
             file=sys.stderr,
         )
         await mcp.run_streamable_http_async(
@@ -142,6 +305,11 @@ async def serve(settings: Settings | None = None) -> None:
 def run() -> None:
     """Console-script / ``python -m mcp_silverbullet`` entry."""
     asyncio.run(serve())
+
+
+# Re-exported for tests that need to construct a verifier
+# collection without going through ``build_verifier``.
+_select_verifier = select_verifier
 
 
 if __name__ == "__main__":  # pragma: no cover

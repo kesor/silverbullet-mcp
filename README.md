@@ -305,18 +305,38 @@ which branch ran.
    If this SilverBullet has **no** auth (dev box), leave SB without a token
    and set `MCP_SILVERBULLET_SB_TOKEN` empty on the bridge (step 3).
 
-3. **Bridge** — from a checkout:
+3. **Bridge** — from a checkout. v1.4 defaults to JWT mode
+   (validate tokens against the IdP's JWKS); set
+   ``MCP_SILVERBULLET_AUTH_MODE=static`` for the v1.x shared-secret
+   surface.
 
    ```bash
+   # JWT mode (v1.4 default — the bridge sits behind Cloudflare Access,
+   # Auth0, Okta, Google-IAP, etc.; validates per-user tokens against
+   # the IdP's JWKS, surfaces the principal on AccessToken.subject):
+   export MCP_SILVERBULLET_JWT_ISSUER=https://<org>.cloudflareaccess.com
+   export MCP_SILVERBULLET_JWT_AUDIENCE=<AUD-tag-from-CF-dashboard>
+   export MCP_SILVERBULLET_JWT_JWKS_URL=https://<org>.cloudflareaccess.com/cdn-cgi/access/certs
+   export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:3000
+   nix run .#mcp-silverbullet
+
+   # Static mode (v1.x compat — one shared secret, used for `mcp dev`
+   # and other non-IdP setups):
+   export MCP_SILVERBULLET_AUTH_MODE=static
    export MCP_SILVERBULLET_TOKEN=$T
    export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:3000
+   nix run .#mcp-silverbullet
+   ```
+
+   Common knobs (both modes):
+
+   ```bash
    # optional: empty when SB has no auth
    # export MCP_SILVERBULLET_SB_TOKEN=
    # optional: public URL stamped into WWW-Authenticate + discovery
    # export MCP_SILVERBULLET_RESOURCE_URL=https://<tunnel>/mcp
    # optional: extra Host values when nginx/cloudflared forward a public name
    # export MCP_SILVERBULLET_ALLOWED_HOSTS=<mcp>.local,<tunnel>.trycloudflare.com
-   nix run .#mcp-silverbullet
    ```
 
    Equivalent without Nix: `uv sync && uv run mcp-silverbullet`.
@@ -329,11 +349,16 @@ which branch ran.
    cloudflared tunnel --url http://127.0.0.1:8000
    ```
 
-5. **Client** — paste `https://<tunnel>/mcp` and bearer `T` into a Grok
-   Custom Connector, or:
+5. **Client** — in JWT mode, paste `https://<tunnel>/mcp` and let
+   Cloudflare Access handle auth (the bridge trusts whatever
+   CF-Access-issued JWT reaches it). In static mode, paste the
+   token too:
 
    ```bash
-   MCP_SILVERBULLET_TOKEN=$T mcp dev http://127.0.0.1:8000/mcp
+   # JWT mode — CF Access injects the CF-Access JWT on every request.
+   # Static mode — the bearer is the shared secret.
+   MCP_SILVERBULLET_AUTH_MODE=static MCP_SILVERBULLET_TOKEN=$T \
+     mcp dev http://127.0.0.1:8000/mcp
    ```
 
 If a quick tunnel URL rotates, the token stays; re-paste the new URL.
@@ -355,8 +380,8 @@ additionally when `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so
-the secret stays out of the repo and out of Pi's process env. Generate
-it once:
+the secret stays out of the repo and out of Pi's process env.
+Generate it once:
 
 ```bash
 python -c 'import secrets; print(secrets.token_hex(32))' \
@@ -364,11 +389,27 @@ python -c 'import secrets; print(secrets.token_hex(32))' \
 chmod 600 ~/.config/mcp-silverbullet/token
 ```
 
-Then start the bridge with that same token in its env:
+For local `mcp dev` sessions where you don't sit behind an
+IdP, opt the bridge back into the v1.x static-token surface:
 
 ```bash
+export MCP_SILVERBULLET_AUTH_MODE=static
 export MCP_SILVERBULLET_TOKEN=$(cat ~/.config/mcp-silverbullet/token)
 export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:63000  # or wherever SB listens
+export MCP_SILVERBULLET_SB_TOKEN=                      # empty if SB has no auth
+nix run .#mcp-silverbullet
+```
+
+In v1.4's default JWT mode (no `AUTH_MODE` set), the bridge
+validates tokens against the operator's IdP JWKS — the
+``MCP_SILVERBULLET_TOKEN`` path is unused. Configure the JWT env
+vars instead:
+
+```bash
+export MCP_SILVERBULLET_JWT_ISSUER=https://<org>.cloudflareaccess.com
+export MCP_SILVERBULLET_JWT_AUDIENCE=<AUD-tag-from-CF-dashboard>
+export MCP_SILVERBULLET_JWT_JWKS_URL=https://<org>.cloudflareaccess.com/cdn-cgi/access/certs
+export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:63000
 export MCP_SILVERBULLET_SB_TOKEN=                      # empty if SB has no auth
 nix run .#mcp-silverbullet
 ```
@@ -381,7 +422,13 @@ try to connect until the first tool call.
 
 | Variable | Default | Role |
 |---|---|---|
-| `MCP_SILVERBULLET_TOKEN` | *(required)* | Inbound `Authorization: Bearer` |
+| `MCP_SILVERBULLET_AUTH_MODE` | `jwt` | Selects the inbound verifier. `jwt` (v1.4 default) validates per-user tokens against the IdP's JWKS via `MCP_SILVERBULLET_JWT_*`; `static` (v1.x compat) accepts a single shared secret via `MCP_SILVERBULLET_TOKEN`. |
+| `MCP_SILVERBULLET_TOKEN` | *(required when `AUTH_MODE=static`; ignored otherwise)* | Shared bearer secret for static mode. Compared constant-time against the inbound `Authorization: Bearer …` header. |
+| `MCP_SILVERBULLET_JWT_ISSUER` | *(required when `AUTH_MODE=jwt`)* | Expected `iss` claim. Cloudflare Access: `https://<org>.cloudflareaccess.com`. |
+| `MCP_SILVERBULLET_JWT_AUDIENCE` | *(required when `AUTH_MODE=jwt`)* | Expected `aud` claim. Cloudflare Access: the per-application AUD tag from the Zero Trust dashboard. |
+| `MCP_SILVERBULLET_JWT_JWKS_URL` | *(required when `AUTH_MODE=jwt`)* | JWKS endpoint URL. Cloudflare Access: `https://<org>.cloudflareaccess.com/cdn-cgi/access/certs`. |
+| `MCP_SILVERBULLET_JWT_ALGORITHMS` | `RS256` | Comma-separated JWA algorithm allow-list. Pinned to `RS256` by default so the bridge refuses the classic algorithm-confusion attack (HS256-signed with the public key as secret). Operators on Auth0/Okta/Google-IAP pass the IdP's algorithm. |
+| `MCP_SILVERBULLET_JWT_LEEWAY_SECONDS` | `30` | Clock-skew tolerance for `exp` / `iat` / `nbf`. CF Access's recommended value; lower is unsafe on hosts with even modest NTP drift. |
 | `MCP_SILVERBULLET_SB_URL` | `http://127.0.0.1:3000` | SilverBullet origin |
 | `MCP_SILVERBULLET_SB_TOKEN` | same as `MCP_SILVERBULLET_TOKEN` | Outbound SB bearer; empty string = no header |
 | `MCP_SILVERBULLET_RESOURCE_URL` | `http://127.0.0.1:8000/mcp` | Discovery + `WWW-Authenticate` |
@@ -391,6 +438,27 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
 | `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the six journal tools above (T10–T12, T34, T35); requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
 | `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages` (T28). Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. Partial failures (404 / 412 / 5xx / timeout on one page) leave that row's etag as `null` rather than failing the whole call. |
+
+### Cloudflare Access boot example
+
+```bash
+export MCP_SILVERBULLET_JWT_ISSUER=https://kabarnit.cloudflareaccess.com
+export MCP_SILVERBULLET_JWT_AUDIENCE=<the-AUD-tag-from-the-CF-dashboard>
+export MCP_SILVERBULLET_JWT_JWKS_URL=https://kabarnit.cloudflareaccess.com/cdn-cgi/access/certs
+export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:3000
+# MCP_SILVERBULLET_TOKEN is unset in JWT mode (the bridge logs
+# "ignored in JWT mode" at boot if it's still present from a v1.x
+# upgrade).
+nix run .#mcp-silverbullet
+```
+
+### Local-dev / `mcp dev` boot example (static mode)
+
+```bash
+export MCP_SILVERBULLET_AUTH_MODE=static
+export MCP_SILVERBULLET_TOKEN=$(cat ~/.config/mcp-silverbullet/token)
+nix run .#mcp-silverbullet
+```
 
 Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`
 (e.g. `http://127.0.0.1:63000`) and `MCP_SILVERBULLET_LIVE_SB_TOKEN`

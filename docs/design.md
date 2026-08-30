@@ -589,14 +589,24 @@ the v1 matrix.
 
 Threats accepted:
 
-- Anyone with the bearer token has read+write on every SilverBullet
-  page the bridge can see. Mitigation: a single user behind a
-  Cloudflare tunnel they control; the token is a 32-byte random;
-  rotated on suspicion. If the threat model widens, T2 reopens.
+- Anyone with a valid bearer has read+write on every SilverBullet
+  page the bridge can see. v1.4's default mode (JWT) limits this
+  to callers authenticated by the configured IdP (typically
+  Cloudflare Access behind the tunnel); v1.x's static-token
+  mode trusts whoever holds the shared secret. Mitigation: the
+  JWT path keeps the IdP's signing keys in the bridge's
+  process memory only (never on disk); the static path's
+  32-byte token is rotated on suspicion. If the threat model
+  widens further, future tickets can scope tokens by IdP
+  groups / per-user SB credentials.
 
 Threats out of scope (v1):
 
-- Multi-user SilverBullet (no SB user/password, only bearer).
+- Multi-user SilverBullet at the SB layer (no SB user/password,
+  only bearer; v1.4's JWT mode gives the bridge per-user
+  ``subject`` but every authenticated user still shares the
+  same SB outbound token unless the operator threads per-user
+  SB credentials through a follow-up ticket).
 - Audit trail of writes via SilverBullet's revision log
   (`server/src/handlers/revisions.rs`). Reachable but not surfaced in
   the bridge yet.
