@@ -8,7 +8,62 @@ Versions correspond to the build-map (wayfinder) charts under
 `docs/wayfinder/`. The map for an in-flight version lists the open
 tickets; this file records what's already shipped.
 
-## [Unreleased] — v1.2 (agent-facing QOL + bullet primitives)
+## [Unreleased] — v1.3 (agent-grade discovery + edit hygiene)
+
+Build map: [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
+**Status: lead-blocked on T31** — six tickets charted; T31
+(verify SB honors `If-Match` on `PUT /.fs/{name}`) is the lead
+ticket and unblocks T32–T36 (everything else assumes the v1.2
+concurrency story holds). T34 (`search_pages`) and T35
+(`find_backlinks`) ship the journal surface into agent-facing
+discovery; T32 (`create_page`), T33 (`prepend_to_page`), and T36
+(256 KiB body-size cap) close the most common agent-side
+friction points. See [`docs/competitive-landscape.md`](competitive-landscape.md)
+for the research that fed this map.
+
+### Planned
+
+- **`create_page(name, content, if_match?)`** (T32) — refuse to
+  overwrite as a first-class operation, distinct from
+  `write_page`'s overwrite-or-create default. Thin wrapper over
+  `write_page(if_match="*")`; translates the 412 path into a
+  clean `ToolError("page already exists: {name}; use write_page
+  to overwrite")`. Returns the T23 ack envelope on success.
+- **`prepend_to_page(name, content, position="after_frontmatter"|"top",
+  if_match?, dry_run=False)`** (T33) — mirrors `append_to_page`'s
+  read-modify-write + `dry_run` shape but inserts at the top.
+  Default `position="after_frontmatter"` (the human-meaningful
+  case for journal / daily-notes pages with YAML frontmatter);
+  `position="top"` overrides for the rare absolute-top intent.
+- **`search_pages(query, prefix?, limit?)`** (T34) — substring
+  content search. Thin wrapper over the v1
+  `pages_touching_topic` journal machinery; returns the same
+  `{name, snippet, match}` shape. Gated behind the journal
+  surface (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` +
+  `MCP_SILVERBULLET_SPACE_PATH`).
+- **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
+  wikilink-target backlinks. Walks the SB space directory,
+  scans every `*.md` for `[[target]]` / `[[target|alias]]`
+  references; returns one entry per match. Journal-gated.
+- **256 KiB body-size cap on every write tool** (T36) — local
+  cap applied before the PUT; surfaces
+  `ToolError("body too large: {size_bytes} bytes exceeds 256
+  KiB cap; chunk into append_to_page calls")` with the
+  remediation hint naming the right next tool. Does NOT apply
+  to read-side tools (`read_page`, `list_pages`, `page_exists`,
+  `diff_pages`, `list_tasks`) or the journal-discovery tools.
+- **T31 verification ticket** — single live-SB pytest case
+  (`tests/test_e2e_live_sb.py`) that creates a page, reads it
+  twice, issues a write with the first read's etag, then a
+  second write with the first read's etag (now stale), and
+  asserts the second call returns 412-equivalent `ToolError`.
+  If the test passes, T31 closes positively and v1.2's
+  `If-Match` assumption is verified; if it fails, T31a / T31b
+  spawn to switch to `xmatthewx`-style `expected_last_modified`
+  body-field convention (see `docs/competitive-landscape.md`
+  § Code notes for the cutover reference).
+
+## [v1.2] — agent-facing QOL + bullet primitives
 
 Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 **Status: destination reached** — every ticket on the v1.2 map

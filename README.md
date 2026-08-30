@@ -8,10 +8,14 @@ Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
 v1.2 map (agent-facing QOL + bullet primitives, destination reached with `check_task`): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.3 map (agent-grade discovery + edit hygiene, lead-blocked on T31): [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
+Competitive landscape research (feature matrix + ranked borrow list across nine SB-MCP competitors): [`docs/competitive-landscape.md`](docs/competitive-landscape.md).
+Subjective notes from that survey (judgment calls, predictions, what I considered and rejected): [`docs/competitive-impressions.md`](docs/competitive-impressions.md).
 
 ## What it exposes
 
-Twelve tools and one resource template:
+Twelve tools and one resource template (v1.3 plans six more — see
+[§ v1.3 roadmap](#v13-roadmap)):
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
@@ -31,6 +35,37 @@ Every write tool honors `if_match` (`"*"` to require existence,
 `<etag>` to require an exact body match, `None` for unconditional).
 Concurrent edits from two clients fail with a 412 — the second
 client's stale etag does not overwrite the first client's write.
+
+### v1.3 roadmap
+
+The [v1.3 wayfinder](docs/wayfinder/map-v1.3.md) charts six
+tickets aimed at closing the most common agent-side friction
+points and surfacing the existing journal surface as agent-facing
+discovery:
+
+- **`create_page(name, content, if_match?)`** (T32) — distinct
+  from `write_page`'s overwrite-or-create default; surfaces a
+  clean `already_exists` `ToolError` instead of a 412 the agent
+  has to pattern-match on.
+- **`prepend_to_page(name, content, position="after_frontmatter"|"top",
+  if_match?, dry_run=False)`** (T33) — top-of-body insert with
+  YAML frontmatter awareness; mirrors `append_to_page`'s
+  `dry_run` shape.
+- **`search_pages(query, prefix?, limit?)`** (T34) — substring
+  content search delegating to the existing journal machinery;
+  journal-gated like `list_tasks`'s space-walk form.
+- **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
+  wikilink-target backlinks for the rename-pre-flight workflow;
+  journal-gated.
+- **256 KiB body-size cap on every write tool** (T36) —
+  `body_too_large` `ToolError` with the remediation hint before
+  the SB round trip.
+- **T31 verification** — single live-SB test asserting that
+  `If-Match: <stale_etag>` returns 412 on `PUT /.fs/{name}`. If
+  it doesn't, T31a / T31b spawn to switch to
+  `expected_last_modified` body-field convention. This is the
+  lead ticket; everything else assumes the v1.2 concurrency
+  story holds.
 
 ### v1.2 wire-shape changes
 
