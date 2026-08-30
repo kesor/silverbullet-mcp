@@ -84,6 +84,18 @@ artefact.
 - **[T8 — License & repo home](#t8-license--repo-home)**: License → MIT
   (matches the upstream SDK). Repo home → deferred ("dev local for now");
   reopen if/when there's a reason to publish.
+- **[T5 — Nix shape](#t5-nix-shape)**: `uv2nix` + a checked-in `uv.lock`,
+  consumed through `pyproject.nix` overlays onto `python311`. nixpkgs
+  ships `mcp==1.29.0`, but v2 is non-negotiable (T1/T3) and v2 pulls in
+  `mcp-types` which nixpkgs doesn't package. `uv2nix` ingests the
+  lockfile and overlays every transitive on top of nixpkgs's Python
+  set; no per-dep overrides.
+- **[T7 — Test surface](#t7-test-surface)**: Three `pytest` layers, no
+  Grok, no real SB. (1) `Client(mcp)` in-memory for unit-level tool
+  logic. (2) `mcp.run(streamable-http)` on a free port + `Client(url)`
+  for the bearer-auth and well-known-doc surface. (3) `httpx.MockTransport`
+  for the bridge→SB hand without spinning up Rust. A manual "Inspector
+  via `mcp dev`" layer for human verification; never in CI.
 
 ## Tickets
 
@@ -246,25 +258,97 @@ never blocked on T1.
 
 ### T5. Nix shape
 
-> **Status**: ⏳ in-progress (rephrased after T3 to match the Python stack)
+> **Status**: ✅ resolved
 > **Labels**: `wayfinder:research`
 > **Question**: How does the flake consume the Python stack locked by T3?
-> Candidates:
->   - `python311.withPackages (ps: [ ps.mcp ps.httpx ps.pydantic ... ])`
->     plus a hand-written `requirements.txt`. Simplest. Relies on
->     `python311Packages.mcp` being populated in nixpkgs unstable, which
->     it is on master as of 2026.
->   - `poetry2nix` reading a `pyproject.toml`/`poetry.lock`. Heavier but
->     pins transitive deps with a lockfile.
->   - `uv2nix` reading a `uv.lock` (PEP 723 script-style or uv-managed
->     venv). Heavier still, bleeding edge.
->   - `buildPythonApplication` derivation wrapping a hand-built virtualenv.
->     Most reproducible, most code.
-> Confirm which is smallest and most reproducible for a one-binary
-> bridge whose only Python deps are `mcp` + `httpx` (+ `pydantic`
-> transitively).
-> **Files when resolved**: design.md §Build, plus a stub `flake.nix` we
-> can flesh out post-design.
+> Candidates: `withPackages`, `poetry2nix`, `uv2nix`, `buildPythonApplication`.
+
+**Resolution.** Adopt **`uv2nix`**, with a checked-in `uv.lock`. Reject
+the other three.
+
+### Why `uv2nix`
+
+- The T3-locked stack is **Python on `mcp==2.1.1`** (the v2-track SDK).
+- **nixpkgs only ships `mcp==1.29.0`** as of master on the date of
+  resolution. v1.x is the legacy-era SDK and is incompatible with the
+  2026-07-28 spec we locked at T1 (no `subscriptions/listen`, the
+  `initialize` handshake still present, no stateless posture helper).
+  Pulling v2 means consuming PyPI directly.
+- The v2 SDK has a transitive dependency on **`mcp-types`** that
+  nixpkgs **does not package**. So the `withPackages` + `overridePythonAttrs`
+  shape would mean **two** bespoke derivations (`mcp` override +
+  a hand-built `mcp-types`), drifting independently from upstream.
+- **`uv2nix`** (pyproject-nix/uv2nix, default branch `master`,
+  powered by `pyproject.nix`) ingests our `uv.lock` and overlays every
+  transitive on top of nixpkgs's Python set. One lockfile, one source
+  of truth, one override surface. The flake ends up looking like:
+
+```nix
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    pyproject-nix = { url = "github:pyproject-nix/pyproject.nix"; inputs.nixpkgs.follows = "nixpkgs"; };
+    uv2nix = { url = "github:pyproject-nix/uv2nix"; inputs.pyproject-nix.follows = "pyproject-nix"; };
+    nixpkgs-python = { url = "github:pyproject-nix/build-system-pkgs/uv2nix-extra"; inputs.uv2nix.follows = "uv2nix"; inputs.pyproject-nix.follows = "pyproject-nix"; inputs.nixpkgs.follows = "nixpkgs"; };
+  };
+  outputs = { self, nixpkgs, uv2nix, nixpkgs-python, ... }:
+    let
+      pkgs = import nixpkgs { system = "x86_64-linux"; };
+      workspace = uv2nix.lib.loadUvWorkspace { workspaceRoot = ./.; };
+      overlay = workspace.mkPyprojectOverlay { sourcePreference = pkgs.lib.mkForce "wheel"; };
+      pythonSet = pkgs.python311.overrideScope (nixpkgs-python.packagesFromRequirements ./requirements.txt ++ overlay);
+    in {
+      packages.x86_64-linux.default = pythonSet.mkVirtualEnv "mcp-silverbullet-env" {
+        mcp-silverbullet = [ "pyproject-runner" ];  # entry-point
+      };
+    };
+```
+
+  (Approximate, lifted from the `pyproject-nix/uv2nix` pattern; the
+  exact API is fixed when the stub `flake.nix` lands.)
+
+### Why not the other options
+
+| Option | Why rejected |
+|---|---|
+| `python311.withPackages (ps: [ ps.mcp ... ])` | Pins us to `mcp==1.29.0`, the wrong SDK for our spec. Skipping it breaks T3/T1. |
+| `poetry2nix` of a `poetry.lock` | Doubles lockfile formats alongside `uv.lock`. Twice the maintenance. |
+| `buildPythonApplication` w/ hand-built venv | Most code, most drift risk. `uv2nix` consumes the exact same lockfile, so this is strictly worse on the "off-the-shelf" axis. |
+| Skip the Nix shell entirely; just `uv run` | Breaks the standing preference ("one `flake.nix` owns dependencies"). `nix run`, `nix-direnv`, and home-manager service modules all need a flake. |
+
+### Standing-preference fit
+
+- **Off-the-shelf libraries**: `uv2nix`, `pyproject.nix` are the
+  standard Nix libraries for this exact task. We are not writing any
+  parser, builder, or transport — we're composing nixpkgs + uv2nix +
+  a uv.lock.
+- **Single `flake.nix`**: one flake at repo root, one pyproject.toml,
+  one uv.lock, one requirements.txt if we keep one for `mkVirtualEnv`.
+  That's the whole surface.
+
+### Dev shell and CI side (forward-looking)
+
+- The same `uv2nix` overlay produces `nix develop`, so `nix-direnv`
+  setups, `home-manager` modules, or NixOS modules wrapping the bridge
+  all line up.
+- Test fixtures (T7) can `import` the same `pythonSet` instead of
+  double-pinning — the SDK under test is whatever's in `uv.lock`,
+  not whatever's in CI's `pip install`.
+
+### Follow-ups (carryover to *Not yet specified*)
+
+- Wire the actual `flake.nix` stub (minimal shape: inputs, outputs,
+  `nix run`). Marked as a separate task ticket, not part of the design doc.
+- File a PR to nixpkgs upgrading `python3Packages.mcp` from v1.29.0 to
+  v2.x and adding `mcp-types`. Not blocking; nice-to-have to retire
+  the uv2nix machinery once nixpkgs catches up.
+
+**Sources:**
+
+- [NixOS nixpkgs — `pkgs/development/python-modules/mcp/default.nix`](https://github.com/NixOS/nixpkgs/blob/master/pkgs/development/python-modules/mcp/default.nix) (pins `mcp==1.29.0`).
+- [PyPI `mcp==2.1.1` — requires_python, requires_dist](https://pypi.org/project/mcp/2.1.1/) (`mcp-types==2.1.1` is a runtime dep).
+- [pyproject-nix/uv2nix](https://github.com/pyproject-nix/uv2nix) (default branch `master`, builds on `pyproject.nix`).
+- [pyproject-nix/pyproject.nix](https://github.com/pyproject-nix/pyproject.nix) (the underlying overlay lib).
+- [mcp python-sdk v2 — Authorization, Streamable HTTP, ASGI docs](https://github.com/modelcontextprotocol/python-sdk/tree/main/docs) (justifies why we want v2 even though nixpkgs ships v1).
 
 ### T6. Tunnel durability
 
@@ -277,10 +361,135 @@ never blocked on T1.
 
 ### T7. Test surface
 
+> **Status**: ✅ resolved
 > **Labels**: `wayfinder:research`
 > **Question**: How do we exercise the bridge end-to-end without Grok?
-> MCP Inspector CLI + a mock SB on `localhost:3010`? Custom vitest fixture?
-> Files when resolved: design.md §Testing.
+
+**Resolution.** Three layers, **all in `pytest`** with no Grok, no
+Inspector UI, no real SilverBullet process needed.
+
+### Layer 1 — in-memory unit tests on the handlers
+
+Connect the official SDK's `Client` straight to our `MCPServer` object
+(no HTTP, no port). This is the pattern on
+`mcp` python-sdk v2 docs/get-started/testing.md:
+
+```python
+@pytest.fixture
+async def client():
+    async with Client(mcp, raise_exceptions=True) as c:
+        yield c
+
+@pytest.mark.anyio
+async def test_read_page_returns_markdown(client):
+    r = await client.read_resource(ReadResourceArguments(uri="silverbullet://page/daily"))
+    assert isinstance(r.contents[0], TextResourceContents)
+    assert r.contents[0].text.startswith("# 2026-08-26")
+```
+
+Coverage of every tool with `httpx.MockTransport` shaping the SB
+backend. Fast — sub-100ms per test, no port. `Client(mcp)` is
+**era-neutral** so it automatically exercises the modern leg of our
+dual-era handler.
+
+### Layer 2 — HTTP integration on a real socket
+
+Spin the bridge up with `mcp.run(transport="streamable-http", ...)`
+inside an async fixture on a free port; point a `Client` at
+`f"http://127.0.0.1:{port}/mcp"`:
+
+```python
+@pytest.fixture
+async def http_bridge(unused_tcp_port_factory):
+    port = unused_tcp_port_factory()
+    t = asyncio.create_task(
+        asyncio.to_thread(
+            lambda: mcp.run(
+                transport="streamable-http",
+                host="127.0.0.1", port=port,
+                stateless_http=True,
+                transport_security=TransportSecurity(host="127.0.0.1"),
+            )
+        )
+    )
+    async with Client(f"http://127.0.0.1:{port}/mcp", raise_exceptions=True) as c:
+        yield c
+    t.cancel()
+```
+
+Covers whatever in-memory testing cannot: the `Authorization: Bearer`
+header, the `401 Unauthorized` + `WWW-Authenticate` response on bad
+tokens, the SDK's `/mcp` route and the `/.well-known/oauth-protected-resource/mcp`
+route being served, the `Accept: application/json, text/event-stream`
+header dance.
+
+### Layer 3 — SilverBullet client plumbing
+
+`httpx.MockTransport` for the bridge→SB hand:
+
+```python
+def test_write_page_sets_x_source_external():
+    transport = httpx.MockTransport(handler_for_expected_put)
+    sb = SilverBulletClient(base_url="http://sb.invalid", token="t", transport=transport)
+    sb.write_page("foo", "bar")
+    assert transport.calls[0].request.headers["X-Source"] == "external"
+```
+
+That covers the SB-side mechanics **without** spinning up a real SB.
+A full bridge-to-SB end-to-end is then composed in CI by:
+
+1. layer-2 fixture brings up the bridge,
+2. `httpx.MockTransport` substitutes for SB,
+3. `Client(http_bridge_url).call_tool("write_page", ...)` calls
+   through, the bridge validates the token, the mock answers,
+   assertions on `MockTransport.calls` check that we set
+   `X-Source: external` and the right `If-Match`.
+
+A **manual** layer 4 — `mcp dev server.py` in a terminal — stands
+in for the Inspector UI; it spawns our server as a subprocess and
+opens the Node-Inspector. Used for the 5-min "does it still work
+end-to-end" sanity check during dev. **Not** used in CI.
+
+### Rejected alternatives
+
+| Option | Why rejected |
+|---|---|
+| MCP Inspector as the test harness | It's a Node-UI subprocess (`mcp dev`), not deterministic, needs `npx` on PATH. Fine for ad-hoc. Not CI-friendly. |
+| Spin up a real SilverBullet server in CI | Pulls in `silverbullet-server` (Rust) build, plus a test fixture for its on-disk space format. Heavy and orthogonal to what we're shipping. The `httpx.MockTransport` layer covers the same surface cheaper. |
+| Custom `vitest`/`pytest-asyncio` HTTP mock at the `httpx` layer only | Loses Layer 1's zero-port in-memory path. Means every test pays a fixed setup cost. |
+
+### Test catalog (v1)
+
+| Tool / surface | Test |
+|---|---|
+| `read_page` | Layer 1, MockTransport returns `text/markdown` body |
+| `read_page` not-found | Layer 1, MockTransport returns `404`, tool result has `isError=True` and a recognizable message |
+| `write_page` creates | Layer 1, MockTransport records the PUT with `X-Source: external`, body matches |
+| `write_page` overwrite with `if_match="*"` | Layer 1, MockTransport returns `412`, tool result has `isError=True` |
+| `list_pages` with prefix | Layer 1, MockTransport returns `FileMeta[]`, fixture filters in Python |
+| Bearer auth: valid token | Layer 2, returns the page; verifies `WWW-Authenticate` is absent in 200 |
+| Bearer auth: missing token | Layer 2, `401` + `WWW-Authenticate: Bearer …` header present |
+| Bearer auth: wrong token | Layer 2, `401`, same `WWW-Authenticate` shape |
+| `/.well-known/oauth-protected-resource/mcp` | Layer 2, plain `httpx.AsyncClient` (no MCP), asserts `resource`, `authorization_servers`, `scopes_supported`, `bearer_methods_supported` |
+| Bridge → SB `X-Source: external` | Layer 3 + Layer 2 fixture |
+
+### Standing-preference fit
+
+- **Off-the-shelf libraries**: `pytest`, `pytest-asyncio`,
+  `inline-snapshot` (already a transitive test-dep of nixpkgs' `mcp`
+  derivation), `httpx.MockTransport`. We don't write a transport or
+  a fixture framework.
+- **Single `flake.nix`**: tests are part of the same `uv2nix`
+  virtualenv as runtime — same `pythonSet`, same `mkVirtualEnv` for
+  CI, same `requirements.txt`. No second lockfile, no "dev deps in
+  pip-tools, runtime in uv".
+
+**Sources:**
+
+- [mcp python-sdk v2 — Testing (in-memory Client)](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/testing.md).
+- [mcp python-sdk v2 — Client (`Client("http://...")`)](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/client/index.md).
+- [mcp python-sdk v2 — `raise_exceptions=True` semantics](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/testing.md#why-raise_exceptionstrue).
+- [httpx.MockTransport](https://www.python-httpx.org/advanced/transports/#mock-transport) for SB-side isolation.
 
 ### T8. License
 
