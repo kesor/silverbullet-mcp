@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "silverbullet": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "bearerToken": "!cat ~/.config/mcp-silverbullet/token",
+      "lifecycle": "lazy",
+      "protocolVersion": "auto",
+      "directTools": true
+    }
+  }
+}
