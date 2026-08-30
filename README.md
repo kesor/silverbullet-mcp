@@ -75,6 +75,39 @@ Inbound MCP and outbound SilverBullet share one bearer secret by default.
 
 If a quick tunnel URL rotates, the token stays; re-paste the new URL.
 
+## Use from a Pi coding agent session
+
+The repo ships with a project-local `.mcp.json` so a Pi session
+running in this checkout discovers the bridge automatically (via the
+`pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
+`nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
+`/reload` in Pi and the bridge's three tools — `read_page`,
+`write_page`, `list_pages` — register as direct Pi tools.
+
+The bearer token is read at HTTP-connect time via the `!command`
+syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so
+the secret stays out of the repo and out of Pi's process env. Generate
+it once:
+
+```bash
+python -c 'import secrets; print(secrets.token_hex(32))' \
+  > ~/.config/mcp-silverbullet/token
+chmod 600 ~/.config/mcp-silverbullet/token
+```
+
+Then start the bridge with that same token in its env:
+
+```bash
+export MCP_SILVERBULLET_TOKEN=$(cat ~/.config/mcp-silverbullet/token)
+export MCP_SILVERBULLET_SB_URL=http://127.0.0.1:63000  # or wherever SB listens
+export MCP_SILVERBULLET_SB_TOKEN=                      # empty if SB has no auth
+nix run .#mcp-silverbullet
+```
+
+The bridge is a side-car, not a daemon: it has to be running for the
+tools to work, and `lifecycle: lazy` in `.mcp.json` means Pi won't
+try to connect until the first tool call.
+
 ## Env vars
 
 | Variable | Default | Role |
