@@ -1158,6 +1158,164 @@ async def _search_pages(
     return results[:validated_limit]
 
 
+# --- T35 tool body (backlinks) ----------------------------------------
+
+
+# T35-specific wikilink regex. The module-level ``_WIKILINK_RE`` used
+# by the task-bullet helpers captures the same shape but with a *lazy*
+# negated-class match that prevents the regex engine from eating
+# ``[``/``]`` characters. T35's helper wants the same shape but
+# surfaces *every* match on the line (not just the first), and uses a
+# non-lazy class so the wire shape is well-defined when multiple
+# wikilinks appear on one line (rare but seen on index pages:
+# ``[[Foo]] [[Bar]] [[Baz]]``).
+_BACKLINK_WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+def _normalize_link_target(target: str) -> str:
+    """Canonicalize a wikilink target for backlink matching.
+
+    SB accepts four ways to spell the same target:
+    ``Projects/Foo``, ``Projects/Foo.md``, ``/Projects/Foo/``,
+    and ``/Projects/Foo.md``. After this normalization, all four
+    compare equal. The agent that queries
+    ``find_backlinks("Projects/Foo")`` matches every page that
+    links to any of the four spellings.
+
+    Strip order:
+
+    - Leading/trailing slashes (``/Projects/Foo/`` →
+      ``Projects/Foo``). SB treats the leading slash as the
+      space-root anchor; the canonical form has no anchor.
+    - Trailing ``.md`` (``Projects/Foo.md`` →
+      ``Projects/Foo``). SB stores pages as ``*.md`` on disk but
+      wikilink resolution happens against the page *name*, not
+      the file extension. The ``.md`` is an editor-only
+      convenience.
+    - Trailing whitespace. The bridge won't surface a target with
+      trailing whitespace in practice, but a defensive
+      ``strip()`` keeps the comparator robust against upstream
+      encoding drift.
+    - Empty result. A target that's empty *after* stripping (e.g.
+      ``target = ".md"``) collapses to ``""``. The T35 tool
+      surfaces a ``ToolError("target must not be empty")`` at
+      the boundary before this helper runs, so ``""`` here is
+      defense-in-depth rather than a user-visible branch.
+
+    The normalized form is what every wikilink target on every
+    line is compared against; the comparator is a plain string
+    ``==`` after both sides have been normalized. Case-sensitive
+    to match SB's page lookup (the v1 T6 / v1.2 T30 carry-forwards
+    document this — ``find_backlinks("Foo")`` does not match
+    ``[[foo]]``).
+    """
+    stripped = target.strip().strip("/")
+    if stripped.endswith(".md"):
+        stripped = stripped[: -len(".md")]
+    return stripped.strip("/")
+
+
+async def _find_backlinks(
+    space_root: Path, target: str
+) -> list[dict[str, object]]:
+    """Walk every ``*.md`` page and return references to ``target``.
+
+    Returns one entry per *line* containing at least one
+    matching wikilink. The wire shape mirrors
+    ``lidiaev/me-db``'s ``find_backlinks`` contract (the closest
+    v1.3 competitive-landscape input):
+
+    - ``file``: the relative path to the linking page (forward
+      slashes, ``Path.as_posix()`` shape — same as T12's name
+      field).
+    - ``line``: 1-indexed line number (matches the
+      ``pages_touching_topic`` / ``patch_page_lines``
+      conventions; an editor showing line N has line N here).
+    - ``text``: the stripped line text (the agent reads this
+      to see *how* the page links — same line that appears in
+      the editor).
+
+    Matching rules:
+
+    - A wikilink matches when its target (after
+      :func:`_normalize_link_target`) equals the query target
+      (after the same normalization). This is the only
+      comparator — no fuzzy match, no alias-aware ranking.
+    - Aliases (``[[target|alias]]``) match the bare ``target``
+      — the alias is the *display* text, not a different page.
+      The regex strips the alias before comparison; see the
+      ``alias_split`` block below.
+    - Self-links (``Projects/Foo`` containing
+      ``[[Projects/Foo]]``) are returned as one entry. Agents
+      that want to exclude self-links filter the result list
+      themselves — the bridge doesn't presume.
+    - Multiple matches on one line yield one entry (the line,
+      not each individual match); the agent that wants
+      per-match granularity calls ``rg`` themselves. Index
+      pages with ``[[Foo]] [[Bar]] [[Baz]]`` return one
+      ``BacklinkEntry`` per line, regardless of how many
+      wikilinks the line carries.
+    - No matches → ``[]`` (empty list, not a ``ToolError``).
+      The agent might be querying pre-emptively ("am I about
+      to break anything if I rename this page?") and a missing
+      target is a legitimate answer, not a failure.
+
+    The walker reuses :func:`_iter_md` (T11/T12) for the
+    ``*.md`` enumeration + hidden-directory skip + ``prefix``
+    guard. T35 doesn't take a ``prefix`` argument (the link
+    graph is space-wide; scoping a backlink search by prefix
+    would silently exclude cross-prefix references that the
+    agent probably wants to see). A future T35a could add an
+    optional ``prefix?`` knob if the use case appears.
+
+    Wire shape: each entry is a dict with ``file`` (str),
+    ``line`` (int), ``text`` (str). The MCP SDK serializes
+    dicts to ``structured_content``; an agent reads the list
+    via ``result["result"]``.
+    """
+    normalized = _normalize_link_target(target)
+    if not normalized:
+        # Defense-in-depth: the tool handler raises upfront,
+        # but a future caller that bypasses the handler still
+        # gets a sensible result.
+        return []
+    results: list[dict[str, object]] = []
+    for path, name in _iter_md(space_root, prefix=""):
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # Skip unreadable pages silently (a binary file
+            # with a ``.md`` extension, a permissions error,
+            # a non-UTF-8 encoding); the walker is best-effort
+            # and a single bad page shouldn't abort the scan.
+            # This matches the v1 T11 / T12 walker's stance
+            # on the same error class.
+            continue
+        for line_idx, raw_line in enumerate(body.splitlines(), start=1):
+            for match in _BACKLINK_WIKILINK_RE.finditer(raw_line):
+                link_target = match.group(1)
+                # Strip alias: ``Foo|read the foo`` → ``Foo``.
+                pipe_idx = link_target.find("|")
+                if pipe_idx >= 0:
+                    link_target = link_target[:pipe_idx]
+                if _normalize_link_target(link_target) == normalized:
+                    # One entry per matching line, not per
+                    # matching wikilink (multiple matches on
+                    # one line collapse to one entry). The
+                    # ``break`` exits the inner ``for match``
+                    # loop; the outer ``for line_idx`` loop
+                    # moves on to the next line.
+                    results.append(
+                        {
+                            "file": name,
+                            "line": line_idx,
+                            "text": raw_line.strip(),
+                        }
+                    )
+                    break
+    return results
+
+
 # --- T29 tool body (space-walk variant) -------------------------------
 
 
@@ -1220,12 +1378,13 @@ def register_journal_tools(
     mcp: MCPServer,
     config: JournalConfig,
 ) -> None:
-    """Register the five journal tools iff the gate is on.
+    """Register the six journal tools iff the gate is on.
 
     ``journal_histogram`` (T11) / ``tag_summary`` (T11) /
     ``recent_pages`` (T11) / ``pages_touching_topic`` (T12) /
     ``search_pages`` (T34 — bounded wrapper over T12 with a
-    ``limit`` knob). When the gate is off, none of the five
+    ``limit`` knob) / ``find_backlinks`` (T35 — wikilink-target
+    backlink scan). When the gate is off, none of the six
     is registered. Called from :func:`mcp_silverbullet.server.build_mcp`; the caller
     passes the already-resolved :class:`JournalConfig` so this
     function does no env parsing and is pure against its inputs. When
@@ -1328,6 +1487,45 @@ def register_journal_tools(
         _normalize_query(query)
         _validate_prefix(prefix)
         return await _search_pages(root, query, prefix, limit)
+
+    @mcp.tool(
+        title="Find backlinks",
+        description=(
+            "Scan every `*.md` page under the SB space directory "
+            "for wikilink references to `target`. Returns one "
+            "entry per matching line with `file` (relative path "
+            "to the linking page), `line` (1-indexed line "
+            "number, matching editor conventions), and `text` "
+            "(the stripped line text). `target` normalization: "
+            "leading/trailing slashes and a trailing `.md` are "
+            "stripped before matching, so `Projects/Foo`, "
+            "`Projects/Foo.md`, and `/Projects/Foo/` all match "
+            "the same canonical target. Aliases "
+            "(`[[target|alias]]`) match the bare target. "
+            "Self-links are included (the agent filters them "
+            "client-side). Empty `target` raises `ToolError` "
+            "upfront, before any FS walk. No matches returns "
+            "`[]`, not a `ToolError` (the agent might be "
+            "querying pre-emptively). The walk reuses the "
+            "T11/T12 `_iter_md` machinery for `*.md` "
+            "enumeration + hidden-directory skip; journal-"
+            "gated like the rest of the discovery surface."
+        ),
+    )
+    async def find_backlinks(
+        target: str,
+    ) -> list[dict[str, object]]:
+        # Validate upfront so the agent sees the error before
+        # any FS walk. An empty / whitespace-only target is
+        # almost certainly a caller bug — surface it loudly
+        # rather than returning the empty ``[]`` silently
+        # (which would mask the typo and waste the agent's
+        # time on a no-op rewrite). Mirrors the
+        # ``text must not be empty`` / ``find must not be empty``
+        # guards on the write tools.
+        if not target or not target.strip():
+            raise ToolError("target must not be empty")
+        return await _find_backlinks(root, target)
 
 
 __all__ = [
