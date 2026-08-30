@@ -31,6 +31,7 @@ from mcp_silverbullet.sb_client import (
     PreconditionFailed,
     SBClient,
     ServerError,
+    synthesize_etag,
 )
 
 
@@ -402,6 +403,226 @@ async def test_write_page_raises_server_error_on_5xx() -> None:
     async with _client(handler) as sb:
         with pytest.raises(ServerError):
             await sb.write_page("index", "body")
+
+
+# --- synthesize_etag (T31a) --------------------------------------------
+
+
+def test_synthesize_etag_returns_dashed_form_when_both_fields_present() -> None:
+    """``synthesize_etag(ms, bytes)`` returns ``"{ms}-{bytes}"`` for the normal case.
+
+    T31a: when SB strips the ``ETag`` response header (the v1.3
+    concurrency-blocking fact on this dev box, surfaced by T31's
+    live verification), the bridge falls back to a value derived
+    from the headers SB *does* send. The standard form is
+    ``"{last_modified_ms}-{size_bytes}"`` — both fields are
+    populated by SB on every PUT response on this build.
+    """
+    assert synthesize_etag(1700000000123, 42) == '"1700000000123-42"'
+
+
+def test_synthesize_etag_returns_ms_only_when_size_missing() -> None:
+    """When ``size_bytes`` is missing, fall back to ``"{ms}"`` alone.
+
+    A proxy that strips ``X-Content-Length`` but keeps
+    ``X-Last-Modified`` still gives the bridge a value to thread
+    into ``If-Match``; it's just weaker (two writes in the same
+    epoch-ms window with different bodies won't be distinguished).
+    The agent loses precision, not the concurrency primitive.
+    """
+    assert synthesize_etag(1700000000123, None) == '"1700000000123"'
+
+
+def test_synthesize_etag_returns_none_when_both_fields_missing() -> None:
+    """When both headers are stripped, no fallback — ``etag`` stays ``None``.
+
+    Mirrors the pre-T31a fully-stripped stance: if SB strips both
+    ``X-Last-Modified`` and ``X-Content-Length``, the bridge has
+    nothing to synthesize from and the agent loses the concurrency
+    primitive (same as a v1.2 SB that honored ``ETag``).
+    """
+    assert synthesize_etag(None, None) is None
+
+
+def test_synthesize_etag_returns_none_when_only_size_present() -> None:
+    """``size_bytes`` without a timestamp can't anchor the value to a write.
+
+    The synthetic etag must change when the page is rewritten;
+    without ``X-Last-Modified`` we have no anchor to that change,
+    so the value would be unstable across reads of the same body.
+    Returning ``None`` (rather than ``"-{size_bytes}"``) is the
+    honest answer: the bridge has no way to distinguish a stale
+    read from a fresh one, so it surfaces no value at all.
+    """
+    assert synthesize_etag(None, 42) is None
+
+
+@pytest.mark.asyncio
+async def test_write_page_meta_etag_synthesized_when_etag_header_missing() -> None:
+    """PUT response without ``ETag`` surfaces a synthesized ``etag`` from X-* headers.
+
+    T31's live verification surfaced the second of the two
+    v1.3-blocking SB facts: PUT responses on this SB build carry
+    no ``ETag`` header. The bridge falls back to ``"{ms}-{bytes}"``
+    so an agent that does
+    ``read_page → write_page(if_match=read.etag)`` has a value to
+    thread. This is the bridge-side proof that the v1.2
+    concurrency story is now physically plumbed correctly on
+    SBs that strip ``ETag`` (T31b adds the post-write verification
+    that closes the operational gap when SB also ignores
+    ``If-Match``).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No ``ETag`` — emulate the SB build that T31 verified.
+        return httpx.Response(
+            200,
+            headers={
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "10",
+            },
+        )
+
+    async with _client(handler) as sb:
+        meta = await sb.write_page("index", "# new body")
+
+    # Synthesized form: ``"{ms}-{bytes}"`` with surrounding quotes
+    # (matches SB's real ETag shape so a future SB build that
+    # honors the header doesn't see a malformed value).
+    assert meta.etag == '"1700000000123-10"'
+    assert meta.last_modified_ms == 1700000000123
+    assert meta.size_bytes == 10
+
+
+@pytest.mark.asyncio
+async def test_read_page_meta_etag_synthesized_when_etag_header_missing() -> None:
+    """GET response without ``ETag`` also synthesizes (read path parity).
+
+    The fallback lives in ``_meta_from_response`` which every
+    code path shares (``read_page`` / ``write_page`` /
+    ``read_page_meta`` / ``delete_page``). On SBs that strip
+    ``ETag`` from PUT *and* GET, the synthesized value is
+    identical on both sides — the same ``"{ms}-{bytes}"`` string
+    — so an agent's ``read.etag`` flows into ``write(if_match=...)``
+    without a translation step.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "4",
+            },
+        )
+
+    async with _client(handler) as sb:
+        page = await sb.read_page("index")
+
+    assert page.etag == '"1700000000123-4"'
+
+
+@pytest.mark.asyncio
+async def test_synthesized_etag_is_stable_across_re_reads_of_same_body() -> None:
+    """Same body + same mtime → same synthesized etag (the stability invariant).
+
+    Two reads of an unchanged page produce identical synthesized
+    etags — the precondition an agent needs to detect *no* edit
+    between read and write. If the bridge synthesized a value that
+    drifted across reads of the same body, every
+    ``write(if_match=read.etag)`` would 412-equivalent-fail even
+    on uncontested writes, and the concurrency primitive would be
+    useless. This test guards the stability invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "4",
+            },
+        )
+
+    async with _client(handler) as sb:
+        first = await sb.read_page("index")
+        second = await sb.read_page("index")
+
+    assert first.etag == second.etag == '"1700000000123-4"'
+
+
+@pytest.mark.asyncio
+async def test_synthesized_etag_differs_when_body_or_mtime_changes() -> None:
+    """Different body or mtime → different synthesized etag (the drift invariant).
+
+    The other half of the stability contract: a write that
+    actually changed the page must produce a synthesized etag
+    that doesn't match the pre-write value, so an agent that
+    does ``read → write(if_match=read.etag)`` sees a mismatch
+    after a *concurrent* write. This test emulates the
+    read-then-write-then-read sequence on a mutating response and
+    asserts the post-write etag is a different string.
+    """
+    mtime_counter = {"ms": 1700000000000}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Each request advances mtime; this emulates two writes
+        # happening at different moments. The body length stays
+        # the same, so the only signal is the timestamp.
+        mtime_counter["ms"] += 1000
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Last-Modified": str(mtime_counter["ms"]),
+                "X-Content-Length": "4",
+            },
+        )
+
+    async with _client(handler) as sb:
+        first = await sb.read_page("index")
+        # Simulate the *agent's* read (matches what the SB saw the
+        # last time the handler ran) and then a *concurrent write*
+        # (handler advances mtime on the next call).
+        concurrent_write = await sb.write_page("index", "body")
+        post_read = await sb.read_page("index")
+
+    # All three etags are synthesized from the same fields.
+    assert first.etag is not None
+    assert concurrent_write.etag is not None
+    assert post_read.etag is not None
+    # The concurrent write's etag drifts from the pre-read etag.
+    assert concurrent_write.etag != first.etag
+    # The post-write read also drifts from the pre-read etag (the
+    # signal T31b's verification path uses to detect the race).
+    assert post_read.etag != first.etag
+
+
+@pytest.mark.asyncio
+async def test_real_etag_wins_over_synthesis_when_both_present() -> None:
+    """When SB sends both ``ETag`` and ``X-*``, the real etag is forwarded.
+
+    Pre-T31a behavior is preserved on SBs that *do* emit an
+    ``ETag``: the synthesized value is never computed. The
+    fallback is strictly opt-in (per-response, only when
+    ``ETag`` is missing); on any SB build that honors the header,
+    the agent still gets a real etag string. Locks the
+    "fallback is invisible when not needed" invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "ETag": '"real-etag"',
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "4",
+            },
+        )
+
+    async with _client(handler) as sb:
+        page = await sb.read_page("index")
+
+    assert page.etag == '"real-etag"'
 
 
 # --- delete_page -------------------------------------------------------

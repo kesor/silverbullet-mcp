@@ -619,12 +619,104 @@ def _meta_from_response(
     """
     return PageMeta(
         name=name,
-        etag=response.headers.get("ETag"),
+        etag=_etag_from_response(response),
         size_bytes=_parse_int_header(response.headers.get("X-Content-Length")),
         last_modified_ms=_parse_int_header(response.headers.get("X-Last-Modified")),
         created_ms=_parse_int_header(response.headers.get("X-Created")),
         body=body,
     )
+
+
+def _etag_from_response(response: httpx.Response) -> str | None:
+    """Read the ``ETag`` response header, falling back to a synthesized value.
+
+    T31's live verification surfaced the v1.3 concurrency-blocking
+    fact: SB on this dev box returns no ``ETag`` header on
+    ``PUT /.fs/{name}``. Without a fallback the read-side envelope
+    surfaces ``etag=None`` on every PUT, and any caller that
+    threads ``read().etag`` into ``write(if_match=<read_etag>)``
+    threads ``None`` — no precondition at all. The fix (T31a):
+    synthesize a stable etag from the headers SB *does* return.
+
+    The synthesized form is ``"{last_modified_ms}-{size_bytes}"`` —
+    both fields are populated by SB on every PUT response on this
+    build (T31's resolution recorded the fact), and the form
+    matches SB's real ETag header shape (a string with surrounding
+    quotes, e.g. ``"<...>"``). Stability: two writes with the
+    same body produce the same synthesized etag (same mtime
+    window, same byte count); two writes with different bodies or
+    different mtimes produce different synthesized etags. That's
+    the entire concurrency primitive the agent needs — detect
+    that *something* changed between read and write, not what
+    specifically changed.
+
+    Fallback chain when ``ETag`` is missing:
+
+    - ``X-Last-Modified`` + ``X-Content-Length`` both present →
+      ``"{ms}-{bytes}"`` (the normal case on this SB build).
+    - ``X-Last-Modified`` present but ``X-Content-Length``
+      missing / malformed → ``"{ms}"`` alone (still changes when
+      the page is rewritten, but won't distinguish two writes in
+      the same epoch-ms window with different bodies).
+    - ``X-Last-Modified`` missing → ``None`` (no fallback
+      available; the agent loses the concurrency primitive, same
+      as on a fully-stripped response pre-T31a).
+
+    The fallback never round-trips to SB — it's a local
+    derivation from headers already on the response. The agent
+    sees the same envelope shape regardless of whether the etag
+    is real or synthesized (no separate flag surfaced; a future
+    caller that wants the distinction can compare the etag
+    against an explicit ``"synthetic:"`` prefix if it ever
+    matters, but no ticket in v1.3 asks for that).
+    """
+    raw = response.headers.get("ETag")
+    if raw:
+        return raw
+    last_modified_ms = _parse_int_header(
+        response.headers.get("X-Last-Modified")
+    )
+    size_bytes = _parse_int_header(
+        response.headers.get("X-Content-Length")
+    )
+    return synthesize_etag(last_modified_ms, size_bytes)
+
+
+def synthesize_etag(
+    last_modified_ms: int | None, size_bytes: int | None
+) -> str | None:
+    """Build the synthetic-etag fallback string from a PUT response's
+    ``X-Last-Modified`` + ``X-Content-Length`` pair.
+
+    Exposed at module scope so :mod:`server` can construct the same
+    value when comparing two reads against each other (the T31b
+    post-write verification path compares ``read_post.etag`` against
+    ``expected_etag``; if both are synthesized, the comparison uses
+    the same function on both sides and they match by construction
+    when the body and mtime haven't drifted).
+
+    The wire shape is ``"{last_modified_ms}-{size_bytes}"`` when
+    both fields are present, ``"{last_modified_ms}"`` alone when
+    only the timestamp is populated, and ``None`` when neither is
+    available. The quotes around the synthesized value mirror SB's
+    own ETag header (``"<...>"``); they're not load-bearing for
+    SB-on-this-build (which ignores ``If-Match`` outright per
+    T31's resolution) but they keep the value shape
+    indistinguishable from a real ETag, which matters on any
+    future SB build that *does* honor the header.
+
+    ``size_bytes`` alone (no timestamp) returns ``None``: a
+    body-length-derived etag would be unstable across reads of the
+    same body (an SB that doesn't emit ``X-Last-Modified`` can't
+    tell the agent *when* a write happened, so the agent can't
+    tell a stale read from a fresh one). Better to surface no
+    value than a value that's silently wrong.
+    """
+    if last_modified_ms is None:
+        return None
+    if size_bytes is None:
+        return f'"{last_modified_ms}"'
+    return f'"{last_modified_ms}-{size_bytes}"'
 
 
 def _page_meta_from_list_item(item: dict[str, object]) -> PageMeta:
