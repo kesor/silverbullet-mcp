@@ -315,10 +315,26 @@ async def serve(settings: Settings | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = settings if settings is not None else load_settings()
-    logging.getLogger().setLevel(settings.log_level)
-    logging.getLogger("mcp_silverbullet").setLevel(settings.log_level)
-    logging.getLogger("uvicorn").setLevel(settings.log_level)
-    logging.getLogger("uvicorn.error").setLevel(settings.log_level)
+    if settings.log_level == "DEBUG":
+        # Selective DEBUG: bridge + protocol + uvicorn, but
+        # leave sse_starlette / httpx2 / hpack / h11 at WARNING
+        # so the journal doesn't drown in chunk frames and
+        # outbound SB GETs. The intent is "I want enough
+        # signal to diagnose my dev box", not "log every byte
+        # of every chunk". Operators that need deeper traces
+        # can still flip individual loggers via env.
+        logging.getLogger().setLevel(logging.DEBUG)
+        for name in (
+            "mcp_silverbullet",
+            "mcp.server",
+            "mcp.server.lowlevel",
+            "mcp.server.mcpserver",
+            "uvicorn",
+            "uvicorn.error",
+        ):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(settings.log_level)
     if settings.log_level == "DEBUG":
         install_http_debug_hooks()
         logging.info(
