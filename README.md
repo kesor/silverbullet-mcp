@@ -11,7 +11,7 @@ v1.2 map (agent-facing QOL + bullet primitives, one open ticket after T23+T24+T2
 
 ## What it exposes
 
-Ten tools and one resource template:
+Eleven tools and one resource template:
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.

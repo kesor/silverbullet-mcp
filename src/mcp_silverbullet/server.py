@@ -500,8 +500,13 @@ def build_mcp(
         Already-resolved journal gate config. ``None`` means the gate
         is off (no journal tools registered). When the gate is on,
         the bridge registers the four journal-surface tools in
-        addition to the ten ``/.fs``-backed tools and the resource
-        template; when off, only the latter are exposed. Resolved by
+        addition to the eleven ``/.fs``-backed + bullet-primitive
+        tools (``read_page`` / ``page_exists`` / ``write_page`` /
+        ``delete_page`` / ``append_to_page`` /
+        ``patch_page_lines`` / ``patch_page_replace`` /
+        ``move_page`` / ``list_pages`` / ``diff_pages`` /
+        ``list_tasks``) and the resource template; when off, only
+        the latter are exposed. Resolved by
         :func:`mcp_silverbullet.main.load_settings` from the two
         ``MCP_SILVERBULLET_JOURNAL_*`` env vars; tests construct one
         directly.
@@ -585,11 +590,11 @@ def register_tools(
     hydrate_etags: bool = False,
     journal_root: Path | None = None,
 ) -> None:
-    """Attach the ten ``/.fs``-backed tools, the bullet primitives, and one resource template to ``mcp``.
+    """Attach the eleven ``/.fs``-backed + bullet-primitive tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
-    are decorators that take the function; eight of the ten tool
+    are decorators that take the function; eight of the eleven tool
     handlers wrap their ``sb_client`` call in
     :func:`_translate_sb_errors`, which maps SB exceptions to
     :exc:`ToolError` per the design doc's status-code mapping.

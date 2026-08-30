@@ -475,6 +475,66 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     await session.call_tool(
                         "delete_page", {"name": diff_target}
                     )
+
+                    # ``list_tasks`` (T29) round-trip against live SB:
+                    # overwrite the marker with a body that has
+                    # checkbox bullets (one addressable with a
+                    # wikilink ref, one non-addressable, one in the
+                    # ``[X]`` cancelled state), then list tasks
+                    # and assert the wire shape matches the
+                    # Layer-1 contract — one entry per bullet,
+                    # ``name`` echoes the page name, ``state`` is
+                    # the literal checkbox character, ``ref`` is the
+                    # wikilink target (or ``None`` for the non-
+                    # addressable bullet), and ``line`` is the
+                    # 1-indexed editor line. The ``list_tasks`` live
+                    # round-trip is structurally identical to the
+                    # ``read_page`` round-trip (one GET per page)
+                    # plus the parser — so a green ``read_page``
+                    # round-trip plus a green Layer-1
+                    # ``list_tasks`` test is a strong live-SB
+                    # signal; this block confirms the parser
+                    # handles the real SB's file encoding and
+                    # bullet rendering in the wild.
+                    bullet_body = (
+                        "hello from T7 live e2e\n"
+                        "# Tasks\n"
+                        "- [ ] first task [[FirstTask]]\n"
+                        "- [x] done task\n"
+                        "- [X] cancelled task\n"
+                        "- [ ] non-addressable\n"
+                    )
+                    await session.call_tool(
+                        "write_page",
+                        {"name": MARKER, "content": bullet_body},
+                    )
+                    listed_tasks = await session.call_tool(
+                        "list_tasks", {"page": MARKER}
+                    )
+                    assert listed_tasks.is_error is False, listed_tasks
+                    tasks_payload = (
+                        listed_tasks.structured_content or {}
+                    ).get("result", [])
+                    # Three of the four bullets have addressable
+                    # states: todo / done / cancelled. The fourth
+                    # (``non-addressable``) is also todo, just
+                    # without a wikilink ref.
+                    assert [t["state"] for t in tasks_payload] == [
+                        " ", "x", "X", " "
+                    ]
+                    assert [t["ref"] for t in tasks_payload] == [
+                        "FirstTask", None, None, None
+                    ]
+                    # ``name`` echoes the page name (parallel
+                    # with the space-walk form's per-row ``name``)
+                    # and ``line`` is 1-indexed against the full
+                    # body. The first task is on editor line 2
+                    # (line 1 is the prose header). We don't
+                    # pin the rest of the line numbers — a future
+                    # test that adds a body line above the
+                    # bullets will shift them.
+                    assert all(t["name"] == MARKER for t in tasks_payload)
+                    assert tasks_payload[0]["line"] == 2
     finally:
         server_task.cancel()
         with suppress(asyncio.CancelledError):
