@@ -22,6 +22,9 @@ for the T3/T4/T10 decisions this implements.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+
 import httpx2 as httpx
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver.exceptions import (
@@ -52,9 +55,53 @@ from mcp_silverbullet.verifier import StaticTokenVerifier
 # dance), so the bridge is its own issuer — honest about what we are.
 _DEFAULT_RESOURCE_URL = "http://127.0.0.1:8000/mcp"
 
-# Body limit printed verbatim into the ToolError; matches the SDK's
-# ``DEFAULT_MAX_REQUEST_BODY_SIZE`` (4 MiB) and ``sb_client._BODY_LIMIT_BYTES``.
+# Body limit printed verbatim into the 413 ``ToolError``; matches the
+# SDK's ``DEFAULT_MAX_REQUEST_BODY_SIZE`` (4 MiB) and
+# ``sb_client._BODY_LIMIT_BYTES``. Used by :func:`_translate_sb_errors`
+# so the wording is in exactly one place — future tightening of the
+# limit (or the SDK default drifting) is a single-line change.
 _BODY_LIMIT_MIB = 4
+
+
+@contextlib.asynccontextmanager
+async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
+    """Wrap a single ``sb_client`` call, mapping its exceptions to ``ToolError``.
+
+    Every tool handler (``read_page``, ``write_page``, ``delete_page``,
+    ``list_pages``, ``append_to_page``) closes over the same
+    :class:`SBClient` and surfaces the same five exception types with
+    the same wording from ``docs/design.md`` § Tools § Status-code
+    mapping. Factoring the translation into this async context
+    manager keeps the wording in one place — a future tightening of
+    a code path (e.g. adding ``403`` → ``ToolError("forbidden")``)
+    is a single-line change.
+
+    The 404 wording needs ``name`` (the page the caller asked for)
+    rather than the URL the SB request hit — callers care about
+    *which* page was missing, not the request's full URL. Tools
+    that target a single page (``read_page``, ``write_page``,
+    ``delete_page``, ``append_to_page``) pass ``name``; ``list_pages``
+    passes an empty string (and doesn't actually raise ``PageNotFound``
+    on its current code path, so the wording never surfaces there).
+
+    Python's ``except`` only catches exceptions actually raised in
+    the wrapped block, so it's safe to list all five clauses on
+    every handler: ``read_page`` (a GET) won't raise
+    ``PreconditionFailed`` or ``BodyTooLarge``, so those clauses
+    never fire there; ``list_pages`` likewise.
+    """
+    try:
+        yield
+    except PageNotFound as exc:
+        raise ToolError(f"page not found: {name}") from exc
+    except PreconditionFailed as exc:
+        raise ToolError("precondition failed; check if_match/if_none_match") from exc
+    except BodyTooLarge as exc:
+        raise ToolError(f"body too large: limit is {_BODY_LIMIT_MIB} MiB") from exc
+    except ServerError as exc:
+        raise ToolError(str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise ToolError("silverbullet request timed out") from exc
 
 
 def build_mcp(
@@ -145,14 +192,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         ),
     )
     async def read_page(name: str) -> str:
-        try:
+        async with _translate_sb_errors(name):
             return await sb_client.read_page(name)
-        except PageNotFound as exc:
-            raise ToolError(f"page not found: {name}") from exc
-        except ServerError as exc:
-            raise ToolError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise ToolError("silverbullet request timed out") from exc
 
     @mcp.tool(
         title="Write page",
@@ -168,22 +209,10 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         content: str,
         if_match: str | None = None,
     ) -> str | None:
-        try:
+        async with _translate_sb_errors(name):
             etag = await sb_client.write_page(
                 name, content, if_match=if_match
             )
-        except PageNotFound as exc:
-            raise ToolError(f"page not found: {name}") from exc
-        except PreconditionFailed as exc:
-            raise ToolError("precondition failed; check if_match/if_none_match") from exc
-        except BodyTooLarge as exc:
-            raise ToolError(
-                f"body too large: limit is {_BODY_LIMIT_MIB} MiB"
-            ) from exc
-        except ServerError as exc:
-            raise ToolError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise ToolError("silverbullet request timed out") from exc
         # ``write_page`` returns ``None`` when the SB response didn't
         # carry an ETag (older or proxy-stripped); surface that as the
         # JSON ``null`` rather than mangling the type.
@@ -204,16 +233,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         name: str,
         if_match: str | None = None,
     ) -> str | None:
-        try:
+        async with _translate_sb_errors(name):
             return await sb_client.delete_page(name, if_match=if_match)
-        except PageNotFound as exc:
-            raise ToolError(f"page not found: {name}") from exc
-        except PreconditionFailed as exc:
-            raise ToolError("precondition failed; check if_match/if_none_match") from exc
-        except ServerError as exc:
-            raise ToolError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise ToolError("silverbullet request timed out") from exc
 
     @mcp.tool(
         title="List pages",
@@ -224,12 +245,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         ),
     )
     async def list_pages(prefix: str = "") -> list[dict[str, str | None]]:
-        try:
+        async with _translate_sb_errors(""):
             metas = await sb_client.list_pages()
-        except ServerError as exc:
-            raise ToolError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise ToolError("silverbullet request timed out") from exc
         result: list[dict[str, str | None]] = [
             {"name": m.name, "etag": m.etag} for m in metas
         ]
