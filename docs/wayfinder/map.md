@@ -28,9 +28,8 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
 ### 🏁 Status: in flight.
 
-Five of eight tickets resolved (T1–T5). Frontier is T6 (operator
-smoke run + README), T7 (live-SB end-to-end test), T8 (write-envelope
-fog).
+Six of eight tickets resolved (T1–T6). Frontier is T7 (live-SB
+end-to-end test) and T8 (write-envelope fog).
 
 ## Notes
 
@@ -90,6 +89,7 @@ fog).
 - [T3. `sb_client.py` (httpx adapter for /.fs)](#t3-sb_clientpy-httpx-adapter-for-fs) (commit `de944`): outbound bridge half — `SBClient` with `read_page`/`write_page`/`list_pages` against SB's `/.fs/...`, typed exceptions (`PageNotFound`, `PreconditionFailed`, `BodyTooLarge`, `ServerError`) per the § Tools status-code table, `FileMeta` dataclass (name + etag only), `write_page` PUT carries `X-Source: external` + `X-Permission: rw` + explicit `Content-Type: text/markdown` (httpx2 doesn't auto-set it for `content=str`); `If-Match` / `If-None-Match: *` both wired, `if_match` wins if both are passed. 16 Layer-3 tests under `httpx.MockTransport` (no real SB), all green in 0.07s; T1 smoke unbroken. Write-envelope fog (T8) deliberately not resolved here — `write_page` only sends the two headers the design doc requires, the real-write attempt is what decides the rest.
 - [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
 - [T5. HTTP integration tests (auth + discovery doc)](#t5-http-integration-tests-auth--discovery-doc) (commit `53ae8`): 5 Layer-2 tests in `tests/test_http_auth.py` exercising the bridge as a real ASGI app via `httpx.ASGITransport(app=streamable_http_app(host="bridge.test"))` + `app.router.lifespan_context(app)` (drives the SDK's `StreamableHTTPSessionManager.run()` since `ASGITransport` doesn't speak Starlette's lifespan protocol). Covers: POST `/mcp` no-token → 401 + `WWW-Authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://bridge.test/.well-known/oauth-protected-resource/mcp"`; POST `/mcp` wrong-token → identical shape (no header-vs-token probe leak); GET `/.well-known/oauth-protected-resource/mcp` (no auth) → 200 + RFC 9728 doc with `resource=<resource_url>`, `authorization_servers=[<resource_url>]` (v1 has no separate authz server), `bearer_methods_supported=["header"]`, `scopes_supported` omitted (`AuthSettings.required_scopes=None`, stripped by `PydanticJSONResponse.render`); POST `/mcp` with auth but `Accept: text/plain` → 406 ("Not Acceptable: Client must accept both application/json and text/event-stream"); end-to-end `streamable_http_client` + `ClientSession` initialize → list_tools (`['list_pages', 'read_page', 'write_page']`) → `call_tool read_page` roundtrip against a mocked SB. ASGI transport vs the ticket's literal "uvicorn on a free port": same wire path (every middleware, header, status code, body shape) minus the TCP stack — fast, deterministic, no port flake. The real-port path is exercised at T7 against the live SilverBullet. 5 new tests in 0.94s; 36 tests total green; `nix flake check` green.
+- [T6. Operator smoke run + README](#t6-operator-smoke-run--readme): `main.py` boots `SBClient` + `build_mcp` + `run_streamable_http_async`; `flake.nix` exposes `apps.mcp-silverbullet`; README documents boot order. Live smoke against SB `127.0.0.1:63000` (no SB auth): write_page + read_page roundtrip OK; list_pages → ToolError `silverbullet error: 307` because `GET /.fs` redirects to `/` on this SB. `mcp` CLI extra not installed; walkthrough used `ClientSession` + `streamable_http_client` instead of `mcp dev`.
 
 ## Tickets
 
@@ -249,6 +249,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Labels**: `wayfinder:task`
 > **Type**: AFK (agent runs it locally and reports; no human in the
 > loop)
+> **Assignee**: pi (claimed 2026-08-27, resolved same day)
+> **Status**: ✅ resolved
 > **Question**: Run `nix run .#mcp-silverbullet` against the running
 > SilverBullet on `127.0.0.1:63000`, point `mcp dev` at it, manually
 > exercise `read_page` / `write_page` / `list_pages` (create one
@@ -262,6 +264,27 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > references `docs/design.md` for the architectural why.
 > **Blocks on**: T2.
 > **Unblocks**: (none — this is the operator-facing milestone).
+> **Resolution**: Boot path in `src/mcp_silverbullet/main.py`
+> (`load_settings` + `serve`). Env contract: required
+> `MCP_SILVERBULLET_TOKEN`; `MCP_SILVERBULLET_SB_URL` default
+> `http://127.0.0.1:3000`; `MCP_SILVERBULLET_SB_TOKEN` defaults to
+> the inbound token, empty string omits `Authorization` (this
+> dev-box SB has no auth). `MCP_SILVERBULLET_RESOURCE_URL` defaults
+> to `http://{host}:{port}/mcp`. `MCP_SILVERBULLET_ALLOWED_HOSTS`
+> comma-list becomes `TransportSecuritySettings.allowed_hosts`.
+> `flake.nix` `apps.default` / `apps.mcp-silverbullet` point at the
+> venv console script. README boot order + env table.
+> Smoke (venv, port 18000, SB `127.0.0.1:63000`, empty SB token):
+> initialize → tools `[list_pages, read_page, write_page]` →
+> `write_page e2e-mcp-silverbullet-t6.md` OK → `read_page` returned
+> `hello from T6 smoke` → `list_pages prefix=e2e-mcp` ToolError
+> `silverbullet error: 307` (`GET /.fs` 307 to `/`; `GET /.fs/{name}`
+> and `PUT`/`DELETE` work). Page deleted via `DELETE /.fs/...` (200).
+> `mcp` CLI extra (`mcp[cli]`) is not in the lockfile; walkthrough
+> used SDK `ClientSession` over Streamable HTTP, same wire as
+> `mcp dev`. 4 new tests in `tests/test_main_settings.py`; 40 tests
+> green. T7 should skip or soften `list_pages` until the list
+> endpoint is mapped on this SB.
 
 ---
 
@@ -331,10 +354,13 @@ file; "blocking" is rendered by ticket ordering and an explicit
 - Promoting `TransportSecuritySettings` configuration from the
   loopback auto-default to an explicit operator-tunable shape
   (allowed_hosts / allowed_origins lists) for tunnel-fronted
-  deployments. Standing-preference note in the map already mentions
-  `MCP_SILVERBULLET_ALLOWED_HOSTS`; the parameter to expose lives
-  inside `build_mcp` (or a new `bridge_config()` factory that T6
-  could grow into). Specifiable when the operator needs it.
+  deployments. T6 wired `MCP_SILVERBULLET_ALLOWED_HOSTS`; remaining
+  fog is allowed_origins / disabling DNS-rebinding entirely.
+- `GET /.fs` (no path) on the live SilverBullet (`127.0.0.1:63000`)
+  returns **307 to `/`**, so `list_pages` cannot use the design-doc
+  list URL as written. `GET`/`PUT`/`DELETE /.fs/{name}` work. Need
+  the actual list-directory endpoint for this SB version before T7
+  can assert `list_pages`.
 
 ## Out of scope
 

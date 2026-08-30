@@ -96,9 +96,12 @@ class SBClient:
         *,
         timeout: httpx.Timeout | None = None,
     ) -> None:
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             timeout=timeout or httpx.Timeout(10.0, connect=3.0),
         )
 

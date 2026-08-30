@@ -114,9 +114,32 @@
     in
     {
       # Runtime virtualenv — what `nix build .#default` produces.
-      packages = forAllSystems (system: {
-        default = pythonSets.${system}.mkVirtualEnv "mcp-silverbullet-env" workspace.deps.default;
-      });
+      # `nix run .#mcp-silverbullet` (and `nix run .`) executes the
+      # console script inside that venv.
+      packages = forAllSystems (
+        system:
+        let
+          venv = pythonSets.${system}.mkVirtualEnv "mcp-silverbullet-env" workspace.deps.default;
+        in
+        {
+          default = venv;
+          mcp-silverbullet = venv;
+        }
+      );
+
+      apps = forAllSystems (
+        system:
+        let
+          app = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/mcp-silverbullet";
+          };
+        in
+        {
+          default = app;
+          mcp-silverbullet = app;
+        }
+      );
 
       # Development shell. Uses the editable overlay so the source tree
       # is live — same model as the hello-world template.
