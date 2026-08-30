@@ -26,9 +26,11 @@ The artefact is **this repo, runnable end-to-end**. No new design
 decisions to lock — those were settled in the prior map; the input here
 is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
-### 🏁 Status: in flight.
+### 🏁 Status: destination reached.
 
-Seven of eight tickets resolved (T1–T7). T8 claimed; grilling in flight.
+All eight tickets resolved (T1–T8). The bridge runs end-to-end:
+code, flake, tests, README, and a live-SB end-to-end test (env-gated)
+all in place.
 
 ## Notes
 
@@ -89,7 +91,8 @@ Seven of eight tickets resolved (T1–T7). T8 claimed; grilling in flight.
 - [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
 - [T5. HTTP integration tests (auth + discovery doc)](#t5-http-integration-tests-auth--discovery-doc) (commit `53ae8`): 5 Layer-2 tests in `tests/test_http_auth.py` exercising the bridge as a real ASGI app via `httpx.ASGITransport(app=streamable_http_app(host="bridge.test"))` + `app.router.lifespan_context(app)` (drives the SDK's `StreamableHTTPSessionManager.run()` since `ASGITransport` doesn't speak Starlette's lifespan protocol). Covers: POST `/mcp` no-token → 401 + `WWW-Authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://bridge.test/.well-known/oauth-protected-resource/mcp"`; POST `/mcp` wrong-token → identical shape (no header-vs-token probe leak); GET `/.well-known/oauth-protected-resource/mcp` (no auth) → 200 + RFC 9728 doc with `resource=<resource_url>`, `authorization_servers=[<resource_url>]` (v1 has no separate authz server), `bearer_methods_supported=["header"]`, `scopes_supported` omitted (`AuthSettings.required_scopes=None`, stripped by `PydanticJSONResponse.render`); POST `/mcp` with auth but `Accept: text/plain` → 406 ("Not Acceptable: Client must accept both application/json and text/event-stream"); end-to-end `streamable_http_client` + `ClientSession` initialize → list_tools (`['list_pages', 'read_page', 'write_page']`) → `call_tool read_page` roundtrip against a mocked SB. ASGI transport vs the ticket's literal "uvicorn on a free port": same wire path (every middleware, header, status code, body shape) minus the TCP stack — fast, deterministic, no port flake. The real-port path is exercised at T7 against the live SilverBullet. 5 new tests in 0.94s; 36 tests total green; `nix flake check` green.
 - [T6. Operator smoke run + README](#t6-operator-smoke-run--readme): `main.py` boots `SBClient` + `build_mcp` + `run_streamable_http_async`; `flake.nix` exposes `apps.mcp-silverbullet`; README documents boot order. Live smoke against SB `127.0.0.1:63000` (no SB auth): write_page + read_page roundtrip OK; list_pages → ToolError `silverbullet error: 307` because `GET /.fs` redirects to `/` on this SB. `mcp` CLI extra not installed; walkthrough used `ClientSession` + `streamable_http_client` instead of `mcp dev`.
-- [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env.
+- [T7. Live-SB end-to-end test (env-gated)](#t7-live-sb-end-to-end-test-env-gated) (commit `7025d`): `tests/test_e2e_live_sb.py` skips unless both `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN` are in env (empty token allowed). With them set, boots `serve()` on a free port, Streamable HTTP write/read roundtrip of `e2e-mcp-silverbullet-marker.md`, `If-Match: *` update succeeds, stale etag does **not** 412 (this SB ignores precondition headers), `list_pages` still ToolError 307. Marker deleted in `finally`. Unset env: skip. 40 passed + 1 skipped without live env. File was untracked at the time T7 was marked resolved on the map; commit `7025d` retroactively stages the file with no changes.
+- [T8. Write-envelope fog (X-* headers on PUT)](#t8-write-envelope-fog-x--headers-on-put) (commit `9275c`): full design-doc envelope — `write_page` sends every X-* header `docs/design.md` § SilverBullet client contract calls out for PUT, on top of the static `X-Source: external` + `X-Permission: rw` + `Content-Type: text/markdown`. New per-call fields: `X-Created = X-Last-Modified = int(time.time_ns() / 1_000_000)` (epoch ms, the unit SB's `header_i64` parses); `X-Content-Length = len(content.encode("utf-8"))` (UTF-8 byte count, matching SB's `meta.size`). Static fields stay in `_WRITE_HEADERS`; new `_epoch_ms()` helper isolates the timestamp computation. Operator chose this path on the basis that the design doc calls for the full envelope and SB's PUT handler reads (but mostly ignores) these from the request — `server-common/src/space/disk.rs::write_file` honors `meta.last_modified > 0` (stamps file mtime) but ignores `meta.created / meta.size / meta.perm`. Live PUT against the dev-box SB on `127.0.0.1:63000` succeeded with the new envelope; response carried `X-Last-Modified` matching our value (file mtime honored) and `X-Created` a few ms later (file btime, since the disk impl ignores request `created`). Bridge doesn't observe either side. 41 passed + 1 skipped.
 
 ## Tickets
 
@@ -318,16 +321,17 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > Test records those SB facts instead of failing the suite. Cleanup
 > `DELETE /.fs/{marker}` in `finally`. Without env vars, pytest skips
 > with the message in the test. PUT responses also returned
-> `X-Content-Length`, `X-Created`, `X-Last-Modified`, `X-Permission`
-> (input for T8).
+> `X-Content-Length`, `X-Created`, `X-Last-Modified`, `X-Permission` —
+> the response-side mirror of the request-side envelope T8 settled on.
 
 ---
 
 ### T8. Write-envelope fog (X-* headers on PUT)
 
 > **Labels**: `wayfinder:grilling`
-> **Type**: HITL (operator decides when first write fails)
-> **Assignee**: pi (claimed 2026-08-27, grilling in flight)
+> **Type**: HITL (operator decided which headers survive a real write)
+> **Assignee**: pi (claimed 2026-08-27, resolved same day)
+> **Status**: ✅ resolved (commit `9275c`)
 > **Question**: When `write_page` actually runs against a real SB,
 > do we send `X-Permission: rw`? `X-Created`? `X-Last-Modified`?
 > `X-Content-Length`? The design doc enumerates them; the user punted
@@ -338,6 +342,24 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > envelope; the *destination* (a working bridge) doesn't change.
 > **Done when**: the user has run a real write once and confirmed
 > which headers survive.
+> **Resolution**: Operator chose the full design-doc envelope on a
+> grilling round (T8 was the only HITL ticket on this map). Reading
+> `server/src/handlers/fs.rs::handle_fs_put` and
+> `server-common/src/space/disk.rs::write_file` first locked the
+> facts: SB's PUT reads `Content-Type` / `X-Created` /
+> `X-Last-Modified` / `X-Content-Length` / `X-Permission` from the
+> request, threads them as `meta: Option<&FileMeta>` into
+> `write_file`, and the disk impl only honors `last_modified > 0`
+> (stamps file mtime). With those facts grounded, the operator's
+> "Full design-doc envelope" answer settled the policy: send all
+> five headers with sensible values (`X-Created = X-Last-Modified =
+> int(time.time_ns() / 1_000_000)`; `X-Content-Length = len(content.
+> encode("utf-8"))`). Live PUT against `127.0.0.1:63000` returned
+> 200 with `X-Last-Modified` echoed and `X-Created` slightly
+> adjusted to the file's actual btime — confirming the disk impl's
+> `last_modified`-honors / `created`-ignores split. New test
+> `test_write_page_x_content_length_matches_utf8_byte_count` guards
+> the codepoint-vs-byte bug class. 41 tests pass + 1 skipped.
 
 ## Not yet specified
 
