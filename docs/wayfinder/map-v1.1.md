@@ -115,7 +115,7 @@ original "tunnel-ready v1.1" chart remain demoted to
 
 <!-- index only — one line per closed ticket, link to the ticket's resolution below -->
 
-- **Drive-by (pre-chart): 412 ToolError wording.** (commit pending):
+- **Drive-by (pre-chart): 412 ToolError wording.** (commit `adf0c`):
   `write_page`'s 412 path now surfaces
   `ToolError("precondition failed; check if_match/if_none_match")`
   instead of the prior map's
@@ -126,7 +126,8 @@ original "tunnel-ready v1.1" chart remain demoted to
   and `docs/design.md § Tools status-code mapping` row all
   updated together. Test count: 97 pass + 2 skip.
 - **Drive-by (pre-chart): `write_page` returns `str | None`.**
-  (commit pending): the previous shape returned `""` when the
+  (commit `adf0c`, the same commit as the 412-wording drive-by
+  above — both fixes landed together): the previous shape returned `""` when the
   SB response didn't carry an `ETag` header. `sb_client.
   write_page` is now typed `-> str | None`; `server.write_page`
   mirrors it. The MCP wire payload becomes
