@@ -295,4 +295,13 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                         "read_page", {"name": "index"}
                     )
                     assert call_result.is_error is False
-                    assert call_result.content[0].text == "# hello over the wire"
+                    # T24: ``read_page`` returns the ack envelope,
+                    # not a raw string. The body lives under
+                    # ``structured_content["body"]``; ``content[0].text``
+                    # is a JSON-serialized copy of the same envelope.
+                    assert call_result.structured_content == {
+                        "body": "# hello over the wire",
+                        "etag": None,
+                        "size_bytes": None,
+                        "last_modified_ms": None,
+                    }

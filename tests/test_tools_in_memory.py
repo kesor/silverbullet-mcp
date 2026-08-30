@@ -83,18 +83,80 @@ def _text(result) -> str:
 
 
 @pytest.mark.asyncio
-async def test_read_page_returns_body_on_200() -> None:
+async def test_read_page_returns_ack_envelope_on_200() -> None:
+    """``read_page`` returns the T24 acknowledgement envelope.
+
+    v1.1 returned ``str`` (just the markdown body). v1.2 T24 widens
+    the return to ``{body, etag, size_bytes, last_modified_ms}``
+    so an agent that just read a page knows its etag (for an
+    ``if_match`` round-trip on the next write) and its current
+    size without a follow-up call. ``name`` is dropped (the caller
+    already passed it in) and ``created_ms`` is dropped (reads have
+    no create-vs-update distinction to surface); the full meta
+    envelope lives on :class:`PageMeta` so a future
+    wider-it-still ticket is a one-liner.
+
+    Locks the read-tool wire shape — the ``silverbullet://page/{name}``
+    resource template returns the same envelope, so an agent that
+    gets the same dict from both surfaces (tool call vs context
+    attachment) can treat them identically.
+    """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert request.url.path == "/.fs/index"
-        return httpx.Response(200, text="# hello")
+        return httpx.Response(
+            200,
+            text="# hello",
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "7",
+            },
+        )
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool("read_page", {"name": "index"})
 
     assert result.is_error is False
-    assert _text(result) == "# hello"
+    # ``size_bytes`` comes from SB's ``X-Content-Length`` response
+    # header. ``created_ms`` is intentionally absent (not even
+    # ``None``) — T24 drops the field, so the wire payload mirrors
+    # that. ``name`` is also dropped (caller already knows it).
+    # The SDK surfaces the dict return under ``structured_content``
+    # because the handler's return annotation is
+    # ``dict[str, object]``.
+    assert result.structured_content == {
+        "body": "# hello",
+        "etag": '"abc123"',
+        "size_bytes": 7,
+        "last_modified_ms": 1700000000123,
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_page_ack_envelope_is_none_when_meta_stripped() -> None:
+    """A 200 with no ``X-*`` / ``ETag`` headers → envelope with Nones for meta.
+
+    Mirror of the v1.1 None-ETag handling on the T24 envelope:
+    a proxy-stripped response surfaces ``None`` for every optional
+    meta field. ``body`` is still the markdown text (always
+    populated on a 200).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "index"})
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "body": "body",
+        "etag": None,
+        "size_bytes": None,
+        "last_modified_ms": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -2546,10 +2608,34 @@ async def test_move_page_does_not_delete_on_destination_collision() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resource_template_returns_markdown_body() -> None:
+async def test_resource_template_returns_ack_envelope() -> None:
+    """``silverbullet://page/{name}`` returns the T24 ack envelope.
+
+    v1.1 returned a raw markdown string (``text/markdown``). v1.2
+    T24 widens the resource to return the same
+    ``{body, etag, size_bytes, last_modified_ms}`` envelope as the
+    read tool, JSON-serialized into the SDK's resource text field;
+    the MIME type is ``application/json`` because the value is a
+    structured object, not raw markdown. Callers parse
+    ``content.text`` as JSON to read the envelope (or
+    ``json.loads(content.text)["body"]`` to grab the markdown).
+
+    Locks the resource wire shape; the read tool's envelope is
+    tested separately above.
+    """
+    import json
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/.fs/index"
-        return httpx.Response(200, text="# page body")
+        return httpx.Response(
+            200,
+            text="# page body",
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "11",
+            },
+        )
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -2557,8 +2643,16 @@ async def test_resource_template_returns_markdown_body() -> None:
 
     assert len(result.contents) == 1
     content = result.contents[0]
-    assert getattr(content, "mime_type", None) == "text/markdown"
-    assert content.text == "# page body"
+    # MIME type flipped from ``text/markdown`` (v1.1 raw body) to
+    # ``application/json`` (v1.2 structured envelope). The body
+    # lives inside the JSON, not as raw text.
+    assert getattr(content, "mime_type", None) == "application/json"
+    assert json.loads(content.text) == {
+        "body": "# page body",
+        "etag": '"abc123"',
+        "size_bytes": 11,
+        "last_modified_ms": 1700000000123,
+    }
 
 
 @pytest.mark.asyncio

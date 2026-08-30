@@ -66,9 +66,11 @@ async def test_read_page_returns_body_on_200() -> None:
 
     v1.1 returned ``str``; v1.2 T23 client-side change widens the
     return to :class:`PageMeta` so the read-tool (T24) and the
-    write-tool (T23) share one envelope. The MCP ``read_page`` tool
-    still unwraps ``.body`` for v1.2-rc1; T24 widens the read tool
-    itself.
+    write-tool (T23) share one envelope. T24 already landed; the
+    read tool subsets the envelope via :func:`_read_meta_to_payload`
+    in :mod:`server`, dropping ``name`` and ``created_ms`` (the
+    fields the read shape doesn't carry — see ``PageMeta``'s
+    class docstring).
     """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -80,8 +82,9 @@ async def test_read_page_returns_body_on_200() -> None:
 
     assert page.body == "# hello"
     # No ``X-*`` headers in this response: every meta field except
-    # name + body is ``None``. The dataclass is a strict superset of
-    # the prior string return so a future T24 unwrap is a one-liner.
+    # name + body is ``None``. The dataclass is the full envelope;
+    # the read tool's wire shape is the dataclass minus ``name``
+    # and ``created_ms``.
     assert page.name == "index"
     assert page.etag is None
     assert page.size_bytes is None

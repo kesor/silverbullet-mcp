@@ -9,8 +9,9 @@ MCP wire.
 Four entry points:
 
 - :func:`read_page` — ``GET /.fs/{name}`` — returns
-  :class:`PageMeta` with ``body`` + meta (T23 client-side change
-  that T24 unwraps for the read tool).
+  :class:`PageMeta` with ``body`` + meta (T23 client-side change;
+  T24 subsets it down to the read-tool wire shape in
+  :func:`_read_meta_to_payload`).
 - :func:`write_page` — ``PUT /.fs/{name}`` — returns
   :class:`PageMeta` with the just-written meta (T23).
 - :func:`delete_page` — ``DELETE /.fs/{name}`` — returns
@@ -233,11 +234,14 @@ class SBClient:
 
         The body's text lives in ``result.body``; the ``X-*`` meta
         headers from SB's response live alongside the body in the
-        same :class:`PageMeta` (matching the T24 read-tool wire shape
-        — a dict with ``body`` plus the meta fields). v1.1 returned
-        ``str``; the T24 ticket widens the MCP ``read_page`` tool's
-        return to this shape; the client-side change ships in T23
-        so T24 is a one-line unwrap in :mod:`server`.
+        same :class:`PageMeta` (matching the T24 read-tool wire
+        shape — a dict with ``body`` plus the meta fields). v1.1
+        returned ``str``; the T23 client-side change widened this
+        client method to return :class:`PageMeta` so T24's MCP-tool
+        widening (subset the envelope via
+        :func:`_read_meta_to_payload` in :mod:`server`) was a
+        one-line change rather than a round trip through the
+        client.
 
         Raises :class:`PageNotFound` if the page is missing.
         """

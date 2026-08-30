@@ -141,7 +141,16 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "read_page", {"name": MARKER}
                     )
                     assert read_back.is_error is False, read_back
-                    assert read_back.content[0].text == body
+                    # T24: ``read_page`` returns the ack envelope.
+                    # ``size_bytes`` should match the byte count of
+                    # ``body`` (``X-Content-Length`` echo from the
+                    # live SB). ``etag`` / ``last_modified_ms`` /
+                    # ``created_ms`` are dropped (T24 read shape).
+                    rpayload = read_back.structured_content or {}
+                    assert rpayload.get("body") == body
+                    assert rpayload.get("size_bytes") == len(
+                        body.encode("utf-8")
+                    )
 
                     # ``append_to_page`` is the v1.1 T19 read-modify-
                     # write tool; lock the round-trip shape against
@@ -164,9 +173,14 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "read_page", {"name": MARKER}
                     )
                     assert after_append.is_error is False, after_append
-                    # Body ended in ``\n`` already, so no extra
-                    # separator is inserted between the two halves.
-                    assert after_append.content[0].text == body + "appended\n"
+                    # T24 envelope: body lives at ``.body``; the
+                    # combined body is ``hello from T7 live e2e\n
+                    # appended\n`` (32 bytes). Body ended in ``\n``
+                    # already, so no extra separator is inserted
+                    # between the two halves.
+                    assert (after_append.structured_content or {}).get(
+                        "body"
+                    ) == body + "appended\n"
 
                     # ``patch_page_lines`` is the v1.1 T20 read-
                     # modify-write tool; round-trip the middle line
@@ -197,7 +211,10 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "read_page", {"name": MARKER}
                     )
                     assert after_patch.is_error is False, after_patch
-                    assert after_patch.content[0].text == "patched\nappended\n"
+                    # T24 envelope: body lives at ``.body``.
+                    assert (after_patch.structured_content or {}).get(
+                        "body"
+                    ) == "patched\nappended\n"
 
                     # ``patch_page_replace`` is the v1.1 T21 read-
                     # modify-write tool; round-trip the literal
@@ -226,7 +243,10 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "read_page", {"name": MARKER}
                     )
                     assert after_replace.is_error is False, after_replace
-                    assert after_replace.content[0].text == "hello\nappended\n"
+                    # T24 envelope: body lives at ``.body``.
+                    assert (after_replace.structured_content or {}).get(
+                        "body"
+                    ) == "hello\nappended\n"
 
                     # ``move_page`` is the v1.1 T22 read-write-delete
                     # tool; round-trip the rename against live SB so
@@ -260,7 +280,10 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         "read_page", {"name": moved_name}
                     )
                     assert after_move_new.is_error is False, after_move_new
-                    assert after_move_new.content[0].text == "hello\nappended\n"
+                    # T24 envelope: body lives at ``.body``.
+                    assert (after_move_new.structured_content or {}).get(
+                        "body"
+                    ) == "hello\nappended\n"
 
                     # Move it back so the precondition block below
                     # can still find ``MARKER``.

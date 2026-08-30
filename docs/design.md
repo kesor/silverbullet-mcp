@@ -218,7 +218,7 @@ added `delete_page`, T19 added `append_to_page`, T20 added
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
-| `read_page` | `name: str` | `GET /.fs/{name}` | `str` (markdown body); T24 widens to `{body, etag, size_bytes, last_modified_ms}` | none |
+| `read_page` | `name: str` | `GET /.fs/{name}` | `{body, etag, size_bytes, last_modified_ms}` (T24; `name` and `created_ms` dropped — caller passed `name`, reads have no create-vs-update distinction) | none |
 | `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may create / overwrite / refuse on `412` |
 | `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may append / refuse on `412` (concurrent-write protection) |
 | `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
@@ -230,10 +230,15 @@ added `delete_page`, T19 added `append_to_page`, T20 added
 Resource template:
 
 - URI template: `silverbullet://page/{name}` (RFC 6570 form).
-- Handler: `httpx GET /.fs/{name}`, returns the body as
-  `text/markdown` blob. This is what Grok uses to attach a page to
-  conversation context (vs calling `read_page` mid-conversation as a
-  tool call result).
+- Handler: `httpx GET /.fs/{name}`, returns the T24 acknowledgement
+  envelope `{body, etag, size_bytes, last_modified_ms}` as a JSON
+  object (`application/json` MIME type). v1.1 returned the body
+  as a raw `text/markdown` blob; v1.2 T24 widens the resource to
+  match the read tool's wire shape so a caller that gets the same
+  dict from both surfaces (tool call vs context attachment) can
+  treat them identically. The MCP SDK serializes the dict as
+  JSON into `contents[0].text`; callers parse the JSON and read
+  `body` / `etag` / `size_bytes` / `last_modified_ms` as needed.
 
 ### `X-Source: external`
 

@@ -7,9 +7,10 @@ T22 added ``move_page``. v1.2's T23 widens every write tool's
 return type from ``str | None`` (the new ETag) to a
 :class:`PageMeta` acknowledgement envelope so an agent that just
 made a write knows ``size_bytes`` / ``last_modified_ms`` /
-``created_ms`` without a follow-up read. T24 (next ticket) widens
-the read-side tool shape to match. T28 widens ``list_pages``. The
-bridge still registers eight ``/.fs``-backed tools
+``created_ms`` without a follow-up read. T24 widens the read-side
+tool shape (``read_page`` and the ``silverbullet://page/{name}``
+resource template) to match. T28 widens ``list_pages``. The bridge
+still registers eight ``/.fs``-backed tools
 (``read_page`` / ``write_page`` / ``delete_page`` /
 ``append_to_page`` / ``patch_page_lines`` /
 ``patch_page_replace`` / ``move_page`` / ``list_pages``) plus one
@@ -32,7 +33,7 @@ client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23 done; T24/T28 next).
+agent-facing QOL tickets (T23/T24 done; T28 next).
 """
 
 from __future__ import annotations
@@ -156,6 +157,35 @@ def _write_meta_to_payload(meta: PageMeta) -> dict[str, object]:
         "size_bytes": meta.size_bytes,
         "last_modified_ms": meta.last_modified_ms,
         "created_ms": meta.created_ms,
+    }
+
+
+def _read_meta_to_payload(meta: PageMeta) -> dict[str, object]:
+    """Project a :class:`PageMeta` down to the T24 read-tool wire shape.
+
+    T24's wire shape is ``{body, etag, size_bytes, last_modified_ms}``
+    — the same metadata fields as :func:`_write_meta_to_payload`,
+    minus ``name`` (the caller already passed it in; echoing it
+    back is noise) and ``created_ms`` (a read has no create-vs-
+    update distinction to surface; ``created_ms`` is the page's
+    birth time, which doesn't change between reads). ``body`` is
+    the only field the write paths populate ``None`` for; on a
+    read it's always a string (possibly empty).
+
+    Centralizing this here keeps the field subset in one place —
+    the next-time-widening ticket (T28 widens :class:`FileMeta`
+    into :class:`PageMeta`; T29/T30 add bullet primitives) doesn't
+    have to re-derive the read subset. ``body`` is materialized
+    as ``""`` (not ``None``) when SB returned an empty page, so
+    the wire shape is always ``str`` rather than ``str | None``
+    — MCP clients that read ``result.structured_content["body"]``
+    don't need a None-guard for the empty-page case.
+    """
+    return {
+        "body": meta.body or "",
+        "etag": meta.etag,
+        "size_bytes": meta.size_bytes,
+        "last_modified_ms": meta.last_modified_ms,
     }
 
 
@@ -306,23 +336,24 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
     @mcp.tool(
         title="Read page",
         description=(
-            "Read the raw markdown body of a SilverBullet page. "
-            "Returns 404-equivalent ToolError if the page is missing. "
-            "v1.2 T23 keeps the read tool returning the body string "
-            "(the write-tool wire shape is the breaking change); T24 "
-            "widens this to `{body, etag, size_bytes, last_modified_ms}` "
-            "matching the write-tool envelope."
+            "Read the markdown body and metadata of a SilverBullet "
+            "page. Returns `{body, etag, size_bytes, "
+            "last_modified_ms}` so the caller can chain edits "
+            "without a follow-up round-trip to learn the page's "
+            "ETag or current size (T24 — read-side widening of the "
+            "T23 acknowledgement envelope, drops `name` since the "
+            "caller passed it in and `created_ms` since reads have "
+            "no create-vs-update distinction to surface). "
+            "`size_bytes` and `last_modified_ms` are `None` when "
+            "SB stripped the `X-Content-Length` / `X-Last-Modified` "
+            "response headers (older SB / proxy). Returns "
+            "404-equivalent ToolError if the page is missing."
         ),
     )
-    async def read_page(name: str) -> str:
+    async def read_page(name: str) -> dict[str, object]:
         async with _translate_sb_errors(name):
-            # Unwrap the body's ``.body`` so the MCP tool's wire
-            # shape stays ``str`` for T23 (T24 widens it). The
-            # underlying client now returns :class:`PageMeta`
-            # because T23 needs the same envelope on the write side
-            # and T24's read-side widening is a one-liner from here.
             page = await sb_client.read_page(name)
-        return page.body or ""
+        return _read_meta_to_payload(page)
 
     @mcp.tool(
         title="Write page",
@@ -741,22 +772,23 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         name="silverbullet_page",
         title="SilverBullet page",
         description=(
-            "Raw markdown body of a SilverBullet page, for attaching "
-            "to conversation context. v1.1 returned the markdown "
-            "body string; v1.2's T23 keeps the resource returning a "
-            "string (the resource template isn't in T23's scope) and "
-            "T24 will widen it to `{body, etag, size_bytes, "
-            "last_modified_ms}` matching the read-tool envelope."
+            "Markdown body and metadata of a SilverBullet page, for "
+            "attaching to conversation context. Returns `{body, "
+            "etag, size_bytes, last_modified_ms}` as a JSON object "
+            "(T24 — same shape as the read tool; `name` and "
+            "`created_ms` are dropped for the same reasons as the "
+            "tool). MIME type is `application/json` because the "
+            "returned value is a structured envelope, not raw "
+            "markdown — callers that want the body as a string read "
+            "`contents[0].text` (a JSON-serialized object) and "
+            "extract `body` themselves. The full envelope lets "
+            "callers chain off `etag` for `if_match` round-trips "
+            "without a second tool call."
         ),
-        mime_type="text/markdown",
+        mime_type="application/json",
     )
-    async def silverbullet_page(name: str) -> str:
+    async def silverbullet_page(name: str) -> dict[str, object]:
         try:
-            # ``read_page`` returned ``str`` in v1.1; the client now
-            # returns :class:`PageMeta` (T23 client-side change that
-            # T24 unwraps for the read tool). The resource template
-            # unwraps the body itself for now so the wire stays a
-            # markdown string until T24 widens it to the full meta.
             page = await sb_client.read_page(name)
         except PageNotFound as exc:
             # 404 is a ResourceNotFoundError per the SDK's two-shape
@@ -771,7 +803,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             raise ResourceError(str(exc)) from exc
         except httpx.TimeoutException as exc:
             raise ResourceError("silverbullet request timed out") from exc
-        return page.body or ""
+        return _read_meta_to_payload(page)
 
 
 __all__ = [

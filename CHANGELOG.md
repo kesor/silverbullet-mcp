@@ -55,6 +55,41 @@ Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
   envelope (the read on the existence check now surfaces full meta
   since the client side was widened in the same change).
 
+- **T24 (BREAKING): `read_page` and the `silverbullet://page/{name}`
+  resource template's return type widened from `str` (raw markdown
+  body) to a dict acknowledgement envelope.** The new shape:
+
+  ```jsonc
+  {
+    "body": "<markdown>",                  // string; "" for an empty page
+    "etag": "\"abc123\"",                   // string with quotes; null if SB stripped it
+    "size_bytes": 1024,                     // UTF-8 byte count; null if SB stripped X-Content-Length
+    "last_modified_ms": 1700000000123       // epoch ms; null if SB stripped X-Last-Modified
+  }
+  ```
+
+  `name` and `created_ms` are deliberately dropped (the caller
+  already passed `name` to the tool; reads have no create-vs-update
+  distinction to surface, so `created_ms` would be noise). The
+  underlying client already returned a `PageMeta` after T23; T24
+  is a wire-shape widening of the read tool plus the matching
+  resource template.
+
+  Migration for the **tool**:
+  `body = result.text` → `payload = result["result"]; body = payload["body"]`
+  (or read `payload["etag"]` to skip the follow-up read that v1.1
+  callers did to learn the etag before an `if_match` round-trip).
+
+  Migration for the **resource template**:
+  `context.text` was a raw markdown string; it is now a
+  JSON-serialized envelope. Callers parse with
+  `json.loads(context.text)["body"]`. The MIME type also flipped
+  from `text/markdown` to `application/json` to match the
+  structured envelope (the body's markdown is *inside* the JSON,
+  not the wire content). See
+  [README § v1.2 wire-shape changes](README.md#v12-wire-shape-changes)
+  for the full migration note.
+
 ## [v1.1] — full CRUD + editing
 
 Build map: [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).

@@ -118,7 +118,7 @@ The destination is reached when all eight tickets are closed.
 <!-- index only — one line per closed ticket, link to the ticket's
 resolution below -->
 
-- **T23. Write-tool acknowledgement shape.** (commit pending):
+- **T23. Write-tool acknowledgement shape.** (commit [`43b8b`](https://github.com/silverbulletmd/mcp-silverbullet/commit/43b8b)):
   Every write tool (`write_page` / `delete_page` / `append_to_page` /
   `patch_page_lines` / `patch_page_replace` / `move_page`) now
   returns `{name, etag, size_bytes, last_modified_ms, created_ms}`
@@ -127,12 +127,13 @@ resolution below -->
   that all three client entry points (`read_page` / `write_page` /
   `delete_page`) now return; the MCP tool layer subsets the envelope
   to the T23 wire shape via `_write_meta_to_payload` in `server.py`.
-  `read_page` (the MCP tool) keeps returning `str` for v1.2-rc1;
-  T24 widens it to `{body, etag, size_bytes, last_modified_ms}`
-  with the same one-line unwrap that the resource template already
-  uses. `list_pages` keeps its v1.1 `list[{name, etag}]` shape; T28
-  widens it. The client-side `list_pages` stays returning `FileMeta`
-  until T28, then both widen together.
+  `read_page` (the MCP tool) kept returning `str` for v1.2-rc1;
+  T24 (resolved in the same map, below) widens it to
+  `{body, etag, size_bytes, last_modified_ms}` with the matching
+  `_read_meta_to_payload` helper. `list_pages` keeps its v1.1
+  `list[{name, etag}]` shape; T28 widens it. The client-side
+  `list_pages` stays returning `FileMeta` until T28, then both
+  widen together.
 
   **Field-by-field contract**: `name` is the page the caller asked
   about; `etag` is `None` when SB stripped the response header;
@@ -204,6 +205,95 @@ resolution below -->
   new envelope rather than split into more tests). `nix flake
   check` green.
 
+- **T24. Read-tool acknowledgement shape.** (commit pending):
+  Both `read_page` (the MCP tool) and the
+  `silverbullet://page/{name}` resource template now return
+  `{body, etag, size_bytes, last_modified_ms}` instead of a raw
+  markdown string. The change rides on a new `_read_meta_to_payload`
+  helper in `server.py` (mirror of T23's `_write_meta_to_payload`)
+  that subsets the same `PageMeta` dataclass the write tools
+  already use; the read tool's return annotation becomes
+  `dict[str, object]` so the MCP SDK populates
+  `structured_content` rather than text-JSON-serializing the
+  dict into `content[0].text` (which is what unannotated dict
+  returns do — the SDK only sets `structured_content` when the
+  return type is announced in the signature).
+
+  **Field-by-field contract**: `body` is the markdown text (always
+  a `str`; an empty page is `""` rather than `None`); `etag` is
+  `None` when SB stripped the `ETag` header; `size_bytes` is the
+  UTF-8 byte count from `X-Content-Length` (or `None` when SB
+  stripped it); `last_modified_ms` is the epoch-ms timestamp from
+  `X-Last-Modified` (or `None` when stripped). `name` and
+  `created_ms` are deliberately dropped — `name` because the
+  caller already passed it in (echoing it back is noise), and
+  `created_ms` because a read has no create-vs-update distinction
+  to surface (`created_ms` is the page's birth time, which
+  doesn't change between reads).
+
+  **Resource template MIME type flip**: the resource template's
+  `mime_type` parameter flips from `text/markdown` (v1.1 raw body)
+  to `application/json` (v1.2 structured envelope). The SDK
+  serializes the returned dict into `contents[0].text` as JSON;
+  callers parse it (`json.loads(context.text)["body"]`) to read
+  the markdown. The wire still carries the body — it's just no
+  longer the raw value of the resource.
+
+  **Breaking change, loudly called out**: the README's v1.2
+  wire-shape section now shows both the write (T23) and read
+  (T24) envelopes side by side with one-line migration notes for
+  each; the CHANGELOG's Unreleased section got a T24 entry
+  covering the tool, the resource template, and the MIME-type
+  flip.
+
+  **Files touched**: `src/mcp_silverbullet/server.py` (new
+  `_read_meta_to_payload` helper mirroring `_write_meta_to_payload`;
+  `read_page` MCP tool return type widened from `str` to
+  `dict[str, object]`; the resource template return type
+  matches and its `mime_type` parameter flipped to
+  `application/json`; module-level docstring updated from
+  "T23 done; T24/T28 next" to "T23/T24 done; T28 next"),
+  `tests/test_tools_in_memory.py` (`test_read_page_returns_body_on_200`
+  → `test_read_page_returns_ack_envelope_on_200` plus a new
+  `test_read_page_ack_envelope_is_none_when_meta_stripped`; the
+  resource template test name flipped from
+  `..._returns_markdown_body` to `..._returns_ack_envelope` and
+  now parses the JSON body), `tests/test_http_auth.py` (the
+  end-to-end read round-trip asserts on `structured_content`).
+  `tests/test_e2e_live_sb.py` (5 read-back assertions across the
+  write/append/patch/replace/move flows updated from
+  `content[0].text == body` to
+  `(structured_content or {}).get("body") == body`), `README.md`
+  (tool list and v1.2 wire-shape section both updated), `CHANGELOG.md`
+  (T24 entry under Unreleased with migration notes for both
+  surfaces), `docs/design.md` (the `read_page` row in the Tools
+  table now shows the full envelope; the resource template
+  description reflects the JSON wire shape and the
+  `application/json` MIME type).
+
+  **Bonus improvements visible while doing it**: the
+  `read_page` MCP tool description no longer says "T24 will widen"
+  (it now documents the widened shape); the resource template's
+  description ditto; stale "T23 keeps the resource returning a
+  string / T24 will widen it" wording is gone from both the
+  description and the handler's comment; the description of
+  `_write_meta_to_payload`'s sibling-helper rationale now
+  references the read subset, not a hypothetical read-side
+  widening.
+
+  **Unblocks**: T28 (list_pages widens to the same envelope
+  family; the read subset's `_read_meta_to_payload` is the
+  template T28's list-row projection will follow), T30 (check_task
+  can use `_read_meta_to_payload` for the read-before-write step
+  if a future ticket surfaces the same data needs).
+
+  Test count: 185 pass + 2 skip (was 184 pass + 2 skip; +1 new
+  in-memory stripped-meta test for `read_page`, +1 net after
+  rewriting the existing 4 read-side tests in place to assert on
+  the new envelope, +1 net after rewriting the resource
+  template test for the JSON wire shape; live e2e skipped).
+  `nix flake check` not run (this dev box doesn't have Nix).
+
 ## Tickets
 
 <!--
@@ -261,11 +351,11 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T24. Read-tool acknowledgement shape
+### T24. Read-tool acknowledgement shape ✅
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: What does `read_page` return?
 >
 > **Context**: Today `read_page` returns `str` (just the body). v1.2
