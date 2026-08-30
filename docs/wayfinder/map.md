@@ -28,7 +28,8 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
 ### 🏁 Status: in flight.
 
-Charted; no tickets resolved yet. Frontier tickets are open below.
+Three of eight tickets resolved (T1, T2, T3). Frontier is T4
+(`verifier.py` + `server.py`), T5, T6, T7, T8.
 
 ## Notes
 
@@ -76,6 +77,7 @@ Charted; no tickets resolved yet. Frontier tickets are open below.
 <!-- index only — one line per closed ticket, link to the ticket's resolution below -->
 
 - [T1. Repo skeleton + pyproject.toml](#t1-repo-skeleton--pyprojecttoml) (commit `dd478`): package shell at `src/mcp_silverbullet/` with smoke entry point, `pyproject.toml` pinning `mcp==2.1.1` + `httpx2>=2.5.0` + Starlette + uvicorn (plus `pytest`/`pytest-asyncio`/`respx` as the test extra), stub `README.md` (T6 replaces), `uv.lock` resolved against Python 3.13. `uv sync` resolves 42 packages; `python -m mcp_silverbullet` prints hello and exits 0.
+- [T2. `flake.nix` (uv2nix + pinned commits)](#t2-flakenix-uv2nix--pinned-commits) (commit `9aabc`): `flake.nix` consumes `uv.lock` via `pyproject-nix/build-system-pkgs` + `uv2nix` (the actual API, NOT the design doc's pseudocode — see resolution); four inputs pinned via `flake.lock` to known commits (nixpkgs `56c02bc...`, pyproject.nix `1b14855...`, uv2nix `4b59ab...`, build-system-pkgs `90ffde...`, all 2026-08). Python interpreter pinned to `pkgs.python313` (3.13.15) so the runtime venv and `uv.lock` agree on wheels (nixpkgs's `pkgs.python3` had drifted to 3.14). `packages.${system}.default` builds `mcp-silverbullet-env` from `workspace.deps.default` (no pytest/editables); `devShells.${system}.default` uses `mkEditablePyprojectOverlay` + `workspace.deps.all` for live-source development; `checks.${system}.pytest` is the uv2nix `passthru.tests` pattern — overrides the `mcp-silverbullet` package to add a derivation that runs `pytest` against `lib.cleanSource ./.` (whole repo minus .venv). Runtime venv smoke (`mcp==2.1.1`, `httpx2==2.12.0`, `python -m mcp_silverbullet` → "hello from mcp-silverbullet") and `nix flake check` both green on `x86_64-linux`. The devShell required two `pyproject.toml` carry-forwards: a `dev` dependency-group containing `editables` (so `mkEditablePyprojectOverlay` includes it in `workspace.deps.all`), and `editables` listed in `[build-system] requires` (so hatchling's `build_editable` finds it at build time, not just at install time). 16 Layer-3 tests pass in both `nix flake check` and `nix develop`.
 - [T3. `sb_client.py` (httpx adapter for /.fs)](#t3-sb_clientpy-httpx-adapter-for-fs) (commit `de944`): outbound bridge half — `SBClient` with `read_page`/`write_page`/`list_pages` against SB's `/.fs/...`, typed exceptions (`PageNotFound`, `PreconditionFailed`, `BodyTooLarge`, `ServerError`) per the § Tools status-code table, `FileMeta` dataclass (name + etag only), `write_page` PUT carries `X-Source: external` + `X-Permission: rw` + explicit `Content-Type: text/markdown` (httpx2 doesn't auto-set it for `content=str`); `If-Match` / `If-None-Match: *` both wired, `if_match` wins if both are passed. 16 Layer-3 tests under `httpx.MockTransport` (no real SB), all green in 0.07s; T1 smoke unbroken. Write-envelope fog (T8) deliberately not resolved here — `write_page` only sends the two headers the design doc requires, the real-write attempt is what decides the rest.
 
 ## Tickets
@@ -116,6 +118,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK (the agent does it)
+> **Assignee**: claude (claimed 2026-08-26, resolved same day)
+> **Status**: ✅ resolved (commit `9aabc`)
 > **Question**: Wire `flake.nix` to consume the `uv.lock` from T1 via
 > `uv2nix` + `pyproject-nix/build-system-pkgs`. Inputs pinned to known
 > commits/tags (not `master`). Expose `packages.<system>.default`,
@@ -127,6 +131,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > and `mcp==2.1.1` is reported, and `nix flake check` is green.
 > **Blocks on**: T1.
 > **Unblocks**: T5 (test runs), T6 (operator smoke run).
+> **Resolution**: see commit `9aabc`. Three carry-forwards worth flagging for future flake work: (1) the design doc's pseudocode (§ Build) names the input `nixpkgs-python`; the actual repo is `pyproject-nix/build-system-pkgs`, exposed as `pyproject-build-systems` in our flake. (2) The API is `uv2nix.lib.workspace.loadWorkspace`, not `uv2nix.lib.loadUvWorkspace`. (3) Hatchling's editable-install path needs `editables` both in `[build-system] requires` (build time) AND in a `dev` dependency-group (runtime of the editable install); missing either fails the devShell build. `nix flake check` is green; `nix develop` opens a shell where `pytest` collects 16 tests and `mcp-silverbullet` runs. Devshell source-tree mode is the right shape for T4 (server.py will edit-import sb_client.py without a rebuild).
 
 ---
 
