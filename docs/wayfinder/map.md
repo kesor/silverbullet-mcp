@@ -133,6 +133,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
+> **Assignee**: claude (claimed 2026-01-15)
+> **Status**: 🔧 in progress
 > **Question**: Implement the 20-line `httpx.AsyncClient` adapter
 > described in `docs/design.md` § SilverBullet client contract:
 > `read_page(name)`, `write_page(name, content, if_match=None)`,
