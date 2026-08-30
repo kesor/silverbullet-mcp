@@ -33,8 +33,9 @@ artefact.
   - **One `flake.nix`** owns dependencies for both the runtime and the dev
     shell. No separate `package.json` lockfiles outside what the flake pins.
   - **Side-car process**, not embedded — locked at charter time.
-  - **Streamable HTTP transport** is the working default unless T1 says
-    otherwise. Already-tested against Cloudflare quick tunnels by xAI docs.
+  - **Streamable HTTP transport** locked at T1
+    ([resolution](#t1-transport-choice-streamable-http-vs-httpsse)),
+    2026-07-28 spec era, stateless posture, single `POST /mcp`.
   - The design doc must spell out a path for both `trycloudflare.com` quick
     tunnels (zero-account) and stable named tunnels.
   - **No MCP Apps / no UI resources** — read/write tools only.
@@ -53,6 +54,11 @@ artefact.
 - **[Cloudflare tunnel model](#t-cf-tunnel-model)**: Already provisioned by
   user; design doc only needs to document boot order and re-connect
   procedure. Out of scope: provisioning automation.
+- **[T1 — Transport choice](#t1-transport-choice-streamable-http-vs-httpsse)**:
+  Streamable HTTP — the only standard remote binding in the 2026-07-28 era.
+  Stateless posture: single `POST /mcp`, optional per-request SSE responses,
+  no protocol-level sessions, no `initialize` handshake. HTTP+SSE rejected
+  for being deprecated and incompatible with `trycloudflare.com`.
 
 ## Tickets
 
@@ -72,12 +78,120 @@ Each ticket is sized to one 100K-token session. Mark with label
 
 ### T1. Transport choice (Streamable HTTP vs HTTP+SSE)
 
+> **Status**: ✅ resolved
 > **Labels**: `wayfinder:research`
 > **Question**: Streamable HTTP (2025-03-26 onward) or HTTP+SSE (legacy
 > 2024-11-05), or both?
 > **Files when resolved**: design.md §Transport.
 > **Decision-payload expected**: chosen transport name; rejection rationale
 > for the alternative; minimum SDK class names.
+
+**Resolution.** Adopt **Streamable HTTP** in the **2026-07-28 spec era**,
+**stateless posture**. Reject HTTP+SSE outright.
+
+Source citations:
+
+1. [spec/2026-07-28/basic/transports — overview] lists **only two standard
+   bindings**: stdio and Streamable HTTP. HTTP+SSE is no longer standard.
+2. [spec/2026-07-28/basic/transports/streamable-http] — "Streamable HTTP was
+   introduced in protocol version 2025-03-26 as a replacement for the
+   HTTP+SSE transport from protocol version 2024-11-05."
+3. [spec/2026-07-28/changelog — Deprecated] — "Reclassify the HTTP+SSE
+   transport (deprecated since protocol version `2025-03-26`) as Deprecated
+   under the feature lifecycle policy. Migrate to Streamable HTTP."
+4. [spec/2026-07-28/basic/transports/streamable-http — Sending Messages] —
+   server "**MUST**" expose a single POST endpoint (e.g. `/mcp`), and the
+   client chooses via the `Accept` header whether the response is
+   `application/json` or `text/event-stream`.
+5. [spec/2026-07-28/changelog — major changes for 2026-07-28] — *Stateless
+   server posture*: removes `Mcp-Session-Id`, removes the
+   `initialize`/`notifications/initialized` handshake, removes the GET
+   stream endpoint, removes SSE resumability (`Last-Event-ID`). Servers
+   needing cross-call state pass it as ordinary tool arguments.
+6. [xAI custom-MCP-tunneling guide] — "`server_url` ... Only Streamable
+   HTTP and SSE transports are supported" by Grok's connector.
+7. [xAI custom-MCP-tunneling guide — Cloudflare quick tunnel caveat] —
+   "Cloudflare quick tunnels do not support Server-Sent Events (SSE). If
+   your MCP server uses the SSE transport, use ngrok instead. Servers
+   using the newer Streamable HTTP transport work fine with Cloudflare."
+
+Binding shape:
+
+- Endpoint: `POST /mcp` only. (No GET stream; no legacy `/sse`.)
+- Every request carries `MCP-Protocol-Version: 2026-07-28`,
+  `Mcp-Method: <rpc>`, `Mcp-Name: ...` headers + the JSON-RPC body
+  including `_meta.io.modelcontextprotocol/protocolVersion`.
+- Per-request responses may be a single JSON object or an SSE stream
+  scoped to that request (used only when the tool emits
+  `notifications/progress` mid-call).
+- No session id, no `initialize` handshake, no cookies. Stateless.
+- Long-lived push notifications for `notifications/tools/list_changed` and
+  `notifications/resources/updated` come from a separate
+  `subscriptions/listen` request — that stays a v2 nice-to-have, not a
+  v1 gate.
+
+SDK class names (concrete, taken from the v2 source tree):
+
+- `McpServer` from `@modelcontextprotocol/server` — registers tools.
+- `WebStandardStreamableHTTPServerTransport` from
+  `@modelcontextprotocol/server` — the lower-level transport (used by
+  hand-rolled Hono servers).
+- `createMcpHandler(buildServer)` from `@modelcontextprotocol/server` —
+  the new ergonomics: a single function that returns a web-standard
+  handler (`{ fetch(req: Request): Promise<Response> }`) backed by the
+  Streamable HTTP transport, dual-era by default (stateless posture
+  serves the modern leg, legacy negotiation path drops back when the
+  client asks for the 2025-03-26 era).
+- `createMcpHonoApp()` from `@modelcontextprotocol/hono` — Hono adapter
+  that arms DNS-rebinding / origin protection by default and exposes
+  `c.get('parsedBody')` for transports that need a parsed JSON body.
+- Wire-up (matches `examples/hono/server.ts`):
+  ```ts
+  const handler = createMcpHandler(() => buildServer());
+  const app = createMcpHonoApp();           // localhost host/origin guard
+  app.all('/mcp', c => handler.fetch(c.req.raw));
+  ```
+
+Why HTTP+SSE is rejected (defensible shortlist):
+
+- **Spec**: reclassified as Deprecated under the feature-lifecycle policy
+  on 2026-07-28; new implementations explicitly told not to adopt it.
+- **Interop**: HTTP+SSE requires the server to push `event: endpoint`
+  before the client can post anything. Cloudflare's reverse proxy on a
+  free quick tunnel buffers until the connection closes, breaking the
+  server-initiated endpoint ping that HTTP+SSE depends on. (xAI guide
+  flags this verbatim.) We use Cloudflare.
+- **Mechanics**: HTTP+SSE prescribes a two-endpoint contract (`GET /sse`
+  + `POST /messages?sessionId=…`) and a stateful `endpoint` event;
+  `subscriptions/listen` and modern list-changed notifications ride on
+  the SSE leg. That contract is not what 2026-07-28 tooling is
+  exercising anymore (Inspector only serves the modern leg on its HTTP
+  test servers; the legacy `mcp-app-http.json` is explicitly tagged
+  "legacy era").
+- **Diminishing returns**: it would re-introduce a transport-specific
+  dependency on Grok's deprecation timeline, and would mean writing two
+  handlers (`createMcpHandler` already gives the era fallback for free).
+
+**Effects on the rest of the map.** T3 (stack) is unblocked; T5 (nix
+shape) and T7 (test surface) become researchable. T4 (tool surface) was
+never blocked on T1.
+
+**Sources also captured for design.md:**
+
+- https://modelcontextprotocol.io/specification/2026-07-28/basic/transports
+- https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+- https://modelcontextprotocol.io/specification/2026-07-28/changelog
+- https://modelcontextprotocol.io/specification/2024-11-05/basic/transports
+- https://docs.x.ai/developers/tools/remote-mcp
+- https://docs.x.ai/grok/connectors/custom-mcp-tunneling
+- https://github.com/modelcontextprotocol/typescript-sdk/tree/main/examples/hono
+- https://github.com/modelcontextprotocol/typescript-sdk/tree/main/packages/middleware/hono
+
+[xAI custom-MCP-tunneling guide]: https://docs.x.ai/grok/connectors/custom-mcp-tunneling
+[spec/2026-07-28/basic/transports — overview]: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports
+[spec/2026-07-28/basic/transports/streamable-http]: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+[spec/2026-07-28/changelog]: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+[spec/2024-11-05/basic/transports]: https://modelcontextprotocol.io/specification/2024-11-05/basic/transports
 
 ### T2. Auth model
 
@@ -91,7 +205,6 @@ Each ticket is sized to one 100K-token session. Mark with label
 ### T3. Stack
 
 > **Labels**: `wayfinder:grilling`
-> **Blocked by**: T1.
 > **Question**: TypeScript (`@modelcontextprotocol/server` + Hono middleware)
 > vs Python (`mcp` SDK) vs Rust (`rmcp` crate). Factor in: official-SDK
 > maturity, nixpkgs friction, and how well Streamable HTTP transport is
@@ -109,7 +222,6 @@ Each ticket is sized to one 100K-token session. Mark with label
 ### T5. Nix shape
 
 > **Labels**: `wayfinder:research`
-> **Blocked by**: T3.
 > **Question**: How does the flake consume the chosen SDK?
 >   - `nodePackages` derivation with `@modelcontextprotocol/server` pinned?
 >   - `pnpm2nix` reading a `pnpm-lock.yaml`?
@@ -131,7 +243,6 @@ Each ticket is sized to one 100K-token session. Mark with label
 ### T7. Test surface
 
 > **Labels**: `wayfinder:research`
-> **Blocked by**: T3.
 > **Question**: How do we exercise the bridge end-to-end without Grok?
 > MCP Inspector CLI + a mock SB on `localhost:3010`? Custom vitest fixture?
 > Files when resolved: design.md §Testing.
@@ -148,8 +259,9 @@ Each ticket is sized to one 100K-token session. Mark with label
 <!-- dim view of what's coming: things we suspect we'll ticket but can't yet phrase precisely -->
 
 - How Grok should discover tool changes mid-session — should the bridge
-  support `resources/subscribe` + SSE notifications for live updates, or
-  is request/response enough? Depends on T4.
+  support `subscriptions/listen` so the SSE notify channel can deliver
+  `notifications/tools/list_changed` and `notifications/resources/updated`
+  mid-session, or is plain per-request POST enough? Decide after T4.
 - Whether the design doc should include a SwiftBar / TUI launcher for the
   tunnel + bridge, or leave that to operator scripts.
 - A schema for *what* the bridge surfaces from SilverBullet — does it pass
@@ -157,6 +269,11 @@ Each ticket is sized to one 100K-token session. Mark with label
   a rich, dangerous axis.
 - Version pinning for `@modelcontextprotocol/server` 2.0 — once nix
   consumption is decided in T5, this becomes a ticket.
+- `Origin` and DNS-rebinding protection: the TS Hono adapter arms
+  localhost-origin validation by default, but our server is not on
+  localhost relative to Grok (it is on the Cloudflare tunnel). Decide
+  after T3 whether to relax or replace the default and ship our own host
+  allow-list.
 
 ## Out of scope
 
