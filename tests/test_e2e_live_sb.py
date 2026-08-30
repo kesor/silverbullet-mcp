@@ -856,3 +856,619 @@ async def test_if_match_stale_etag_returns_412() -> None:
         with suppress(asyncio.CancelledError):
             await server_task
         await _delete_t31_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T31a: synthetic-etag fallback end-to-end against live SB.
+#
+# The T31 verification closed negatively on this dev box: SB strips
+# the ``ETag`` response header on PUT, so a real-etag round trip is
+# impossible. T31a's ``synthesize_etag`` fallback derives a stable
+# value from ``X-Last-Modified`` + ``X-Content-Length``. This live
+# test exercises the fallback end-to-end: read a page (synthesized
+# etag appears on the envelope even though SB stripped ``ETag``),
+# then write with that synthesized value, then read again with a
+# different body length and assert the synthesized etag drifted.
+# This is the operational canary that the v1.3 fallback is wired
+# correctly: if the synthesized value doesn't drift on a real body
+# change, T31b's post-write verification has nothing to compare.
+# ---------------------------------------------------------------------------
+
+T31A_MARKER = "e2e-mcp-silverbullet-t31a-synth-etag.md"
+
+
+async def _delete_t31a_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T31A_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_if_match_synthetic_etag_drifts_on_body_change() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    body_a = "T31a first write body\n"
+    body_b = "T31a second write body, longer\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: write body_a. The envelope's ``etag``
+                    # is synthesized from ``X-Last-Modified`` +
+                    # ``X-Content-Length`` because SB strips
+                    # ``ETag`` on this build (the T31 fact). The
+                    # synthesized value is whatever
+                    # :func:`synthesize_etag` returns for the
+                    # response headers — what matters for this test
+                    # is that the envelope carries *some* etag so
+                    # the agent has a value to thread into a
+                    # follow-up write.
+                    created = await session.call_tool(
+                        "write_page",
+                        {"name": T31A_MARKER, "content": body_a},
+                    )
+                    assert created.is_error is False, created
+                    created_payload = created.structured_content or {}
+                    etag_a = created_payload.get("etag")
+                    size_a = created_payload.get("size_bytes")
+                    assert etag_a is not None, (
+                        "T31a: bridge envelope on a fresh write "
+                        "should carry *some* etag (real or "
+                        "synthesized); got None on this SB build. "
+                        "synthesize_etag fallback is not wired "
+                        "correctly."
+                    )
+                    assert size_a is not None
+                    # The synthesized form on this SB build is
+                    # ``"<ms>-<bytes>"`` (both headers populated
+                    # by SB on every PUT). Lock the exact form so
+                    # a future regression that changes the
+                    # synthetic shape (e.g. dropping the dashes)
+                    # fails loudly.
+                    assert etag_a.startswith('"') and etag_a.endswith('"')
+                    assert "-" in etag_a
+
+                    # Step 2: re-read the same body. The
+                    # synthesized etag should match the post-write
+                    # etag (stability across reads of unchanged
+                    # content — the precondition an agent needs
+                    # to detect *no* edit between read and write).
+                    read_again = await session.call_tool(
+                        "read_page", {"name": T31A_MARKER}
+                    )
+                    assert read_again.is_error is False, read_again
+                    etag_a_read = (
+                        read_again.structured_content or {}
+                    ).get("etag")
+                    assert etag_a_read == etag_a, (
+                        f"T31a: synthetic etag should be stable "
+                        f"across re-reads of the same body; got "
+                        f"{etag_a_read!r} after first read, "
+                        f"{etag_a!r} after write"
+                    )
+
+                    # Step 3: write body_b (different length). The
+                    # synthesized etag *must* drift — it's the
+                    # only signal T31b's post-write verification
+                    # has to compare against. Without drift here,
+                    # T31b's helper can never detect a concurrent
+                    # edit on this SB build.
+                    second_write = await session.call_tool(
+                        "write_page",
+                        {"name": T31A_MARKER, "content": body_b},
+                    )
+                    assert second_write.is_error is False, second_write
+                    etag_b = (
+                        second_write.structured_content or {}
+                    ).get("etag")
+                    assert etag_b is not None
+                    assert etag_b != etag_a, (
+                        f"T31a: synthetic etag should drift on a "
+                        f"body change; got the same value "
+                        f"{etag_b!r} for both writes. The "
+                        f"synthesize_etag fallback is "
+                        f"non-functional on this SB build."
+                    )
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t31a_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T31b: post-write concurrency-token verification end-to-end against live SB.
+#
+# T31 closed negatively on this SB build: PUT returns 200 on
+# stale ``If-Match`` (the v1.3 SB-blocking fact). Without T31b
+# the v1.2 / v1.3 concurrency story was unsupported here. T31b's
+# post-write verification helper re-reads after a 200 write and
+# compares the post-write etag against the one the caller passed
+# in ``if_match``; a mismatch raises
+# ``ToolError("concurrent edit detected: …")``.
+#
+# This live test exercises the same race as T31 but with the
+# helper in place: a write-then-mutate-out-of-band-then-write
+# sequence against the live SB, where the second write's
+# ``if_match`` is now stale. The T31 negative verification expected
+# ``is_error=True`` on the second write's *412 path* (which never
+# fires here); T31b's verification expects ``is_error=True`` on
+# the helper's post-write re-read path instead. End state is the
+# same — the agent sees ``concurrent edit detected`` — but the
+# mechanism differs (post-write re-read, not pre-write 412).
+# ---------------------------------------------------------------------------
+
+T31B_MARKER = "e2e-mcp-silverbullet-t31b-verify.md"
+
+
+async def _delete_t31b_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T31B_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_edit_detected_via_post_write_verification() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    body_a = "T31b first write body\n"
+    body_b = "T31b second write body, longer\n"
+    body_c = "T31b third write body with stale If-Match\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: write body_a. The envelope's
+                    # ``etag`` is synthesized via T31a (SB
+                    # strips ``ETag`` on this build). Capture
+                    # the etag and the size for the synthetic
+                    # fallback path; T31a already verified the
+                    # synthesized value is stable across reads
+                    # of unchanged content.
+                    created = await session.call_tool(
+                        "write_page",
+                        {"name": T31B_MARKER, "content": body_a},
+                    )
+                    assert created.is_error is False, created
+                    created_payload = created.structured_content or {}
+                    etag_a = created_payload.get("etag")
+                    last_modified_a = created_payload.get("last_modified_ms")
+                    size_a = created_payload.get("size_bytes")
+                    if etag_a is None:
+                        # Same fallback as T31: synthesize a
+                        # ``"<ms>-<bytes>"`` value from the
+                        # ``X-Last-Modified`` + ``size_bytes``
+                        # the envelope *did* surface. T31a's
+                        # helper now does this automatically
+                        # on the bridge side, so this branch
+                        # is unreachable in normal operation —
+                        # kept as a defensive guard so a future
+                        # regression that strips T31a's
+                        # fallback doesn't crash this test.
+                        if last_modified_a is None or size_a is None:
+                            raise AssertionError(
+                                "T31b: cannot construct a synthetic "
+                                "fallback etag; envelope missing both "
+                                "etag and X-Last-Modified/size_bytes"
+                            )
+                        etag_a = f'"{last_modified_a}-{size_a}"'
+
+                    # Step 2: write body_b (mutate out-of-band
+                    # so ``etag_a`` is stale). No ``if_match``
+                    # here — this is the concurrent edit we're
+                    # trying to detect.
+                    mutating_write = await session.call_tool(
+                        "write_page",
+                        {"name": T31B_MARKER, "content": body_b},
+                    )
+                    assert mutating_write.is_error is False, (
+                        "T31b: out-of-band mutating write failed; "
+                        "test setup broken"
+                    )
+
+                    # Step 3: write body_c with the now-stale
+                    # ``if_match=etag_a``. On this SB build the
+                    # PUT returns 200 (T31's negative finding);
+                    # T31b's post-write verification helper
+                    # re-reads and detects the drift. The agent
+                    # sees the unified
+                    # ``"concurrent edit detected: …"``
+                    # ``ToolError`` rather than a silent
+                    # overwrite.
+                    stale_write = await session.call_tool(
+                        "write_page",
+                        {
+                            "name": T31B_MARKER,
+                            "content": body_c,
+                            "if_match": etag_a,
+                        },
+                    )
+                    assert stale_write.is_error is True, (
+                        f"T31b: stale If-Match should surface "
+                        f"as 'concurrent edit detected' on this "
+                        f"SB build (T31 negative; T31b fallback "
+                        f"verification); bridge returned "
+                        f"is_error=False. The v1.3 concurrency "
+                        f"story is broken end-to-end."
+                    )
+                    assert stale_write.content, (
+                        "is_error=True but content is empty — "
+                        "no message to check the wording against"
+                    )
+                    assert "concurrent edit detected" in (
+                        stale_write.content[0].text
+                    ), (
+                        f"T31b: stale write raised a "
+                        f"non-concurrency error: "
+                        f"{stale_write.content[0].text!r}"
+                    )
+                    assert etag_a in stale_write.content[0].text, (
+                        f"T31b: error message should name the "
+                        f"expected etag; got "
+                        f"{stale_write.content[0].text!r}"
+                    )
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t31b_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T32: create_page end-to-end against live SB.
+#
+# The T32 ticket's "Done when" calls for a T7-style live
+# create-on-empty round trip. This test exercises the happy
+# path end-to-end: create a fresh page, verify the returned
+# envelope matches the T23 shape (``name`` / ``etag`` /
+# ``size_bytes`` / ``last_modified_ms`` / ``created_ms``),
+# then read it back to confirm the body landed. The
+# page-already-exists case is exercised at Layer 1
+# (``tests/test_tools_in_memory.py``); the live test pins
+# the happy-path wire shape and the create-then-read
+# round trip on a real SB.
+# ---------------------------------------------------------------------------
+
+T32_MARKER = "e2e-mcp-silverbullet-t32-create.md"
+
+
+async def _delete_t32_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T32_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_create_page_round_trip_on_empty_space() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    body = "T32 create page body\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: create the page. The envelope
+                    # carries the T23 wire shape (``name`` /
+                    # ``etag`` / ``size_bytes`` /
+                    # ``last_modified_ms`` / ``created_ms``);
+                    # ``is_error`` is False on the happy path.
+                    created = await session.call_tool(
+                        "create_page",
+                        {"name": T32_MARKER, "content": body},
+                    )
+                    assert created.is_error is False, created
+                    created_payload = created.structured_content or {}
+                    assert created_payload.get("name") == T32_MARKER
+                    # ``size_bytes`` is the UTF-8 byte count
+                    # of the body we just wrote (matches the
+                    # T23 contract; independent of SB's
+                    # response shape on this build).
+                    assert created_payload.get("size_bytes") == len(
+                        body.encode("utf-8")
+                    )
+
+                    # Step 2: read it back and confirm the
+                    # body landed verbatim. This is the
+                    # create-then-read round trip the T32
+                    # ticket's "Done when" calls for.
+                    read_back = await session.call_tool(
+                        "read_page", {"name": T32_MARKER}
+                    )
+                    assert read_back.is_error is False, read_back
+                    read_payload = read_back.structured_content or {}
+                    assert read_payload.get("body") == body
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t32_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T33: prepend_to_page end-to-end against live SB.
+#
+# The T33 ticket's "Done when" calls for a T7-style live
+# test that prepends to a journal page with a YAML frontmatter
+# and verifies the frontmatter is still at the top and the
+# new content is just below. This test exercises that round
+# trip end-to-end against the dev-box SB.
+# ---------------------------------------------------------------------------
+
+T33_MARKER = "e2e-mcp-silverbullet-t33-prepend.md"
+
+
+async def _delete_t33_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T33_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_round_trip_with_frontmatter() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    # Pre-populate the page via the bridge so the test
+    # doesn't depend on raw ``/.fs`` PUT semantics outside
+    # the bridge surface. ``create_page`` (T32) is the
+    # right tool for the setup write.
+    original_body = "---\ntitle: T33 marker\ntags: [test]\n---\noriginal body line\n"
+    prepend_content = "PREPENDED LINE\n"
+
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: create the marker with a YAML
+                    # frontmatter and a body line. Use
+                    # ``create_page`` so we don't have to
+                    # reason about whether ``If-Match: *``
+                    # is honored on this dev box's SB.
+                    created = await session.call_tool(
+                        "create_page",
+                        {"name": T33_MARKER, "content": original_body},
+                    )
+                    assert created.is_error is False, created
+
+                    # Step 2: prepend with the default
+                    # ``position="after_frontmatter"``.
+                    # The new content should land *between*
+                    # the closing ``---`` and the first body
+                    # line — the human-meaningful default for
+                    # journal / daily-notes pages with YAML
+                    # frontmatter.
+                    prepended = await session.call_tool(
+                        "prepend_to_page",
+                        {
+                            "name": T33_MARKER,
+                            "content": prepend_content,
+                        },
+                    )
+                    assert prepended.is_error is False, prepended
+
+                    # Step 3: read it back and verify the
+                    # frontmatter is still at the top AND
+                    # the new content is just below.
+                    read_back = await session.call_tool(
+                        "read_page", {"name": T33_MARKER}
+                    )
+                    assert read_back.is_error is False, read_back
+                    body = (read_back.structured_content or {}).get("body", "")
+                    expected = (
+                        "---\n"
+                        "title: T33 marker\n"
+                        "tags: [test]\n"
+                        "---\n"
+                        "PREPENDED LINE\n"
+                        "original body line\n"
+                    )
+                    assert body == expected, (
+                        f"T33: prepended body should land "
+                        f"below frontmatter; got:\n{body!r}\n"
+                        f"expected:\n{expected!r}"
+                    )
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t33_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T36: body-size cap end-to-end against live SB.
+#
+# The T36 ticket's "Done when" calls for Layer-1 + Layer-2
+# coverage; live-SB integration is not needed because the
+# cap is enforced locally (before the SB round trip) and the
+# failure surface is purely local. This is a sanity-check
+# live test that exercises the cap on ``write_page`` and
+# confirms the SB PUT *never happens* — a regression that
+# moved the cap check below the SB round trip would surface
+# here as an actual PUT against the live SB.
+# ---------------------------------------------------------------------------
+
+T36_MARKER = "e2e-mcp-silverbullet-t36-cap.md"
+
+
+async def _delete_t36_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T36_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_body_size_cap_fires_before_sb_round_trip() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+    )
+    # 256 KiB + 1 byte of "a" — one byte over the cap.
+    over_cap_body = "a" * (256 * 1024 + 1)
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # The cap fires locally — the bridge
+                    # raises ``body too large`` before any
+                    # SB round trip. ``is_error=True`` with
+                    # the ``body too large`` wording.
+                    result = await session.call_tool(
+                        "write_page",
+                        {"name": T36_MARKER, "content": over_cap_body},
+                    )
+                    assert result.is_error is True
+                    assert "body too large" in result.content[0].text
+                    # The error names the size (so the agent
+                    # can act on it) and the cap.
+                    assert str(256 * 1024 + 1) in result.content[0].text
+                    assert "256 KiB" in result.content[0].text
+                    assert "append_to_page" in result.content[0].text
+
+                    # Verify the page was NOT created on SB
+                    # (the cap fired locally, the PUT never
+                    # happened). A subsequent ``read_page``
+                    # should 404 (or, on this dev box, fail
+                    # with the standard ``page not found``
+                    # wording) — *not* return the oversized
+                    # body, which would prove the cap failed
+                    # to fire.
+                    read_back = await session.call_tool(
+                        "read_page", {"name": T36_MARKER}
+                    )
+                    assert read_back.is_error is True
+                    assert "page not found" in read_back.content[0].text
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        # Defensive — the page shouldn't exist (the cap
+        # fired before the PUT), but the cleanup is
+        # best-effort.
+        await _delete_t36_marker(sb_url, sb_token)

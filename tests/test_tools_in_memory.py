@@ -86,9 +86,12 @@ wording.
 
 from __future__ import annotations
 
+import json
+
 import httpx2 as httpx
 import pytest
 from mcp.client import Client
+from mcp.server.mcpserver.exceptions import ToolError
 
 from mcp_silverbullet.sb_client import SBClient
 from mcp_silverbullet.server import build_mcp
@@ -478,18 +481,28 @@ async def test_write_page_ack_envelope_is_none_when_meta_stripped() -> None:
 
 @pytest.mark.asyncio
 async def test_write_page_forwards_if_match() -> None:
-    """The MCP tool passes ``if_match`` straight to ``sb_client.write_page``.
+    """The MCP tool passes ``if_match`` straight to ``sb_client.write_page`.
 
     T3 covers the wire envelope (X-Source / X-Permission / Content-Type /
     If-Match on the actual HTTP request); this test guards the MCP
     argument path so a future refactor doesn't silently drop the
-    parameter or coerce it to the empty string.
+    parameter or coerce it to the empty string. After the T31b
+    post-write verification helper was added, ``write_page`` also
+    issues a follow-up ``GET`` (the re-read that compares the
+    post-write etag against the caller's ``if_match``); the test
+    asserts the PUT envelope is correct regardless of how many
+    GETs follow.
     """
     seen_match: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen_match.append(request.headers.get("If-Match", ""))
-        return httpx.Response(200, headers={"ETag": '"v2"'})
+        if request.method == "PUT":
+            seen_match.append(request.headers.get("If-Match", ""))
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns the same etag so the helper's
+        # etag compare passes (the page didn't drift between the
+        # write and the re-read).
+        return httpx.Response(200, headers={"ETag": '"v1"'})
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -930,6 +943,10 @@ async def test_append_to_page_forwards_if_match_to_write() -> None:
     since I last read" passes the etag they got from their last
     ``read_page``; the bridge threads it straight into
     ``If-Match`` on the PUT. The GET carries no precondition.
+    T31b added a post-write verification GET (``read_page_meta``)
+    that fires after a 200 write; this test asserts the *initial*
+    read/write sequence is correct (the verification GET comes
+    after the write and is covered by the dedicated T31b tests).
     """
     seen_if_match: list[str] = []
     calls: list[str] = []
@@ -948,9 +965,15 @@ async def test_append_to_page_forwards_if_match_to_write() -> None:
             {"name": "index", "text": "world", "if_match": '"v1"'},
         )
 
-    # Read first, then write; If-Match only on the write.
-    assert calls == ["GET", "PUT"]
-    assert seen_if_match == ["", '"v1"']
+    # Initial sequence is read-then-write; the T31b verification
+    # GET follows after the write completes (a follow-up GET
+    # between the write and any other verification work). The
+    # PUT envelope carries the caller's ``If-Match``; the GETs
+    # carry no precondition.
+    assert calls[0] == "GET"
+    assert calls[1] == "PUT"
+    assert seen_if_match[0] == ""
+    assert seen_if_match[1] == '"v1"'
 
 
 @pytest.mark.asyncio
@@ -2245,8 +2268,13 @@ async def test_patch_page_lines_forwards_if_match_to_write() -> None:
             },
         )
 
-    assert calls == ["GET", "PUT"]
-    assert seen_if_match == ["", '"v1"']
+    # Initial sequence is read-then-write; T31b appends a
+    # post-write verification GET. The PUT envelope carries the
+    # caller's ``If-Match``; the GETs carry no precondition.
+    assert calls[0] == "GET"
+    assert calls[1] == "PUT"
+    assert seen_if_match[0] == ""
+    assert seen_if_match[1] == '"v1"'
 
 
 @pytest.mark.asyncio
@@ -2777,9 +2805,13 @@ async def test_patch_page_replace_forwards_if_match_to_write() -> None:
             },
         )
 
-    # Read first, then write; If-Match only on the write.
-    assert calls == ["GET", "PUT"]
-    assert seen_if_match == ["", '"v1"']
+    # Initial sequence is read-then-write; T31b appends a
+    # post-write verification GET. The PUT envelope carries the
+    # caller's ``If-Match``; the GETs carry no precondition.
+    assert calls[0] == "GET"
+    assert calls[1] == "PUT"
+    assert seen_if_match[0] == ""
+    assert seen_if_match[1] == '"v1"'
 
 
 @pytest.mark.asyncio
@@ -3613,7 +3645,9 @@ async def test_move_page_forwards_if_match_to_delete() -> None:
     *write* side (here the source delete — the etag from the read
     is the natural anchor). The read carries no precondition; the
     destination PUT carries ``If-None-Match: *`` (move is rename,
-    not merge).
+    not merge). T31b adds a post-delete verification GET that
+    short-circuits to 404 (the source is gone) — see the dedicated
+    T31b tests for that path.
     """
     seen_if_match: list[str] = []
 
@@ -3632,9 +3666,12 @@ async def test_move_page_forwards_if_match_to_delete() -> None:
             {"name": "old", "new_name": "new", "if_match": '"v1"'},
         )
 
-    # GET has no precondition; PUT has If-None-Match (not If-Match);
-    # DELETE carries the caller's if_match.
-    assert seen_if_match == ["", "", '"v1"']
+    # Initial sequence: GET (no precondition), PUT (If-None-Match,
+    # so empty ``If-Match``), DELETE (caller's ``if_match``).
+    # T31b's post-delete verification GET (which carries no
+    # ``If-Match`` either) follows and is covered by the T31b
+    # tests; this test pins the initial-sequence envelope.
+    assert seen_if_match[:3] == ["", "", '"v1"']
 
 
 @pytest.mark.asyncio
@@ -5220,3 +5257,1437 @@ async def test_check_task_timeout_returns_tool_error() -> None:
     assert result.is_error is True
     assert _text(result) == "Error executing tool check_task: silverbullet request timed out"
 
+# --- T31b: post-write concurrency-token verification ---------------------
+
+
+@pytest.mark.asyncio
+async def test_t31b_write_page_detects_concurrent_edit_via_silent_overwrite() -> None:
+    """200 write followed by a re-read with a drifted etag surfaces ``concurrent edit detected``.
+
+    T31 closed negatively on this dev box (SB ignores ``If-Match``
+    on PUT, returns no ``ETag``). Without T31b the v1.2 / v1.3
+    concurrency story was unsupported: an agent that does
+    ``read → write(if_match=read_etag)`` silently overwrites a
+    page a concurrent agent already updated. T31b's
+    post-write verification helper re-reads the page and
+    compares etags — a drifted etag raises
+    ``ToolError("concurrent edit detected: …")`` *before* the
+    T23 ack envelope is constructed, so the agent sees the
+    same conflict signal it would have seen on an SB that
+    honored ``If-Match``, just delivered later in the round
+    trip.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            # SB returns 200 on stale ``If-Match`` (the v1.3 SB
+            # fact T31 surfaced); the bridge's post-write
+            # verification is what catches the drift.
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        # Verification GET returns the post-write etag, which
+        # drifts from the caller's ``"v1"`` — the page was
+        # mutated out-of-band between the agent's read and
+        # write.
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+    # The error names the expected etag so the agent can see
+    # what the bridge was looking for.
+    assert '"v1"' in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t31b_write_page_verification_passes_when_etag_unchanged() -> None:
+    """Happy path: 200 write followed by a re-read with the same etag → success.
+
+    The mirror of the negative case: the helper compares the
+    post-write re-read against the caller's ``if_match``; if
+    they match (no concurrent edit), the helper no-ops and the
+    tool returns the normal T23 ack envelope. This locks the
+    ``happy path is unaffected`` invariant — a T31b
+    regression that fires on every write would be loudest as
+    a 100% failure of this test, not as a flaky edge case.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns the same etag.
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload.get("name") == "index"
+    assert payload.get("etag") == '"v1"'
+
+
+@pytest.mark.asyncio
+async def test_t31b_write_page_skips_verification_when_if_match_is_none() -> None:
+    """``if_match=None`` opts out of the verification (no precondition to verify).
+
+    The helper's contract: ``None`` and ``"*"`` are both no-ops
+    (no value to compare against). When the caller passes
+    ``if_match=None`` they explicitly opted out of the
+    concurrency primitive — there's no race the helper can
+    detect. Locks the "opt-in only" invariant: a regression
+    that fires verification on every write would surface here
+    as a 200 response turning into an error.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No follow-up GET expected: the helper skips when
+        # ``if_match`` is ``None``. Handler returns 200 for any
+        # method just in case a future regression adds one.
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body"},
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t31b_write_page_skips_verification_when_if_match_is_star() -> None:
+    """``if_match="*"`` (require existence) opts out of verification too.
+
+    ``"*"`` doesn't uniquely identify a body; comparing it
+    against a real etag would always mismatch. The helper's
+    ``if expected_etag == "*": return`` clause makes the
+    ``write_page(if_match="*")`` path (which is what
+    ``create_page`` / T32 delegates to) safe — the helper
+    won't fire on the create path and cause every create to
+    surface as a concurrency error.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"whatever"'})
+        return httpx.Response(200, headers={"ETag": '"whatever"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": "*"},
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t31b_append_to_page_detects_concurrent_edit_via_silent_overwrite() -> None:
+    """Read-modify-write tools inherit the same verification on their final PUT.
+
+    T31b's contract applies to every write tool that threads
+    an etag through ``if_match`` — read-modify-write tools do
+    that explicitly (they read the page, splice, and re-write
+    with the read's etag as the precondition). The negative
+    case is identical to ``write_page``'s: 200 on the PUT
+    followed by a re-read with a drifted etag surfaces the
+    unified ``concurrent edit detected`` wording.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # First GET is the read-modify-write's read.
+            return httpx.Response(200, text="hello")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        # Verification GET returns the drifted etag.
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "world", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t31b_append_to_page_auto_threads_read_etag_when_if_match_is_none() -> None:
+    """``if_match=None`` on append_to_page auto-threads the read's etag for the verification path.
+
+    Read-modify-write tools thread the read's etag into the
+    write's ``if_match`` automatically (the v1.2 read-modify-
+    write contract). The T31b helper sees that auto-threaded
+    value as ``expected_etag`` and re-reads after the write —
+    so a concurrent edit between read and write surfaces as
+    the unified concurrency error, even when the caller
+    passed ``if_match=None``. This is the operational canary
+    for the v1.3 story: an agent that just wants ``append``
+    (no etag round-trip) still gets concurrent-edit detection
+    for free.
+    """
+    request_count = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            request_count["get"] += 1
+            # First GET (the read-modify-write) returns
+            # ``"read-etag"``, which the bridge auto-threads
+            # into the write's ``If-Match``. Second GET (the
+            # verification re-read) returns ``"new"`` — drift
+            # means a concurrent edit happened between the
+            # read and the write, and the helper surfaces the
+            # unified concurrency error.
+            if request_count["get"] == 1:
+                return httpx.Response(
+                    200, text="hello", headers={"ETag": '"read-etag"'}
+                )
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "world"},
+        )
+
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t31b_dry_run_skips_verification() -> None:
+    """``dry_run=True`` paths do not invoke the verification helper.
+
+    The helper's contract: ``dry_run=True`` short-circuits to
+    a no-op because no write happened to verify. A regression
+    that fired verification on the dry-run path would turn
+    every dry-run into a concurrency check against the
+    pre-write read, which is meaningless — there's no PUT
+    to race against. Locks the "dry-run is read-only" invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Only GETs expected (read + dry-run's pre-read; no PUT).
+        return httpx.Response(200, text="hello", headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index", "text": "world", "if_match": '"v1"', "dry_run": True},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload.get("dry_run") is True
+
+
+@pytest.mark.asyncio
+async def test_t31b_verification_skips_on_re_read_404() -> None:
+    """Re-read returning 404 (page deleted out-of-band post-write) is a no-op, not an error.
+
+    The helper's contract: a 404 on the verification re-read is
+    treated as "verification skipped" (not a concurrency
+    violation). A regression that fired the helper on a 404
+    would turn every post-delete re-read into a spurious
+    concurrency error. Locks the "post-delete re-read is safe"
+    invariant — important for ``delete_page`` (which has no
+    PUT to verify) and ``move_page`` (where the source
+    re-read post-delete 404s by construction).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns 404 (page deleted
+        # out-of-band).
+        return httpx.Response(404, text="not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t31b_verification_skips_on_re_read_5xx() -> None:
+    """Re-read returning 5xx degrades gracefully (no false-positive concurrency error).
+
+    The helper's contract: transient SB failures during the
+    re-read are treated as "verification skipped" rather than
+    as a concurrency violation. The alternative is a
+    false-positive "concurrent edit detected" on a flaky SB
+    that would be much harder to debug than a silently-lost
+    verification. Locks the "transient failures are
+    best-effort" invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t31b_412_wins_over_verification_on_sbs_that_honor_if_match() -> None:
+    """When SB returns 412, the unified 412 wording wins (no follow-up re-read).
+
+    T31b's contract: the helper is the *fallback* for SBs that
+    don't honor ``If-Match`` — the primary path is the 412
+    from :func:`_translate_sb_errors`. When SB returns 412,
+    the helper doesn't run (the request already raised a
+    typed exception, which the helper's caller propagates
+    through ``_translate_sb_errors``). This test pins that
+    the 412 path *still* wins even with T31b in place — a
+    regression that bypassed the 412 path on this branch
+    would surface here.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is True
+    assert "precondition failed" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t31b_delete_page_post_delete_verification_skips() -> None:
+    """``delete_page``'s post-delete verification re-read 404s, helper no-ops.
+
+    The T31b ticket: ``delete_page`` and ``move_page`` get a
+    "lighter verification" because the source post-delete
+    is gone. The helper's ``except PageNotFound: return``
+    branch handles this — no spurious concurrency error. The
+    test asserts the delete succeeds normally even when the
+    re-read would 404.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns 404 (source is gone).
+        return httpx.Response(404, text="not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "delete_page", {"name": "index", "if_match": '"v1"'}
+        )
+
+    assert result.is_error is False# --- T32: create_page --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_page_returns_ack_envelope_on_200() -> None:
+    """``create_page`` happy path returns the T23 ack envelope.
+
+    Locks the wire shape: the agent that creates a page gets the
+    same `{name, etag, size_bytes, last_modified_ms, created_ms}`
+    envelope `write_page` returns, so a caller that learns one
+    shape has it for both tools. The body is omitted (writes
+    return meta only — T23).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Created": "1700000000000",
+                "X-Content-Length": "4",
+            },
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "new-page", "content": "body"}
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["name"] == "new-page"
+    assert payload["etag"] == '"abc123"'
+    assert payload["size_bytes"] == 4
+    assert payload["last_modified_ms"] == 1700000000123
+    assert payload["created_ms"] == 1700000000000
+
+
+@pytest.mark.asyncio
+async def test_create_page_sends_if_match_star_to_sb() -> None:
+    """``create_page`` always sends ``If-Match: *`` (refuse to overwrite).
+
+    Locks the implementation contract: ``create_page`` delegates
+    to ``write_page(if_match="*")`, so the bridge sends
+    ``If-Match: *`` to SB on every create. The caller never has
+    to pass `if_match` (it's implied per the T32 ticket); the
+    tool exists precisely because the agent shouldn't have to
+    think about the precondition.
+    """
+    captured_if_match: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_if_match.append(request.headers.get("If-Match", ""))
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        await client.call_tool(
+            "create_page", {"name": "new", "content": "body"}
+        )
+
+    assert captured_if_match == ["*"]
+
+
+@pytest.mark.asyncio
+async def test_create_page_already_exists_translates_412_to_tool_error() -> None:
+    """SB returning 412 (page exists) surfaces as ``page already exists: {name}; use write_page to overwrite``.
+
+    The T32 charter's headline: the agent that calls
+    ``create_page`` on an existing page gets a clean
+    ``ToolError("page already exists: {name}; use write_page
+    to overwrite")`` rather than the generic 412 wording
+    (`"precondition failed; check if_match/if_none_match"`)
+    that ``write_page`` would surface. The error names the
+    page (so the agent can see what collided) AND names the
+    right next tool (so the agent doesn't have to remember
+    the pattern-match).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "existing", "content": "body"}
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "page already exists" in text
+    assert "existing" in text
+    assert "write_page" in text
+    # The wording is *not* the generic 412 from
+    # ``_translate_sb_errors`` (which would say
+    # ``"precondition failed; check if_match/if_none_match"``).
+    # This is the T32 translation.
+    assert "precondition failed" not in text
+
+
+@pytest.mark.asyncio
+async def test_create_page_empty_name_returns_tool_error() -> None:
+    """Empty ``name`` → upfront ``ToolError("name must not be empty")``.
+
+    Cheap, no-read input validation first: an empty name is
+    almost certainly a caller bug (the caller forgot to fill
+    in the page name); surface it loudly before the round
+    trip. Mirrors the upfront guards on the other tools
+    (``text must not be empty``, ``find must not be empty``,
+    ``ref must not be empty``). Locks the T32 charter's
+    "empty `name` (upfront `ToolError`)" requirement.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No PUT should fire — the upfront guard rejects the
+        # call before any SB round trip.
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "", "content": "body"}
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_create_page_whitespace_only_name_returns_tool_error() -> None:
+    """``"   "`` → upfront ``ToolError("name must not be empty")``.
+
+    Whitespace-only names are empty in practice (SB would
+    reject the request downstream, but the bridge catches it
+    upstream). Same surface as the empty-name case so the
+    agent sees one shape across both.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "   \n  ", "content": "body"}
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_create_page_404_does_not_silently_succeed() -> None:
+    """A 404 on create (theoretically impossible since we're *creating*) still surfaces.
+
+    The :func:`_translate_sb_errors` helper's 404 clause is
+    reached when SB returns 404. SB's ``/.fs`` PUT handler
+    doesn't typically 404 (the create-or-overwrite shape is
+    the whole point of the endpoint), but if it ever does,
+    the agent sees a ``page not found`` wording rather than
+    a silent success. Locks the "no hidden failures"
+    invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "anything", "content": "body"}
+        )
+
+    assert result.is_error is True
+    assert "page not found" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_create_page_5xx_returns_tool_error() -> None:
+    """SB 5xx on a create → ``ToolError``, not a silent success.
+
+    The wording matches the design doc § Tools § Status-code
+    mapping: 5xx becomes ``silverbullet error: {status}`` (the
+    same wording every other SB-backed tool uses). A future
+    ticket could thread the upstream error text through
+    ``ServerError``, but that's a separate concern; the T32
+    charter is to wire ``create_page`` through the standard
+    error-translation path, not to redesign the error
+    envelope.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "anything", "content": "body"}
+        )
+
+    assert result.is_error is True
+    assert "silverbullet error: 503" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_create_page_does_not_expose_if_match_in_tool_schema() -> None:
+    """``create_page``'s tool schema omits ``if_match`` (implied ``"*"``).
+
+    The T32 charter: ``if_match="*"`` is implied (no need to
+    make the caller pass it). The MCP tool schema exposes only
+    ``name`` and ``content`` as caller-facing arguments —
+    threading an etag precondition would be a misuse of the
+    create semantic (``write_page(if_match=<etag>)`` is the
+    right tool for that). This test introspects the schema via
+    ``list_tools`` and asserts ``create_page``'s
+    ``inputSchema`` does not declare ``if_match`` as a
+    property, so an agent reading the schema can't
+    accidentally try to pass one.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        create_page_tool = next(
+            t for t in tools.tools if t.name == "create_page"
+        )
+        schema = create_page_tool.input_schema
+        properties = schema.get("properties", {})
+        assert "name" in properties
+        assert "content" in properties
+        # ``if_match`` is implied — not exposed to callers.
+        # A future T32a could add an ``overwrite=False`` knob
+        # if a use case appears, but the charter is "create
+        # or refuse" with no caller-controlled precondition.
+        assert "if_match" not in properties# --- T33: prepend_to_page --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_happy_path_no_frontmatter() -> None:
+    """``prepend_to_page`` on a body without frontmatter lands content at the absolute top.
+
+    The simplest case: a page with no ``---\\n…\\n---\\n`` block,
+    default ``position="after_frontmatter"`` (which behaves
+    identically to ``"top"`` when there's no frontmatter to
+    anchor against). The new content lands at the absolute top
+    of the page body.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="hello world\n")
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": "HEADER\n"},
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["name"] == "index"
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_default_after_frontmatter_inserts_below_block() -> None:
+    """Default ``position="after_frontmatter"`` puts content *below* the YAML block.
+
+    The human-meaningful default: a page with a YAML
+    frontmatter block gets the new content *between* the
+    closing ``---`` and the first body line, NOT above the
+    opening ``---`` (which would break frontmatter consumers
+    that expect to find the block at the top of the page).
+    """
+    original_body = "---\ntitle: My Page\ntags: [foo]\n---\nbody line\n"
+    new_content = "INSERTED\n"
+
+    captured_writes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=original_body)
+        if request.method == "PUT":
+            captured_writes.append(request.content.decode("utf-8"))
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": new_content},
+        )
+
+    assert result.is_error is False
+    assert captured_writes == [
+        "---\ntitle: My Page\ntags: [foo]\n---\nINSERTED\nbody line\n"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_position_top_inserts_above_frontmatter() -> None:
+    """``position="top"`` puts the new content above the YAML block.
+
+    The override path: the caller explicitly wants to push
+    the frontmatter down (rare; almost always a bug in
+    practice, but a legitimate intent the tool exposes).
+    The new content lands at the absolute top of the file,
+    above the opening ``---`` fence.
+    """
+    original_body = "---\ntitle: My Page\n---\nbody line\n"
+    new_content = "BEFORE FM\n"
+
+    captured_writes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=original_body)
+        if request.method == "PUT":
+            captured_writes.append(request.content.decode("utf-8"))
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {
+                "name": "index",
+                "content": new_content,
+                "position": "top",
+            },
+        )
+
+    assert result.is_error is False
+    assert captured_writes == [
+        "BEFORE FM\n---\ntitle: My Page\n---\nbody line\n"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_position_top_without_frontmatter() -> None:
+    """``position="top"`` on a body without frontmatter = ``"after_frontmatter"``.
+
+    Without frontmatter to anchor against, both positions
+    produce the same splice (new content at absolute top).
+    Locks the "no frontmatter to push down" equivalence.
+    """
+    captured_writes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body line\n")
+        if request.method == "PUT":
+            captured_writes.append(request.content.decode("utf-8"))
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {
+                "name": "index",
+                "content": "HEADER\n",
+                "position": "top",
+            },
+        )
+
+    assert result.is_error is False
+    assert captured_writes == ["HEADER\nbody line\n"]
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_malformed_frontmatter_treated_as_no_frontmatter() -> None:
+    """A page that opens with ``---`` but doesn't close it = no-frontmatter.
+
+    The T33 ticket's explicit rule: a malformed frontmatter
+    block is treated as no-frontmatter at all. The new
+    content lands at the absolute top, same as a page
+    with no ``---`` opening fence. Locks the "raw text,
+    no parser" stance from the ticket.
+    """
+    original_body = "---orphan body line\n"  # opening fence, no closing
+    new_content = "HEADER\n"
+
+    captured_writes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=original_body)
+        if request.method == "PUT":
+            captured_writes.append(request.content.decode("utf-8"))
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": new_content},
+        )
+
+    assert result.is_error is False
+    # New content at absolute top — frontmatter-less splice.
+    assert captured_writes == ["HEADER\n---orphan body line\n"]
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_empty_content_returns_tool_error() -> None:
+    """Empty ``content`` → upfront ``ToolError("content must not be empty")``.
+
+    Mirrors the empty-``text`` guard on ``append_to_page``.
+    Surface it loudly before the read-modify-write round
+    trip; an empty prepend is almost certainly a caller bug.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No GET expected — the upfront guard rejects the
+        # call before any SB round trip.
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": ""},
+        )
+
+    assert result.is_error is True
+    assert "content must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_unknown_position_returns_tool_error() -> None:
+    """Unknown ``position`` → upfront ``ToolError("position must be one of: …")`.
+
+    Same upfront-rejection pattern as the empty-content
+    guard. The two-mode ``position`` knob is the
+    frontmatter-aware default + the absolute-top override;
+    anything else is a typo (``"topmost"``, ``"first"``,
+    ``"above_frontmatter"``, ...) and should surface
+    loudly before any FS walk.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {
+                "name": "index",
+                "content": "body",
+                "position": "topmost",
+            },
+        )
+
+    assert result.is_error is True
+    assert "position must be one of" in _text(result)
+    assert "after_frontmatter" in _text(result)
+    assert "top" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_dry_run_returns_preview_without_writing() -> None:
+    """``dry_run=True`` returns the T26 preview envelope without writing.
+
+    Mirrors the dry-run behavior on ``append_to_page`` /
+    ``patch_page_lines`` / ``patch_page_replace``. The
+    dry-run envelope surfaces the *post-shaping* body
+    (with frontmatter-aware splice applied), so the diff
+    the agent sees is exactly what would have been
+    written.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body line\n")
+        # No PUT expected on a dry-run path.
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {
+                "name": "index",
+                "content": "HEADER\n",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+    assert payload["original"] == "body line\n"
+    assert payload["patched"] == "HEADER\nbody line\n"
+    # Diff is a non-empty string for any non-trivial patch;
+    # we don't pin the exact wording (difflib formatting
+    # can drift across Python versions) — just that the
+    # field is populated.
+    assert payload["diff"]
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_dry_run_does_not_invoke_t31b_verification() -> None:
+    """``dry_run=True`` short-circuits T31b's post-write verification helper.
+
+    Locks the T31b helper's ``dry_run=True`` opt-out for
+    the new tool — a regression that fired the verification
+    path on dry-run would turn every dry-run into a
+    concurrency check against the pre-write read, which is
+    meaningless (there's no PUT to race against).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # GET returns a different etag on every read; if
+        # T31b fired, the second GET's etag would differ
+        # from the first and the helper would raise
+        # ``concurrent edit detected``. Since dry_run
+        # short-circuits, only one GET (the read) should
+        # fire.
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="body line\n", headers={"ETag": '"v1"'}
+            )
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {
+                "name": "index",
+                "content": "HEADER\n",
+                "if_match": '"v1"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_auto_threads_read_etag_when_if_match_is_none() -> None:
+    """``if_match=None`` auto-threads the read's etag into the write's ``If-Match``.
+
+    Same auto-thread pattern as ``append_to_page`` / the
+    patch tools: when the caller passes ``None``, the
+    read's etag is threaded into the write's precondition
+    so a concurrent edit between read and write surfaces
+    as ``concurrent edit detected`` via the T31b helper,
+    even without the caller managing an etag round-trip.
+    """
+    request_count = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            request_count["get"] += 1
+            if request_count["get"] == 1:
+                # First read: returns the read's etag,
+                # which the bridge auto-threads into the
+                # write's ``If-Match``.
+                return httpx.Response(
+                    200, text="body\n", headers={"ETag": '"read-etag"'}
+                )
+            # Verification GET returns a drifted etag.
+            return httpx.Response(
+                200, text="body\n", headers={"ETag": '"new"'}
+            )
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": "HEADER\n"},
+        )
+
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_404_returns_tool_error() -> None:
+    """Missing page → standard ``ToolError("page not found: {name}")`` wording."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "missing", "content": "body"},
+        )
+
+    assert result.is_error is True
+    assert "page not found" in _text(result)
+    assert "missing" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_prepend_to_page_412_returns_tool_error() -> None:
+    """Stale ``if_match`` → standard 412 wording (``"precondition failed; …"``)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "index", "content": "body", "if_match": '"v0"'},
+        )
+
+    assert result.is_error is True
+    assert "precondition failed" in _text(result)
+
+# --- _split_frontmatter_block helper unit tests (T33) ------------------
+
+
+def test_split_frontmatter_block_no_frontmatter_returns_none() -> None:
+    """Body without a leading ``---`` fence → ``(None, body)``.
+
+    The canonical "no frontmatter" signal: ``None``, matching
+    the journal helper's contract. Callers that don't care
+    about the no-frontmatter distinction can treat ``None``
+    the same as ``[]`` and not break; :func:`prepend_to_page`
+    treats them identically (the splice is the same).
+    """
+    from mcp_silverbullet.server import _split_frontmatter_block
+
+    fm, rest = _split_frontmatter_block("body content\n")
+    assert fm is None
+    assert rest == "body content\n"
+
+
+def test_split_frontmatter_block_with_frontmatter_splits_correctly() -> None:
+    """Body with a leading ``---\\n…\\n---\\n`` block → ``(fm, rest)``.
+
+    The wire shape: ``frontmatter`` carries the opening
+    fence, the ``…`` lines, the closing fence, AND the
+    trailing ``\\n`` after the closing fence (so
+    concatenation is correct: ``fm + content + rest``). The
+    ``rest`` half starts at the line *after* the closing
+    fence with its trailing newline preserved iff the
+    original body had one.
+    """
+    from mcp_silverbullet.server import _split_frontmatter_block
+
+    body = "---\ntitle: My Page\ntags: [foo]\n---\nbody line\n"
+    fm, rest = _split_frontmatter_block(body)
+    # Frontmatter carries the opening fence through the
+    # trailing newline after the closing fence.
+    assert fm == "---\ntitle: My Page\ntags: [foo]\n---\n"
+    # Body half starts at the line after the closing fence
+    # and preserves the trailing newline.
+    assert rest == "body line\n"
+
+
+def test_split_frontmatter_block_malformed_returns_none() -> None:
+    """Body that opens with ``---`` but doesn't close it → ``(None, body)``.
+
+    Locks the T33 ticket's "raw text, no parser" stance:
+    a malformed frontmatter block is treated as no
+    frontmatter at all. The body shape stays the same
+    (the tool doesn't have to special-case a malformed
+    page) and the no-frontmatter signal is honest about
+    the page being broken.
+    """
+    from mcp_silverbullet.server import _split_frontmatter_block
+
+    # Opening fence, no closing fence.
+    fm, rest = _split_frontmatter_block("---orphan body line\n")
+    assert fm is None
+    assert rest == "---orphan body line\n"
+
+
+def test_split_frontmatter_block_empty_body_returns_none() -> None:
+    """Empty body → ``(None, "")``.
+
+    Defensive: an empty body is the trivial no-frontmatter
+    case. Locks the helper's behavior on the edge input
+    (the journal helper's splitlines-based path returns
+    ``[]`` on empty input; this one matches).
+    """
+    from mcp_silverbullet.server import _split_frontmatter_block
+
+    fm, rest = _split_frontmatter_block("")
+    assert fm is None
+    assert rest == ""
+
+
+def test_split_frontmatter_block_body_without_trailing_newline() -> None:
+    """Body without a trailing newline preserves the no-newline shape.
+
+    The body half (``rest``) doesn't gain a trailing
+    newline it didn't have. Without this invariant, a
+    prepended page that originally ended without a newline
+    would gain one — silently changing the page's wire
+    shape and potentially breaking downstream consumers
+    that compare body bytes.
+    """
+    from mcp_silverbullet.server import _split_frontmatter_block
+
+    body = "---\ntitle: My Page\n---\nbody without trailing newline"
+    fm, rest = _split_frontmatter_block(body)
+    # The closing fence was followed by a newline in the
+    # original body (every well-formed frontmatter block
+    # ends with ``---\n``), so ``fm`` carries that
+    # newline. The body half starts immediately after
+    # the newline.
+    assert fm == "---\ntitle: My Page\n---\n"
+    assert rest == "body without trailing newline"
+    assert not rest.endswith("\n")
+
+
+# --- T36: 256 KiB body-size cap ----------------------------------------
+
+
+# Helper bodies for cap tests — exactly-at-cap (256 KiB) and
+# over-the-cap (256 KiB + 1 byte). Allocating as ``bytes`` is
+# the cleanest way to land an exact size without counting
+# individual codepoints.
+CAP_BODY = "a" * (256 * 1024)
+OVER_CAP_BODY = "a" * (256 * 1024 + 1)
+
+
+def _ok_handler() -> "callable":
+    """A handler that returns 200 for every method (used for cap tests)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("write_page", {"name": "x", "content": OVER_CAP_BODY}),
+        ("create_page", {"name": "x", "content": OVER_CAP_BODY}),
+        ("append_to_page", {"name": "x", "text": OVER_CAP_BODY}),
+        ("prepend_to_page", {"name": "x", "content": OVER_CAP_BODY}),
+        (
+            "patch_page_lines",
+            {
+                "name": "x",
+                "start_line": 1,
+                "end_line": 1,
+                "new_content": OVER_CAP_BODY,
+            },
+        ),
+        (
+            "patch_page_replace",
+            {"name": "x", "find": "x", "new_string": OVER_CAP_BODY},
+        ),
+    ],
+)
+async def test_t36_body_cap_fires_on_every_write_tool(
+    tool_name: str, args: dict
+) -> None:
+    """A 257 KiB body raises ``body too large`` on every write tool.
+
+    The T36 ticket's "Done when" calls for a parametrized test
+    (one per tool, all asserting the same ``body too large``
+    wording). The cap is enforced at the tool-handler level
+    — the SB round trip never happens on an oversized body,
+    so any 200 response on these tools with a 257 KiB input
+    is a regression.
+    """
+    server = _build(_ok_handler())
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(tool_name, args)
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "body too large" in text
+    # The error names the size, the cap, and the remediation
+    # hint — ``xmatthewx``-style. The exact size and cap
+    # values are spelled out so the agent can act on them
+    # without guessing.
+    assert str(256 * 1024 + 1) in text
+    assert "256 KiB" in text
+    assert "append_to_page" in text
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_accepts_exact_cap_boundary() -> None:
+    """A body of *exactly* 256 KiB passes the cap (boundary, inclusive).
+
+    Locks the inclusive-cap invariant: ``size > cap`` rejects,
+    ``size <= cap`` accepts. The boundary case is the one
+    most likely to drift across refactors; an off-by-one
+    here would surface as either a 200 with a too-large
+    body or a ``body too large`` with a legal-sized body,
+    both regressions the agent would notice.
+    """
+    server = _build(_ok_handler())
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "x", "content": CAP_BODY}
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_fires_before_sb_round_trip() -> None:
+    """The cap fires *before* any PUT — the SB handler is never called.
+
+    Verifies the T36 charter's "before the SB round trip"
+    constraint. A test handler that records whether it saw
+    a PUT is the right shape: the handler's PUT counter
+    must stay at zero when the cap fires.
+    """
+    put_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            put_count["n"] += 1
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "x", "content": OVER_CAP_BODY}
+        )
+
+    assert result.is_error is True
+    assert "body too large" in _text(result)
+    assert put_count["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_does_not_apply_to_read_page() -> None:
+    """``read_page`` is unaffected by the cap (read-side, not write-side).
+
+    The T36 ticket is explicit: the cap applies to every
+    *write* tool. ``read_page``'s body can be arbitrarily
+    large; the agent that wants to chunk a big page
+    reads it (no cap) and ``append_to_page`` chunks (capped
+    per chunk). Locks the "read-side is unaffected"
+    invariant.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 500 KiB body — way over the cap. ``read_page``
+        # must surface it without raising.
+        return httpx.Response(
+            200, text="a" * (500 * 1024), headers={"ETag": '"v1"'}
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "x"})
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_does_not_apply_to_list_pages() -> None:
+    """``list_pages`` is unaffected by the cap (no body to cap).
+
+    The T36 ticket: ``list_pages`` returns metadata, not
+    bodies. No cap applies. Locks the read-side invariant
+    for ``list_pages`` specifically (in case a future
+    ticket wants to widen the cap to cover response-side
+    payloads, the test would surface the regression).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=json.dumps(
+                [
+                    {"name": f"page-{i}", "size": 1000000}
+                    for i in range(100)
+                ]
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_does_not_apply_to_page_exists() -> None:
+    """``page_exists`` is unaffected by the cap (no body to cap).
+
+    ``page_exists`` is a cheap GET that returns a bool; no
+    body bytes pass through the bridge. The cap doesn't
+    apply. Locks the read-side invariant for ``page_exists``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="body", headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "x"})
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_does_not_apply_to_diff_pages() -> None:
+    """``diff_pages`` is unaffected by the cap (read-only, returns a diff string).
+
+    ``diff_pages`` reads two pages and returns a unified
+    diff — it's a read-side tool, not a write. The cap
+    doesn't apply. (A diff could in theory exceed the cap
+    on pathological inputs, but that's a separate concern
+    from the write-side guardrail.)
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="body", headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages",
+            {"name": "x", "other_body": "other"},
+        )
+
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_fires_on_move_page_when_source_body_is_oversized() -> None:
+    """``move_page``'s cap fires when the *source body* exceeds 256 KiB.
+
+    ``move_page`` is unique among the write tools: the
+    caller's "body" is the source page's stored body, which
+    the bridge reads and re-writes at the destination. The
+    cap applies to that about-to-be-written body (matching
+    the T36 charter's "the body the bridge is about to
+    write" wording). A 600 KB source page moving to a new
+    name surfaces the same ``body too large`` error the
+    other write tools would.
+    """
+    oversized_source = "a" * (256 * 1024 + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text=oversized_source, headers={"ETag": '"v1"'}
+            )
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "src", "new_name": "dst"}
+        )
+
+    assert result.is_error is True
+    assert "body too large" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_fires_on_check_task_when_page_body_is_oversized() -> None:
+    """``check_task``'s cap fires when the post-shaping body exceeds 256 KiB.
+
+    ``check_task`` is a single-character edit; the
+    post-shaping body is roughly the same size as the
+    pre-shaping body. The cap applies to the post-shaping
+    body (what the PUT will carry), so ``check_task`` on a
+    > 256 KiB page surfaces the same ``body too large``
+    error the other write tools would.
+    """
+    oversized_page = "a" * (256 * 1024 + 1) + "\n- [ ] [[Ref]] bullet\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text=oversized_page, headers={"ETag": '"v1"'}
+            )
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "x", "ref": "Ref"}
+        )
+
+    assert result.is_error is True
+    assert "body too large" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t36_body_cap_dry_run_still_fires() -> None:
+    """``dry_run=True`` doesn't bypass the cap (cap is on the caller's body, not the post-shaping).
+
+    The cap fires on the caller's body before any read or
+    write happens. ``dry_run=True`` paths go through the
+    same upfront guard. Locks the "cap is everywhere the
+    cap is supposed to be" invariant — a regression that
+    moved the cap check inside ``dry_run=False`` only would
+    surface here.
+    """
+    server = _build(_ok_handler())
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {
+                "name": "x",
+                "text": OVER_CAP_BODY,
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert "body too large" in _text(result)
+
+
+def test_t36_check_body_size_accepts_empty_string() -> None:
+    """An empty string is well under the cap (passes).
+
+    Sanity check: the helper's ``len(body.encode("utf-8"))``
+    measurement works on the empty-string edge case (size
+    0, well under the 256 KiB cap). ``write_page(name, "")``
+    would not raise the cap (it would succeed at writing an
+    empty page). The helper itself is silent on success.
+    """
+    from mcp_silverbullet.server import _check_body_size
+
+    # No exception.
+    _check_body_size("")
+
+
+def test_t36_check_body_size_accepts_boundary() -> None:
+    """A body of *exactly* 256 KiB passes (boundary, inclusive).
+
+    Pins the inclusive cap invariant at the helper level
+    (the tool-level parametrized test covers the wire
+    surface; this covers the helper directly so a
+    regression in the boundary check itself — e.g., ``>``
+    becoming ``>=`` — surfaces here without going through
+    the MCP tool layer).
+    """
+    from mcp_silverbullet.server import _check_body_size
+
+    # No exception at the boundary.
+    _check_body_size("a" * (256 * 1024))
+
+
+def test_t36_check_body_size_rejects_over_cap() -> None:
+    """A body of 256 KiB + 1 byte raises ``body too large``.
+
+    Pins the boundary at the helper level. The error
+    message must name the size, the cap, and the
+    remediation hint (``append_to_page`` chunks).
+    """
+    from mcp_silverbullet.server import _check_body_size
+
+    with pytest.raises(ToolError) as excinfo:
+        _check_body_size("a" * (256 * 1024 + 1))
+
+    text = str(excinfo.value)
+    assert "body too large" in text
+    assert str(256 * 1024 + 1) in text
+    assert "256 KiB" in text
+    assert "append_to_page" in text
+
+
+def test_t36_check_body_size_uses_utf8_byte_count_not_codepoint_count() -> None:
+    """Multi-byte characters count as their UTF-8 byte count, not codepoints.
+
+    ``"é"`` is 1 codepoint but 2 UTF-8 bytes. A body of
+    256 KiB of ``"é"`` (128 Ki codepoints, 256 KiB bytes)
+    passes; a body of 256 KiB + 1 byte of ``"é"`` fails.
+    Locks the UTF-8 byte-count invariant from the T36
+    ticket — the agent that computes ``len(body)`` (Python
+    codepoint count) would underestimate; the bridge
+    measures ``len(body.encode("utf-8"))``.
+    """
+    from mcp_silverbullet.server import _check_body_size
+
+    # 256 KiB *of bytes* = 128 Ki * of codepoints * 2 bytes each.
+    boundary = "é" * (128 * 1024)
+    assert len(boundary.encode("utf-8")) == 256 * 1024
+    _check_body_size(boundary)  # boundary, no raise
+
+    over = boundary + "é"
+    assert len(over.encode("utf-8")) == 256 * 1024 + 2
+    with pytest.raises(ToolError) as excinfo:
+        _check_body_size(over)
+    assert "body too large" in str(excinfo.value)

@@ -283,6 +283,14 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                     assert tool_names == [
                         "append_to_page",
                         "check_task",
+                        # T32: refuse-to-overwrite create tool.
+                        # Distinct from ``write_page`` (which
+                        # overwrite-or-creates by default); the
+                        # agent that has a specific create intent
+                        # uses ``create_page`` and gets a clean
+                        # ``page already exists`` ``ToolError`` on
+                        # collision.
+                        "create_page",
                         "delete_page",
                         "diff_pages",
                         "list_pages",
@@ -291,6 +299,13 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                         "page_exists",
                         "patch_page_lines",
                         "patch_page_replace",
+                        # T33: top-of-body insert with YAML
+                        # frontmatter awareness; mirrors
+                        # ``append_to_page``'s
+                        # read-modify-write + ``dry_run``
+                        # shape. Distinct from ``append_to_page``
+                        # (which inserts at the bottom).
+                        "prepend_to_page",
                         "read_page",
                         "write_page",
                     ]

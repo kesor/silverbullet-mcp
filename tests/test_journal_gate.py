@@ -1,7 +1,7 @@
 """Layer-1 tests for the journal-tools config gate (T10) and the
-boot-time inventory of all four journal tools.
+boot-time inventory of all six journal tools.
 
-The journal surface is an optional, strictly-additive set of four
+The journal surface is an optional, strictly-additive set of six
 direct-FS read tools. It ships only when two env vars agree: the
 operator opts in with ``MCP_SILVERBULLET_JOURNAL_TOOLS=1`` AND points
 ``MCP_SILVERBULLET_SPACE_PATH`` at a readable directory. This file
@@ -17,10 +17,12 @@ real behaviors (returned shapes, prefix filtering, mtime sorting,
 frontmatter parsing) live. T12 inverts the last skeleton
 (``pages_touching_topic``) and the real behaviors (name+content
 search, match-kind, snippet shape) live in
-``tests/test_journal_search.py``. The remaining assertion here is
-that ``pages_touching_topic`` round-trips against an empty
-``tmp_path`` with ``is_error=False`` — i.e., it boots cleanly
-alongside the three T11 tools.
+``tests/test_journal_search.py``. T34 added ``search_pages`` (the
+bounded-wrapper variant of T12 with a ``limit`` knob); T35 added
+``find_backlinks`` (wikilink-target backlink scan). The remaining
+assertion here is that ``pages_touching_topic`` round-trips against
+an empty ``tmp_path`` with ``is_error=False`` — i.e., it boots
+cleanly alongside the five other journal tools.
 
 Each test reuses the in-memory ``Client(mcp, raise_exceptions=True)``
 pattern from ``tests/test_tools_in_memory.py`` and the
@@ -54,6 +56,10 @@ JOURNAL_TOOL_NAMES = {
     # T34 added ``search_pages`` (bounded wrapper over T12).
     # Same journal gate — off when the gate is off, on when it's on.
     "search_pages",
+    # T35 added ``find_backlinks`` (wikilink-target backlink scan).
+    # Same journal gate; same shape conventions as the other
+    # discovery tools (file-walk, no `If-Match` concerns).
+    "find_backlinks",
 }
 SB_TOOL_NAMES = {
     "read_page",
@@ -63,11 +69,23 @@ SB_TOOL_NAMES = {
     "append_to_page",
     "patch_page_lines",
     "patch_page_replace",
+    # T33: top-of-body insert with YAML frontmatter
+    # awareness; mirrors ``append_to_page``'s
+    # read-modify-write + ``dry_run`` shape. Distinct from
+    # ``append_to_page`` (which inserts at the bottom).
+    "prepend_to_page",
     "move_page",
     "page_exists",
     "diff_pages",
     "check_task",
     "list_tasks",
+    # T32: refuse-to-overwrite create tool. Distinct from
+    # ``write_page`` (which overwrite-or-creates by default);
+    # the agent that has a specific create intent uses
+    # ``create_page`` and gets a clean ``page already exists``
+    # ``ToolError`` on collision (rather than the generic 412
+    # wording the agent would otherwise have to pattern-match).
+    "create_page",
 }
 
 
@@ -240,6 +258,18 @@ async def test_build_mcp_registers_journal_tools_when_gate_is_on(
         # real behaviors live in ``tests/test_journal_search.py``.
         result = await client.call_tool(
             "pages_touching_topic", {"query": "anything"}
+        )
+        assert result.is_error is False
+        assert result.structured_content == {"result": []}
+        # T35: ``find_backlinks`` round-trips against an empty
+        # ``tmp_path`` — an empty space is a valid (empty) backlink
+        # graph, so the call returns ``[]`` rather than raising.
+        # The shape-and-error assertions for the real behaviors
+        # (matching, normalization, aliasing) live in the dedicated
+        # ``tests/test_journal_backlinks.py`` (added alongside
+        # T35).
+        result = await client.call_tool(
+            "find_backlinks", {"target": "anything"}
         )
         assert result.is_error is False
         assert result.structured_content == {"result": []}

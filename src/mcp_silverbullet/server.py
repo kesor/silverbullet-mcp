@@ -199,6 +199,209 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
         raise ToolError("silverbullet request timed out") from exc
 
 
+# Wording printed verbatim into the T31b concurrency-conflict error.
+# Centralized here so future tweaks (renaming the conflict class,
+# adding the offending etag to the message) don't ripple across the
+# six call sites that thread an etag through ``if_match``.
+_CONCURRENT_EDIT_MSG = (
+    "concurrent edit detected: the page changed since you read it at "
+    "{expected_etag}; read it again and re-issue the write with the "
+    "current etag"
+)
+
+
+# Body-size cap applied uniformly across every write tool
+# (T36). 256 KiB matches ``xmatthewx/silverbullet-mcp-server``'s
+# cap (the closest v1.3 competitive-landscape reference for the
+# feature). Small enough to surface clearly to an agent as "you
+# tried to write 600 KB to a journal page, that won't fit, here's
+# the remediation hint"; large enough to be a non-issue for any
+# human-authored page. The cap is enforced *before* the SB
+# round trip on every write tool, so the read step on
+# read-modify-write tools is unaffected (a 500 KB existing
+# page is fine; a 500 KB about-to-be-written payload is not).
+_BODY_SIZE_CAP_BYTES = 256 * 1024
+
+
+def _check_body_size(body: str) -> None:
+    """Raise ``ToolError("body too large: …")`` when the body exceeds the 256 KiB cap.
+
+    T36: every write tool (``write_page``, ``create_page``,
+    ``prepend_to_page``, ``append_to_page``,
+    ``patch_page_lines``, ``patch_page_replace``,
+    ``move_page``, ``check_task``) calls this helper at the
+    top of its handler, before any SB round trip. The
+    measurement is on the UTF-8 byte count of the
+    *caller-supplied* body — ``write_page``'s ``content``,
+    ``append_to_page``'s ``text``, ``prepend_to_page``'s
+    ``content``, ``patch_page_lines``'s ``new_content``,
+    ``patch_page_replace``'s ``new_string``, ``move_page``'s
+    whole-page body. This matches the spirit of the
+    T36 ticket's "you tried to write 600 KB to a journal
+    page, that won't fit" framing and avoids the
+    surprise of ``append_to_page(name, text="100KB")``
+    against a 200 KB existing page silently working but
+    ``text="200KB"`` against the same page hitting the cap
+    due to post-shaping concatenation.
+
+    The cap is measured on the body the bridge is *about
+    to write* — not the request body's Content-Length
+    (the bridge might be re-encoding the body), not the
+    body the bridge just read on read-modify-write tools
+    (a 500 KB existing page is fine; a 500 KB
+    about-to-be-written payload is not), and not the
+    page's stored ``size_bytes`` (which is the size
+    *after* a prior write, not the size of the current
+    request).
+
+    The 256 KiB cap is inclusive — a body of *exactly*
+    256 KiB passes the check, a body of 256 KiB + 1 byte
+    fails. The boundary case is covered by a dedicated
+    test (`test_check_body_size_accepts_exact_cap`).
+
+    The error message names both the body size and the cap
+    (so the agent sees the numbers, not just a vague
+    "too large"), and includes a remediation hint that
+    names the right next tool (``append_to_page`` chunks)
+    — same pattern the rest of the bridge's error
+    wording uses (clear next-step hint, not a vague
+    "failed").
+
+    Out of scope (per the T36 ticket):
+    - Configurable cap (`MCP_SILVERBULLET_BODY_SIZE_CAP`).
+      ``xmatthewx``'s cap is fixed; we mirror that.
+      Operators who need a different cap can fork.
+    - The cap does NOT replace SB's own size limits. SB
+      may accept a smaller body than the cap; the
+      bridge's cap is a guardrail for the agent, not a
+      promise about SB's limits.
+    - Streamed / chunked writes. The cap is the boundary
+      that tells an agent "stop trying to write 600 KB
+      in one call; use ``append_to_page`` chunks". A
+      streamed / chunked write tool is a separate
+      design effort and a v1.4+ concern.
+    """
+    size_bytes = len(body.encode("utf-8"))
+    if size_bytes > _BODY_SIZE_CAP_BYTES:
+        raise ToolError(
+            f"body too large: {size_bytes} bytes exceeds "
+            f"{_BODY_SIZE_CAP_BYTES} byte (256 KiB) cap; "
+            f"chunk into append_to_page calls"
+        )
+
+
+async def _verify_concurrency_token(
+    sb_client: SBClient,
+    name: str,
+    *,
+    post_write_meta: PageMeta,
+    expected_etag: str | None,
+    dry_run: bool = False,
+) -> None:
+    """Post-write concurrency-token check for SBs that don't honor ``If-Match``.
+
+    T31's live verification surfaced the v1.3-blocking SB fact:
+    this dev-box SB returns 200 on a stale ``If-Match`` instead of
+    412, so the v1.2 / v1.3 ``If-Match`` contract is not enforced
+    server-side. Without a check, an agent that does
+    ``read → write(if_match=read_etag)`` on this SB silently
+    overwrites a page a concurrent agent already updated.
+
+    The fix is post-write: re-read the page after a 200 write and
+    compare the post-write etag against the etag the caller passed
+    in ``if_match``. A mismatch means the page changed between
+    read and write (the very race ``If-Match`` exists to prevent);
+    the helper raises :exc:`ToolError("concurrent edit detected:
+    …")` so the agent sees the same conflict signal it would have
+    seen on an SB that honored ``If-Match``, just delivered later
+    in the round trip.
+
+    The helper runs only on **200 writes** (silent overwrite).
+    On SBs that *do* honor ``If-Match``, the existing 412 path in
+    :func:`_translate_sb_errors` still wins — cheaper than a
+    re-read, fires before the helper runs. The helper is the
+    fallback for SBs that don't honor ``If-Match``; both paths
+    exist, the cheaper one wins when it works.
+
+    Verification shape per the T31b ticket:
+
+    - ``expected_etag`` is ``None`` (caller passed ``if_match=None``
+      / no precondition requested) → no-op. The caller opted out
+      of the concurrency primitive; no race to detect.
+    - ``expected_etag`` is ``"*"`` (caller passed ``if_match="*"``,
+      meaning "require existence") → no-op. ``"*"`` doesn't
+      uniquely identify a body; the re-read will return some etag
+      and we have nothing to compare against. ``create_page`` (T32)
+      is the canonical user of ``if_match="*"`` and never wants
+      this helper to fire on it; this branch enforces that.
+    - ``expected_etag`` is a concrete string → re-read, compare.
+      A different value (real or synthesized via T31a's
+      :func:`synthesize_etag`) means the page was mutated
+      out-of-band between the caller's read and the write we just
+      completed.
+    - Re-read returns 404 → no-op (page was deleted out-of-band;
+      the write that just succeeded implies it still existed at
+      write time, so a follow-up delete is *post-write* — not a
+      concurrency violation the caller can recover from by
+      re-reading).
+    - Re-read returns a transient error (``ServerError`` /
+      ``httpx.TimeoutException``) → the verification step
+      degrades gracefully (no false-positive error); the
+      concurrency primitive is best-effort. The T31b ticket
+      documents this as a deliberate tradeoff: the alternative
+      is a false-positive "concurrent edit" on a flaky SB that
+      would be much harder to debug than a silently-lost
+      verification.
+    - ``dry_run=True`` → no-op (no write happened to verify).
+      Reads still happen on the dry-run path for ``if_match``
+      validation (see ``_validate_if_match_on_read``), but the
+      T31b helper is about catching races *after* a successful
+      write, which dry-runs don't perform.
+
+    Why a separate helper instead of inlining the re-read in each
+    tool handler: the read-modify-write tools
+    (``append_to_page``, ``patch_page_lines``,
+    ``patch_page_replace``, ``move_page``, ``check_task``) all
+    thread ``read_page.etag`` into ``if_match=...`` automatically,
+    so the post-write verification is the same shape on all six
+    tool paths. Centralizing it in one helper keeps the wording
+    (``_CONCURRENT_EDIT_MSG``) in one place — a future change to
+    the error class or the remediation hint doesn't ripple
+    through six call sites.
+
+    Wire shape: a 200 write whose post-write etag differs from
+    ``expected_etag`` raises ``ToolError(_CONCURRENT_EDIT_MSG)``
+    *before* the T23 ack envelope is constructed, so the agent
+    never sees a 200 on a stale write. The 412-equivalent path
+    (SB honors ``If-Match``) remains the primary concurrency
+    primitive on SBs that support it; this helper is the fallback
+    for SBs that don't.
+    """
+    if dry_run:
+        return
+    if expected_etag is None or expected_etag == "*":
+        return
+    # Re-read the page and compare. We deliberately use
+    # ``read_page_meta`` (no body) rather than ``read_page`` here:
+    # the re-read is a concurrency check, not a body fetch — the
+    # body is irrelevant to the etag comparison, and skipping the
+    # body keeps the helper cheap on large pages. ``read_page_meta``
+    # raises :class:`PageNotFound` if the page vanished (treated as
+    # "verification skipped" — see the re-read-failure note in the
+    # docstring) and :class:`ServerError` on 5xx (also "skipped",
+    # not surfaced as a concurrency error).
+    try:
+        post_meta = await sb_client.read_page_meta(name)
+    except PageNotFound:
+        return  # page deleted post-write; not a concurrency violation
+    except (ServerError, httpx.TimeoutException):
+        return  # transient SB failure; verification is best-effort
+    if post_meta.etag != expected_etag:
+        raise ToolError(
+            _CONCURRENT_EDIT_MSG.format(expected_etag=expected_etag)
+        )
+
+
 def _write_meta_to_payload(meta: PageMeta) -> dict[str, object]:
     """Project a :class:`PageMeta` down to the T23 write-tool wire shape.
 
@@ -319,6 +522,100 @@ def _split_body_lines(body: str) -> tuple[list[str], bool]:
     if lines and lines[-1] == "":
         lines.pop()
     return lines, had_trailing_newline
+
+
+def _split_frontmatter_block(
+    body: str,
+) -> tuple[str | None, str]:
+    """Split a body into the YAML frontmatter block (with fences) and the rest.
+
+    T33 (``prepend_to_page``) uses this to honor the
+    ``position="after_frontmatter"`` default: when a page has
+    a leading ``---\n…\n---\n`` block, the prepended content
+    goes *between* the closing ``---`` and the first body
+    line (not above the opening ``---``). The shape mirrors
+    the v1.2 :func:`mcp_silverbullet.journal._split_frontmatter_lines`
+    helper but returns the frontmatter as a *single string*
+    (with the surrounding fences and trailing newline
+    preserved) so the caller can ``frontmatter + content +
+    rest_of_body`` without re-joining.
+
+    Returns ``(None, body)`` when the body has no leading
+    frontmatter — ``None`` is the canonical "no frontmatter"
+    signal (matches the journal helper's contract). A page
+    that opens with ``---`` but doesn't close it (a
+    malformed frontmatter block) is treated as *no*
+    frontmatter: ``(None, body)``. The T33 ticket explicitly
+    documents this fallback: ``a page that opens with ``---``
+    but doesn't close it (a malformed frontmatter block) is
+    treated as no-frontmatter — the new content goes at the
+    absolute top, same as a page with no frontmatter.`` This
+    is the same "raw text, no parser" pattern the v1.1 /
+    v1.2 maps use; we do not pull in a YAML library.
+
+    Wire shape:
+
+    - ``"---\\nfoo: bar\\n---\\nbody\\n"`` →
+      ``("---\\nfoo: bar\\n---\\n", "body\\n")``. The trailing
+      newline after the closing ``---`` lives in the
+      ``frontmatter`` string (so concatenation is correct:
+      ``frontmatter + new_content + body``).
+    - ``"body\\n"`` (no frontmatter) → ``(None, "body\\n")``.
+    - ``"---body\\n"`` (opening fence with no close) →
+      ``(None, "---body\\n")``. Malformed → treated as
+      no-frontmatter.
+    """
+    if not body.startswith("---"):
+        return None, body
+    # ``splitlines`` keeps line boundaries consistent with
+    # how the rest of the bridge represents pages (no
+    # universal-newline handling — same as the journal
+    # helper's contract). ``splitlines`` on the empty
+    # string returns ``[]``, which we'd reject with
+    # ``len < 2`` below (an opening fence with no body at
+    # all is malformed; treat as no-frontmatter).
+    lines = body.splitlines()
+    if len(lines) < 2:
+        return None, body
+    # The opening fence must be a *standalone* ``---`` with
+    # no leading whitespace (per YAML spec). ``body`` started
+    # with ``"---"`` so ``lines[0] == "---"`` (no leading
+    # whitespace). Look for the closing fence starting from
+    # line index 1 — a standalone ``"---"`` on its own line.
+    close_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx] == "---":
+            close_idx = idx
+            break
+    if close_idx is None:
+        # Malformed: opening fence but no closing fence.
+        # Treat as if no frontmatter was present.
+        return None, body
+    # Reconstruct the two halves as strings. The
+    # ``frontmatter`` string carries the opening fence, the
+    # ``…`` lines, the closing fence, AND the trailing
+    # newline after the closing fence (if any). Splitlines
+    # dropped the newlines, so we rejoin with ``"\n"`` and
+    # append the trailing ``"\n"`` iff the original body
+    # had one. The body half starts at the line *after*
+    # the closing fence, with its trailing newline
+    # preserved.
+    fm_str = "\n".join(lines[: close_idx + 1])
+    # The closing ``---`` was followed by a newline in the
+    # original body (every well-formed frontmatter block
+    # ends with ``---\n``); preserve that.
+    if body[len(fm_str) : len(fm_str) + 1] == "\n":
+        fm_str += "\n"
+    rest_str = "\n".join(lines[close_idx + 1 :])
+    # Restore trailing newline on the body half iff the
+    # original body had one (we only added a final newline
+    # because splitlines dropped it). The simplest correct
+    # rule: if the original body ended with ``"\n"`` and we
+    # have a non-empty rest_str, the rest_str should end
+    # with ``"\n"``.
+    if body.endswith("\n") and rest_str and not rest_str.endswith("\n"):
+        rest_str += "\n"
+    return fm_str, rest_str
 
 
 def _apply_line_patch(
@@ -561,17 +858,19 @@ def build_mcp(
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
             "check existence of, diff, enumerate, search, and "
-            "flip checkbox tasks on SilverBullet pages. Twelve "
+            "flip checkbox tasks on SilverBullet pages. Fourteen "
             "always-on tools (`read_page`, `page_exists`, "
-            "`write_page`, `delete_page`, `append_to_page`, "
+            "`write_page`, `create_page`, `delete_page`, "
+            "`append_to_page`, `prepend_to_page`, "
             "`patch_page_lines`, `patch_page_replace`, "
             "`move_page`, `list_pages`, `diff_pages`, "
-            "`check_task`, `list_tasks`) plus up to five "
+            "`check_task`, `list_tasks`) plus up to six "
             "journal-gated tools (`journal_histogram`, "
             "`tag_summary`, `recent_pages`, "
-            "`pages_touching_topic`, `search_pages`) when the "
-            "operator enables the journal surface, plus one "
-            "resource template `silverbullet://page/{name}` "
+            "`pages_touching_topic`, `search_pages`, "
+            "`find_backlinks`) when the operator enables "
+            "the journal surface, plus one resource "
+            "template `silverbullet://page/{name}` "
             "for attaching page bodies to conversation context. "
             "The four read-modify-write tools "
             "(`append_to_page`, `patch_page_lines`, "
@@ -769,10 +1068,123 @@ def register_tools(
         content: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip so an
+        # oversized write surfaces a clear ``body too large``
+        # ``ToolError`` with the remediation hint rather than a
+        # deferred failure at SB.
+        _check_body_size(content)
         async with _translate_sb_errors(name):
             meta = await sb_client.write_page(
                 name, content, if_match=if_match
             )
+        # T31b: post-write concurrency-token verification. Runs
+        # only on 200 writes where ``if_match`` was a concrete
+        # etag (``"*"`` and ``None`` are no-ops per the helper's
+        # contract); 412 still wins on SBs that honor
+        # ``If-Match`` via :func:`_translate_sb_errors`. The
+        # helper degrades gracefully on transient re-read
+        # failures so a flaky SB doesn't surface false-positive
+        # concurrency errors.
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=if_match,
+        )
+        return _write_meta_to_payload(meta)
+
+    @mcp.tool(
+        title="Create page",
+        description=(
+            "Create a SilverBullet page (refuse to overwrite). "
+            "Distinct from `write_page`'s overwrite-or-create "
+            "default: `create_page` is the right tool when the "
+            "agent has a specific intent to *create* a page "
+            "and a collision means a programming bug, not a "
+            "silent overwrite. Returns the write acknowledgement "
+            "`{name, etag, size_bytes, last_modified_ms, "
+            "created_ms}` (T23) on success — same envelope as "
+            "`write_page`, so an agent that learns the shape "
+            "once has it for both tools. Errors: empty / "
+            "whitespace-only `name` upfront "
+            "`ToolError(\"name must not be empty\")`; page "
+            "already exists → `ToolError(\"page already exists: "
+            "{name}; use write_page to overwrite\")` (a clear "
+            "next-tool hint rather than the generic 412 wording "
+            "the agent would have to pattern-match on). "
+            "Implemented as `write_page(name, content, "
+            "if_match=\"*\")` + 412 → `already_exists` "
+            "translation; the underlying ``If-Match: *`` is the "
+            "same primitive `write_page` accepts as a caller-"
+            "facing argument, just specialized at the tool "
+            "boundary. `if_match` is implied (``\"*\"``); an "
+            "explicit precondition would be a misuse of the "
+            "create semantic and is not exposed — agents that "
+            "want to write-with-precondition call "
+            "`write_page` directly."
+        ),
+    )
+    async def create_page(
+        name: str,
+        content: str,
+    ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip so an
+        # oversized create surfaces a clear ``body too large``
+        # ``ToolError`` with the remediation hint rather than a
+        # deferred failure at SB.
+        _check_body_size(content)
+        # Cheap upfront guard: an empty name is almost
+        # certainly a caller bug (the caller forgot to fill
+        # in the page name); surface it loudly before the
+        # round trip. Mirrors the upfront guards on the
+        # other tools (`text must not be empty`,
+        # `find must not be empty`, `ref must not be empty`).
+        if not name or not name.strip():
+            raise ToolError("name must not be empty")
+        # ``create_page`` always uses ``if_match="*"`` to
+        # require existence (refuse to overwrite). The
+        # ``if_match="*"`` path opts out of T31b's post-
+        # write verification helper (no etag to compare
+        # against), which means on SBs that don't honor
+        # ``If-Match`` (T31's negative finding on this dev
+        # box) the silent-overwrite case is not caught by
+        # the helper. The map's T32 charter is the clean
+        # one: the ``If-Match: *`` primitive is supposed
+        # to enforce existence; on SBs that don't honor
+        # it, the primitive is broken and ``create_page``
+        # silently overwrites. A T32a follow-up could
+        # close the gap with an ``exists_page`` round trip
+        # before the PUT (extra cost on the happy path for
+        # a rare edge case), but the T32 ticket's charter
+        # is the 412 → ``already_exists`` translation
+        # only. The honest wire shape is one that maps
+        # cleanly to SBs that *do* honor ``If-Match``;
+        # the silent-overwrite case is a documented
+        # limitation, not a hidden bug.
+        async with _translate_sb_errors(name):
+            try:
+                meta = await sb_client.write_page(
+                    name, content, if_match="*"
+                )
+            except PreconditionFailed as exc:
+                # SB honored ``If-Match`` — page definitely
+                # already exists. Translate to the
+                # ``already_exists`` wording with the
+                # next-tool hint. ``from exc`` preserves
+                # the original ``PreconditionFailed`` in
+                # the traceback for debugging. The other
+                # SB error types (404 / 5xx / timeout /
+                # ``BodyTooLarge``) are caught by
+                # ``_translate_sb_errors`` for the standard
+                # ``page not found: {name}`` /
+                # ``server error`` wording — the
+                # ``PreconditionFailed`` translation is
+                # specific to ``create_page``'s
+                # refuse-to-overwrite contract.
+                raise ToolError(
+                    f"page already exists: {name}; "
+                    f"use write_page to overwrite"
+                ) from exc
         return _write_meta_to_payload(meta)
 
     @mcp.tool(
@@ -797,6 +1209,20 @@ def register_tools(
     ) -> dict[str, object]:
         async with _translate_sb_errors(name):
             meta = await sb_client.delete_page(name, if_match=if_match)
+        # T31b: post-delete verification. Per the T31b ticket
+        # docstring, ``delete_page`` gets a *lighter*
+        # verification: the helper re-reads the source, hits 404
+        # (we just deleted it), and short-circuits to no-op via
+        # its ``except PageNotFound: return`` branch. The call
+        # is here for symmetry with the other tools and to
+        # document the T31b contract — there's no operational
+        # concurrency check possible after a delete.
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=if_match,
+        )
         return _write_meta_to_payload(meta)
 
     @mcp.tool(
@@ -837,6 +1263,8 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(text)
         # An empty append is almost certainly a caller bug (the
         # caller meant to write something and forgot to fill it in);
         # surface it loudly upfront so the read-modify-write round
@@ -864,9 +1292,166 @@ def register_tools(
                 # so the agent sees one shape across both paths.
                 _validate_if_match_on_read(page.etag, if_match)
                 return _dry_run_payload(body, new_body)
-            meta = await sb_client.write_page(
-                name, new_body, if_match=if_match
+            # T31b: thread the read's etag into ``if_match`` when
+            # the caller passed ``None``, so a concurrent edit
+            # between read and write fails 412 on SBs that honor
+            # ``If-Match`` (or the post-write verification below on
+            # SBs that don't). The caller can still pass an
+            # explicit ``if_match`` (real or synthesized) and
+            # bypass the auto-thread — the post-write verification
+            # uses that explicit value verbatim.
+            write_if_match = (
+                if_match if if_match is not None else page.etag
             )
+            meta = await sb_client.write_page(
+                name, new_body, if_match=write_if_match
+            )
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=write_if_match,
+            dry_run=dry_run,
+        )
+        return _write_meta_to_payload(meta)
+
+    @mcp.tool(
+        title="Prepend to page",
+        description=(
+            "Prepend text to the top of a SilverBullet page "
+            "with YAML frontmatter awareness. Two positions:\n\n"
+            "* `position=\"after_frontmatter\"` (default) — "
+            "insert the new content *between* the closing "
+            "`---` of the frontmatter block and the first body "
+            "line. This is the human-meaningful default for "
+            "journal / daily-notes pages with YAML frontmatter: "
+            "the new content lands at the top of the page "
+            "body, *above* the visible content but *below* "
+            "the frontmatter (frontmatter stays at the very "
+            "top, where frontmatter consumers expect to find "
+            "it). For a page without frontmatter, this is "
+            "equivalent to `position=\"top\"` — the new "
+            "content lands at the absolute top.\n\n"
+            "* `position=\"top\"` — insert the new content "
+            "*above* the frontmatter, at the absolute top of "
+            "the file. Use this when the caller explicitly "
+            "wants to push frontmatter down (rare; most "
+            "frontmatter is configuration that consumers "
+            "expect at the top, so this is almost always a "
+            "bug). For a page without frontmatter, this is "
+            "equivalent to `position=\"after_frontmatter\"`.\n\n"
+            "Mirrors `append_to_page`'s read-modify-write + "
+            "`dry_run` shape: the read happens, the in-memory "
+            "splice is computed (frontmatter-aware per the "
+            "rules above), `if_match=<etag>` is checked "
+            "against the read's etag (a stale etag raises "
+            "412-equivalent `ToolError`), and the tool "
+            "either writes the new body (`dry_run=False`) or "
+            "returns the `{dry_run, original, patched, diff}` "
+            "preview (`dry_run=True`). Returns the T23 ack "
+            "envelope (`{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}`) on success.\n\n"
+            "Errors: empty / whitespace-only `content` "
+            "upfront `ToolError(\"content must not be empty\")`; "
+            "unknown `position` upfront "
+            "`ToolError(\"position must be one of: "
+            "after_frontmatter, top\")`; 412 on stale "
+            "`if_match`; 404 on missing page (standard "
+            "wording); 413 on a body > 4 MiB (standard "
+            "wording). Frontmatter detection: a leading "
+            "`---\\n…\\n---\\n` block (LF or CRLF). A page "
+            "that opens with `---` but doesn't close it (a "
+            "malformed frontmatter block) is treated as "
+            "no-frontmatter — the new content lands at the "
+            "absolute top, same as a page with no frontmatter "
+            "at all. The same \"raw text, no parser\" pattern "
+            "the rest of the bridge uses; no YAML library is "
+            "pulled in."
+        ),
+    )
+    async def prepend_to_page(
+        name: str,
+        content: str,
+        position: str = "after_frontmatter",
+        if_match: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(content)
+        # Cheap, no-read input validation first. An empty
+        # content is almost certainly a caller bug (the
+        # caller meant to prepend something and forgot to
+        # fill it in); surface it loudly upfront so the
+        # read-modify-write round trip isn't wasted. Mirrors
+        # the empty-``text`` guard on ``append_to_page``.
+        if not content:
+            raise ToolError("content must not be empty")
+        # Validate ``position`` upfront — an unknown value
+        # is almost certainly a typo (``"topmost"``,
+        # ``"first"``, ``"above_frontmatter"``, ...). The
+        # two-mode shape mirrors ``append_to_page``'s
+        # ``dry_run`` knob: small extra surface, big
+        # usability win.
+        if position not in ("after_frontmatter", "top"):
+            raise ToolError(
+                "position must be one of: "
+                "after_frontmatter, top"
+            )
+        async with _translate_sb_errors(name):
+            page = await sb_client.read_page(name)
+            body = page.body or ""
+            # Compute the splice per ``position``. The
+            # ``_split_frontmatter_block`` helper returns
+            # ``(frontmatter_or_None, rest)`` where ``None``
+            # is the canonical "no frontmatter" signal. The
+            # ``position`` knob affects only the case where
+            # frontmatter is present; without frontmatter,
+            # both ``after_frontmatter`` and ``top`` produce
+            # the same splice (new content at absolute top).
+            frontmatter, rest = _split_frontmatter_block(body)
+            if position == "top" or frontmatter is None:
+                # Either the caller explicitly wanted
+                # absolute-top, or there's no frontmatter
+                # to anchor against. ``new_content + body``
+                # in both cases.
+                new_body = content + body
+            else:
+                # ``after_frontmatter`` with frontmatter
+                # present: ``frontmatter + content + rest``.
+                # ``frontmatter`` already includes the
+                # closing ``---\n``; ``rest`` starts at the
+                # line after the closing fence (and carries
+                # the body half's trailing newline if the
+                # original body had one).
+                new_body = frontmatter + content + rest
+            if dry_run:
+                # T26: validate ``if_match`` against the
+                # read's etag *here* because no PUT happens.
+                # Same shape as the other read-modify-write
+                # tools' dry-run paths.
+                _validate_if_match_on_read(page.etag, if_match)
+                return _dry_run_payload(body, new_body)
+            # T31b: thread the read's etag into ``if_match``
+            # when the caller passed ``None``, so a
+            # concurrent edit between read and write fails
+            # 412 on SBs that honor ``If-Match`` (or the
+            # post-write verification below on SBs that
+            # don't). Same auto-thread pattern as
+            # ``append_to_page`` / ``patch_page_lines`` /
+            # ``patch_page_replace``.
+            write_if_match = (
+                if_match if if_match is not None else page.etag
+            )
+            meta = await sb_client.write_page(
+                name, new_body, if_match=write_if_match
+            )
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=write_if_match,
+            dry_run=dry_run,
+        )
         return _write_meta_to_payload(meta)
 
     @mcp.tool(
@@ -916,6 +1501,8 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(new_content)
         # Cheap, no-read input validation first: a non-positive
         # start_line or an inverted range can't be helped by reading
         # the page (line_count is undefined until then), so the
@@ -964,9 +1551,26 @@ def register_tools(
                 # is exactly the body that would have been written.
                 _validate_if_match_on_read(page.etag, if_match)
                 return _dry_run_payload(body, new_body)
-            meta = await sb_client.write_page(
-                name, new_body, if_match=if_match
+            # T31b: same auto-thread pattern as
+            # :func:`append_to_page`. The caller's explicit
+            # ``if_match`` wins when present; the read's etag
+            # threads through automatically when the caller
+            # passed ``None``. The post-write verification below
+            # compares the same value against the post-write
+            # re-read.
+            write_if_match = (
+                if_match if if_match is not None else page.etag
             )
+            meta = await sb_client.write_page(
+                name, new_body, if_match=write_if_match
+            )
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=write_if_match,
+            dry_run=dry_run,
+        )
         return _write_meta_to_payload(meta)
 
     @mcp.tool(
@@ -1017,6 +1621,11 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
+        # T36: cap the body size before the SB round trip. The cap
+        # applies to ``new_string`` (the caller's replacement text),
+        # not the post-shaping body, matching the T36 charter's
+        # "you tried to write 600 KB" framing.
+        _check_body_size(new_string)
         # Cheap, no-read input validation first. ``find == ""`` would
         # match between every character (``"abc".replace("", "X")``
         # is ``"XaXbXcX"``) — almost certainly a caller bug, not
@@ -1054,9 +1663,25 @@ def register_tools(
                 # dry-run envelope surfaces the result.
                 _validate_if_match_on_read(page.etag, if_match)
                 return _dry_run_payload(body, new_body)
-            meta = await sb_client.write_page(
-                name, new_body, if_match=if_match
+            # T31b: same auto-thread pattern as the other
+            # read-modify-write tools — caller-supplied
+            # ``if_match`` wins, read's etag threads through when
+            # the caller passed ``None``. The post-write
+            # verification helper covers SBs that don't honor
+            # ``If-Match``.
+            write_if_match = (
+                if_match if if_match is not None else page.etag
             )
+            meta = await sb_client.write_page(
+                name, new_body, if_match=write_if_match
+            )
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=meta,
+            expected_etag=write_if_match,
+            dry_run=dry_run,
+        )
         return _write_meta_to_payload(meta)
 
     @mcp.tool(
@@ -1148,6 +1773,16 @@ def register_tools(
             # ``page not found: {name}`` wording.
             page = await sb_client.read_page(name)
             body = page.body or ""
+            # T36: cap the about-to-be-written body (the source's
+            # body, which becomes the destination's body on
+            # ``move_page``) before the destination PUT. The cap is
+            # on the source's stored body, not the request — this
+            # catches the "move a 600 KB page" case before the
+            # destination write. An oversized source page is
+            # unusual (the cap is 256 KiB), but the bridge should
+            # still surface a clear ``body too large`` error rather
+            # than a deferred failure at the destination PUT.
+            _check_body_size(body)
             # 2. Write the body to ``new_name``. ``if_none_match=True``
             # makes SB send ``If-None-Match: *`` and refuse if the
             # destination already exists — ``move_page`` is rename,
@@ -1208,6 +1843,34 @@ def register_tools(
                 f"moved body to {new_name} but failed to delete "
                 f"{name}: silverbullet request timed out; both now exist"
             ) from exc
+        # T31b: post-delete concurrency verification. Per the
+        # T31b ticket docstring, ``move_page`` gets a *lighter*
+        # verification: the helper re-reads the source, hits 404
+        # (we just deleted it), and short-circuits to no-op via
+        # its ``except PageNotFound: return`` branch. The call is
+        # here for symmetry with the other tools and to document
+        # the T31b contract — there's no operational concurrency
+        # check possible after a successful move (the source
+        # gone and the destination exists is the intended state).
+        # The pre-delete 412 path above (``"moved body to … but
+        # failed to delete"``) remains the primary concurrency
+        # signal on SBs that honor ``If-Match``; on SBs that
+        # don't, the destination write's 200 with the source
+        # already mutated out-of-band is the failure mode this
+        # helper *can't* detect (the read happened before the
+        # destination write, so a write between read and
+        # destination-write would not be caught by a post-delete
+        # re-read — the body is at ``new_name``, which is what
+        # the caller wanted). The T31b ticket explicitly
+        # accepts this gap: ``move_page`` is a structural
+        # rename, not a guarded edit, and the per-step 412s
+        # are the realistic concurrency story.
+        await _verify_concurrency_token(
+            sb_client,
+            name,
+            post_write_meta=new_meta,
+            expected_etag=if_match,
+        )
         # Successful move: return the destination's acknowledgement.
         # ``new_meta`` already has ``name=new_name`` (write_page
         # threads the name through), so the payload's ``name`` field
@@ -1524,6 +2187,17 @@ def register_tools(
         target_marker = _validate_check_task_state(state)
         async with _translate_sb_errors(page):
             result_page = await sb_client.read_page(page)
+        # T36: cap the about-to-be-written body before the PUT.
+        # The cap applies to the post-shaping body (the page
+        # with the bullet flipped), which is what the PUT will
+        # actually carry. ``check_task`` on a > 256 KiB page
+        # would hit the cap — unusual (the cap is 256 KiB), but
+        # the bridge surfaces the clear ``body too large``
+        # ``ToolError`` rather than a deferred failure at SB.
+        # Note: the *read* step above is unaffected by the cap
+        # (the T36 ticket's "a 500 KB existing page is fine" rule
+        # is about the read step being allowed; the write is
+        # what's capped).
         body = result_page.body or ""
         # Distinct error surfaces for 0-match vs multi-match.
         # ``_find_task_bullet` returns the *first* match without
@@ -1573,6 +2247,14 @@ def register_tools(
                 f"live on a different page"
             )
         new_body, editor_line, _original_state, _new_state = flip_result
+        # T36: cap the about-to-be-written body. We compute the
+        # cap on ``new_body`` (the post-shaping body that the
+        # PUT will carry) — ``check_task`` is a single-character
+        # edit, so the post-shaping body is roughly the same
+        # size as the pre-shaping body; a > 256 KiB page hit by
+        # ``check_task`` is unusual but the cap is the same
+        # uniform guardrail the rest of the write surface uses.
+        _check_body_size(new_body)
         if dry_run:
             # T26: validate ``if_match`` against the read's etag
             # *here* because no PUT happens. Same shape as the
@@ -1602,6 +2284,22 @@ def register_tools(
             meta = await sb_client.write_page(
                 page, new_body, if_match=write_if_match
             )
+        # T31b: same post-write concurrency-token verification
+        # as the other read-modify-write tools. ``write_if_match``
+        # carries the auto-threaded read etag (or the caller's
+        # explicit ``if_match`` when set), so the helper
+        # compares against the same value that threaded through
+        # ``If-Match``. On SBs that don't honor ``If-Match``, a
+        # concurrent edit between read and write fails the
+        # helper's etag compare and surfaces as the unified
+        # ``concurrent edit detected`` ``ToolError``.
+        await _verify_concurrency_token(
+            sb_client,
+            page,
+            post_write_meta=meta,
+            expected_etag=write_if_match,
+            dry_run=dry_run,
+        )
         return _write_meta_to_payload(meta)
 
     @mcp.resource(
