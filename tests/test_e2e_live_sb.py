@@ -535,6 +535,105 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     # bullets will shift them.
                     assert all(t["name"] == MARKER for t in tasks_payload)
                     assert tasks_payload[0]["line"] == 2
+
+                    # ``check_task`` (T30) round-trip against live
+                    # SB: flip ``FirstTask`` from ``[ ]`` (todo) to
+                    # ``[x]`` (done), confirm the page body reflects
+                    # the flip via a follow-up ``list_tasks`` /
+                    # ``read_page``, then flip it back to ``[ ]``
+                    # (``state=\"todo\"``). The T30 contract is:
+                    # the read-modify-write round trip lands with
+                    # the new marker, the etag chain keeps the
+                    # write idempotent against a single concurrent
+                    # editor save (we don't exercise that here —
+                    # that's a fault-injection test the upstream
+                    # ``append_to_page`` / ``patch_page_*`` live
+                    # blocks already cover; ``check_task`` shares
+                    # the same ``If-Match`` plumbing). We also
+                    # exercise the ``dry_run=True`` path: a flip
+                    # preview that leaves the page body unchanged
+                    # so the live-SB signal for the no-PUT
+                    # contract is structural rather than just
+                    # load-bearing on the Layer-1 tests.
+                    flipped = await session.call_tool(
+                        "check_task",
+                        {"page": MARKER, "ref": "FirstTask", "state": "done"},
+                    )
+                    assert flipped.is_error is False, flipped
+                    ack = flipped.structured_content or {}
+                    # T23 ack envelope on the write — etag,
+                    # size_bytes, last_modified_ms all populated
+                    # against real SB.
+                    assert ack.get("name") == MARKER
+                    assert ack.get("etag") is not None
+                    assert ack.get("size_bytes") is not None
+                    assert ack.get("last_modified_ms") is not None
+                    # Confirm the page body now shows ``[x]`` for
+                    # ``FirstTask`` via ``list_tasks`` — the
+                    # bullet's ``state`` should have flipped.
+                    listed_after = await session.call_tool(
+                        "list_tasks", {"page": MARKER}
+                    )
+                    assert listed_after.is_error is False
+                    after_tasks = (
+                        listed_after.structured_content or {}
+                    ).get("result", [])
+                    first = next(
+                        t for t in after_tasks if t["ref"] == "FirstTask"
+                    )
+                    assert first["state"] == "x"
+                    # dry-run preview: a fully-built dry-run
+                    # envelope, page body unchanged. We flip the
+                    # same task back to ``todo`` via dry-run so
+                    # the live-SB signal for the no-PUT contract
+                    # is that the body's first task is still
+                    # ``[x]`` after the dry-run call.
+                    preview = await session.call_tool(
+                        "check_task",
+                        {
+                            "page": MARKER,
+                            "ref": "FirstTask",
+                            "state": "todo",
+                            "dry_run": True,
+                        },
+                    )
+                    assert preview.is_error is False, preview
+                    pc = preview.structured_content or {}
+                    assert pc.get("dry_run") is True
+                    assert "FirstTask" in (pc.get("patched") or "")
+                    # Body unchanged: first task still ``[x]``.
+                    listed_dry = await session.call_tool(
+                        "list_tasks", {"page": MARKER}
+                    )
+                    assert listed_dry.is_error is False
+                    dry_tasks = (
+                        listed_dry.structured_content or {}
+                    ).get("result", [])
+                    first_dry = next(
+                        t for t in dry_tasks if t["ref"] == "FirstTask"
+                    )
+                    assert first_dry["state"] == "x"
+                    # Roll the real flip back to ``[ ]`` so the
+                    # test leaves the live space in a known
+                    # state (the rest of the test suite, future
+                    # runs, and the operator's live state all
+                    # benefit from a clean marker page).
+                    rolled_back = await session.call_tool(
+                        "check_task",
+                        {"page": MARKER, "ref": "FirstTask", "state": "todo"},
+                    )
+                    assert rolled_back.is_error is False, rolled_back
+                    listed_final = await session.call_tool(
+                        "list_tasks", {"page": MARKER}
+                    )
+                    assert listed_final.is_error is False
+                    final_tasks = (
+                        listed_final.structured_content or {}
+                    ).get("result", [])
+                    first_final = next(
+                        t for t in final_tasks if t["ref"] == "FirstTask"
+                    )
+                    assert first_final["state"] == " "
     finally:
         server_task.cancel()
         with suppress(asyncio.CancelledError):

@@ -37,11 +37,18 @@ per ``- [ ]`` / ``- [x]`` / ``- [X]`` bullet) plus an opt-in
 space-walk variant (``list_tasks(page=None, prefix="Daily")``)
 that walks the SB space directory directly (gated behind the
 journal config the same way ``journal_histogram`` etc. are).
-The bridge registers ten ``/.fs``-backed tools (``read_page`` /
-``page_exists`` / ``write_page`` / ``delete_page`` /
-``append_to_page`` / ``patch_page_lines`` / ``patch_page_replace``
-/ ``move_page`` / ``list_pages`` / ``diff_pages``) plus one
-bullet primitive (``list_tasks``) plus one resource template
+T30 adds ``check_task`` for a twelfth tool — flip a checkbox
+bullet's state by its wikilink ref (``check_task(page, ref,
+state="done")`` reads the page, finds the unique bullet whose
+wikilink target equals ``ref``, flips the marker, and writes
+the body back via ``write_page(if_match=<read_etag>)`` so a
+concurrent edit fails 412 rather than silently clobbering the
+flip). The bridge registers eleven ``/.fs``-backed tools
+(``read_page`` / ``page_exists`` / ``write_page`` /
+``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
+``patch_page_replace`` / ``move_page`` / ``list_pages`` /
+``diff_pages`` / ``check_task``) plus one bullet enumerator
+(``list_tasks``) plus one resource template
 (``silverbullet://page/{name}``). Each tool closes over a single
 :class:`SBClient` opened at boot; SB's typed exceptions translate
 to :mcp_exc:`ToolError` with the exact wording from
@@ -53,7 +60,8 @@ T10 of the v1.1 map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the eleven ``/.fs``-backed + bullet-primitive tools
+registers only the eleven ``/.fs``-backed tools plus one bullet
+primitive (``list_tasks``) — twelve total —
 and the resource template. See :mod:`mcp_silverbullet.journal` for
 the gate logic.
 
@@ -62,7 +70,8 @@ client contract for the SB-side status codes, and
 ``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
 for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
 v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
-agent-facing QOL tickets (T23/T24/T25/T26/T27/T28/T29 done; T30 next).
+agent-facing QOL tickets (T23/T24/T25/T26/T27/T28/T29/T30 done;
+destination reached).
 """
 
 from __future__ import annotations
@@ -83,8 +92,11 @@ from mcp.server.mcpserver.server import MCPServer
 
 from mcp_silverbullet.journal import (
     JournalConfig,
+    _apply_checkbox_flip,
+    _find_task_bullet,
     _list_tasks_for_space,
     _parse_tasks,
+    _validate_check_task_state,
     register_journal_tools,
 )
 from mcp_silverbullet.sb_client import (
@@ -505,8 +517,8 @@ def build_mcp(
         ``delete_page`` / ``append_to_page`` /
         ``patch_page_lines`` / ``patch_page_replace`` /
         ``move_page`` / ``list_pages`` / ``diff_pages`` /
-        ``list_tasks``) and the resource template; when off, only
-        the latter are exposed. Resolved by
+        ``check_task`` / ``list_tasks``) and the resource template;
+        when off, only the latter are exposed. Resolved by
         :func:`mcp_silverbullet.main.load_settings` from the two
         ``MCP_SILVERBULLET_JOURNAL_*`` env vars; tests construct one
         directly.
@@ -531,35 +543,42 @@ def build_mcp(
         name=name,
         instructions=(
             "Read, write, delete, append to, patch, move, list, "
-            "check existence of, diff, and enumerate checkbox "
-            "tasks on SilverBullet pages. Eleven tools "
+            "check existence of, diff, enumerate, and flip "
+            "checkbox tasks on SilverBullet pages. Twelve tools "
             "(`read_page`, `page_exists`, `write_page`, "
             "`delete_page`, `append_to_page`, "
             "`patch_page_lines`, `patch_page_replace`, "
             "`move_page`, `list_pages`, `diff_pages`, "
-            "`list_tasks`) plus one resource template "
-            "`silverbullet://page/{name}` for attaching page "
-            "bodies to conversation context. The three "
-            "read-modify-write tools (`append_to_page`, "
-            "`patch_page_lines`, `patch_page_replace`) accept "
+            "`check_task`, `list_tasks`) plus one resource "
+            "template `silverbullet://page/{name}` for "
+            "attaching page bodies to conversation context. "
+            "The four read-modify-write tools "
+            "(`append_to_page`, `patch_page_lines`, "
+            "`patch_page_replace`, `check_task`) accept "
             "`dry_run=True` (T26) to preview the patch without "
             "committing. `list_pages` returns the full meta "
             "envelope per row (`{name, etag, size_bytes, "
             "last_modified_ms, created_ms}`); set "
             "`MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` to "
-            "hydrate the etag from a per-page GET (T28 opt-in). "
-            "`diff_pages` (T27) takes one page plus either "
-            "`other_name` (a second page to diff against) or "
-            "`other_body` (a literal string) and returns a "
-            "line-based unified diff alongside the read-side "
-            "envelopes for both pages. `list_tasks` (T29) "
-            "enumerates checkbox bullets on a page "
-            "(`list_tasks(page=\"name\")`) or across the whole "
-            "space (`list_tasks(prefix=\"Daily\")`, requires "
-            "the journal surface); the per-page form is always "
-            "available via `GET /.fs/{page}`, the space-walk "
-            "form requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` "
-            "plus `MCP_SILVERBULLET_SPACE_PATH`."
+            "hydrate the etag from a per-page GET (T28 "
+            "opt-in). `diff_pages` (T27) takes one page plus "
+            "either `other_name` (a second page to diff "
+            "against) or `other_body` (a literal string) and "
+            "returns a line-based unified diff alongside the "
+            "read-side envelopes for both pages. `list_tasks` "
+            "(T29) enumerates checkbox bullets on a page "
+            "(`list_tasks(page=\"name\")`) or across the "
+            "whole space (`list_tasks(prefix=\"Daily\")`, "
+            "requires the journal surface); the per-page "
+            "form is always available via `GET /.fs/{page}`, "
+            "the space-walk form requires "
+            "`MCP_SILVERBULLET_JOURNAL_TOOLS=1` plus "
+            "`MCP_SILVERBULLET_SPACE_PATH`. `check_task` "
+            "(T30) flips a checkbox bullet's state by its "
+            "wikilink ref (`check_task(page, ref, "
+            "state=\"done\")`); the same read-modify-write "
+            "contract as the patch tools, with `state` in "
+            "{\"done\", \"todo\", \"cancelled\"}."
         ),
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
@@ -590,11 +609,11 @@ def register_tools(
     hydrate_etags: bool = False,
     journal_root: Path | None = None,
 ) -> None:
-    """Attach the eleven ``/.fs``-backed + bullet-primitive tools and one resource template to ``mcp``.
+    """Attach the eleven ``/.fs``-backed tools, the bullet primitive (``list_tasks``), and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
-    are decorators that take the function; eight of the eleven tool
+    are decorators that take the function; nine of the twelve tool
     handlers wrap their ``sb_client`` call in
     :func:`_translate_sb_errors`, which maps SB exceptions to
     :exc:`ToolError` per the design doc's status-code mapping.
@@ -1399,6 +1418,170 @@ def register_tools(
                 "MCP_SILVERBULLET_SPACE_PATH)"
             )
         return await _list_tasks_for_space(journal_root, prefix)
+
+    @mcp.tool(
+        title="Check task",
+        description=(
+            "Flip a checkbox bullet's state by its wikilink ref. "
+            "Locates the unique checkbox bullet on `page` whose "
+            "wikilink target equals `ref` (case-sensitive, "
+            "matching `list_tasks` and SB's case-sensitive page "
+            "lookup) and flips the `[ ]` / `[x]` / `[X]` marker "
+            "to the requested `state`. `state=\"done\"` "
+            "(default) flips to `[x]`, `state=\"todo\"` flips to "
+            "`[ ]`, `state=\"cancelled\"` flips to `[X]` "
+            "(SB's third state). Any other value is "
+            "`ToolError(\"state must be one of: done, todo, "
+            "cancelled\")` — surfaced upfront, no read round "
+            "trip. The rest of the line (leading whitespace, the "
+            "dash, the bullet text, the wikilink itself) is "
+            "preserved verbatim — only the character inside the "
+            "square brackets changes. Returns the T23 write "
+            "acknowledgement `{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}` (the etag / size / "
+            "timestamps reflect what was actually written, not "
+            "what was read — same carry-forward as the other "
+            "read-modify-write tools). `if_match=\"*\"` requires "
+            "the page to exist; `if_match=<etag>` requires the "
+            "body hash to match the read's etag (same "
+            "read-modify-write contract as `append_to_page` / "
+            "`patch_page_lines` / `patch_page_replace` — "
+            "concurrent edits fail with the unified 412 "
+            "ToolError rather than silently clobbering). "
+            "`dry_run=True` (T26) returns `{dry_run: True, "
+            "original: str, patched: str, diff: str}` without "
+            "writing — the read still happens, the in-memory "
+            "flip is computed, `if_match=<etag>` is checked "
+            "against the read's etag (a stale etag raises "
+            "412-equivalent ToolError so the agent sees one "
+            "shape across both paths), and the tool reports "
+            "back the line that would have changed. The "
+            "pre-read input-validation errors below still fire "
+            "on dry-run — a caller that passes an unknown "
+            "`state` or an empty `ref` gets the same specific "
+            "ToolError the live path would surface, not a vague "
+            "preview. Errors: empty `ref` upfront → "
+            "`ToolError(\"ref must not be empty\")`; a missing "
+            "page → standard `ToolError(\"page not found: "
+            "{page}\")`; no bullet on the page has a wikilink "
+            "matching `ref` → "
+            "`ToolError(\"no task with ref {ref} on page {page}; "
+            "the task may not have a wikilink ref or may live "
+            "on a different page\")`; multiple bullets have "
+            "matching wikilinks → "
+            "`ToolError(\"ref {ref} matches multiple tasks on "
+            "page {page}; narrow the ref or use "
+            "patch_page_lines directly\")` (the multi-match "
+            "case is a caller error — two same-refed tasks on "
+            "one page is the rare edge that needs "
+            "disambiguation, not silent toggling of the first "
+            "one); stale etag → standard 412 ToolError."
+        ),
+    )
+    async def check_task(
+        page: str,
+        ref: str,
+        state: str = "done",
+        if_match: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        # Cheap, no-read input validation first. An unknown
+        # `state` is almost certainly a caller typo
+        # (``\"checked\"``, ``\"complete\"``, …) — surface it
+        # loudly upfront so the read-modify-write round trip
+        # isn't wasted. An empty `ref` would match every line
+        # containing ``[[]]`` — a degenerate intent that
+        # ``_find_task_bullet` already treats as "no match"
+        # (``\"\"` is a caller bug, not a real lookup"), but
+        # surfacing it upfront gives the agent a clearer
+        # failure than \"no task with ref on page\". Mirrors
+        # the upfront guards on the other read-modify-write
+        # tools (``append_to_page`'s empty-text,
+        # ``patch_page_replace`'s empty-find).
+        if not ref:
+            raise ToolError("ref must not be empty")
+        target_marker = _validate_check_task_state(state)
+        async with _translate_sb_errors(page):
+            result_page = await sb_client.read_page(page)
+        body = result_page.body or ""
+        # Distinct error surfaces for 0-match vs multi-match.
+        # ``_find_task_bullet` returns the *first* match without
+        # counting; we re-walk to count explicitly so the
+        # wording carries the count the agent needs to fix the
+        # call (\"narrow the ref or pass replace_all…\"
+        # equivalent for tasks).
+        match = _find_task_bullet(body, ref)
+        if match is None:
+            raise ToolError(
+                f"no task with ref {ref} on page {page}; "
+                f"the task may not have a wikilink ref or may "
+                f"live on a different page"
+            )
+        # Count additional matches by re-parsing — the
+        # ``_parse_tasks`` walker is O(page size) and we just
+        # spent one read, so this is cheap and the agent sees
+        # the count in the error wording rather than having
+        # to debug a \"succeeded for the wrong bullet\"
+        # outcome.
+        all_tasks = _parse_tasks(page, body)
+        match_count = sum(1 for t in all_tasks if t.ref == ref)
+        if match_count > 1:
+            raise ToolError(
+                f"ref {ref} matches multiple tasks on page "
+                f"{page}; narrow the ref or use "
+                f"patch_page_lines directly"
+            )
+        # Single match confirmed. ``_apply_checkbox_flip`
+        # splices the modified line into a new body via the
+        # byte offsets ``_find_task_bullet` returned; the rest
+        # of the page is byte-exact (same trailing-newline
+        # shape, no implicit changes outside the bullet line).
+        flip_result = _apply_checkbox_flip(body, ref, state)
+        if flip_result is None:
+            # Defence-in-depth: ``_find_task_bullet` already
+            # matched, but ``_apply_checkbox_flip` re-runs it
+            # under the hood and could conceivably see a
+            # different answer if the body mutated between
+            # calls (it can't here — both run synchronously
+            # inside the ``async with`` block — but raising a
+            # clearer error beats a ``None``-attribute
+            # surprise).
+            raise ToolError(
+                f"no task with ref {ref} on page {page}; "
+                f"the task may not have a wikilink ref or may "
+                f"live on a different page"
+            )
+        new_body, editor_line, _original_state, _new_state = flip_result
+        if dry_run:
+            # T26: validate ``if_match`` against the read's etag
+            # *here* because no PUT happens. Same shape as the
+            # other patch tools' dry-run paths.
+            _validate_if_match_on_read(result_page.etag, if_match)
+            return _dry_run_payload(body, new_body)
+        # Live path: thread the read's etag into the write so a
+        # concurrent edit fails 412 rather than silently
+        # clobbering. The read carries no precondition (matches
+        # ``append_to_page` / ``patch_page_*` siblings); the
+        # write's ``If-Match`` is the *caller's* guard, lifted
+        # to the bridge-side read so the etag-threading is
+        # automatic and the caller doesn't have to repeat it.
+        # An explicit ``if_match`` from the caller is honored
+        # verbatim — if the caller passed a *stale* etag
+        # themselves, the write fails 412 at SB (or
+        # ``_translate_sb_errors` translates that to the
+        # unified ToolError wording). The only case where the
+        # bridge overrides the caller's ``if_match`` is the
+        # ``None`` case, where we thread the read's etag
+        # through so concurrent edits are caught without the
+        # caller having to manage an etag round-trip.
+        write_if_match = (
+            if_match if if_match is not None else result_page.etag
+        )
+        async with _translate_sb_errors(page):
+            meta = await sb_client.write_page(
+                page, new_body, if_match=write_if_match
+            )
+        return _write_meta_to_payload(meta)
 
     @mcp.resource(
         "silverbullet://page/{name}",

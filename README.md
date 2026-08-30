@@ -7,11 +7,11 @@ side-car on loopback; it does not provision tunnels.
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
 v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
-v1.2 map (agent-facing QOL + bullet primitives, one open ticket after T23+T24+T25+T26+T27+T28+T29): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+v1.2 map (agent-facing QOL + bullet primitives, destination reached with `check_task`): [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
 
 ## What it exposes
 
-Eleven tools and one resource template:
+Twelve tools and one resource template:
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
@@ -24,6 +24,7 @@ Eleven tools and one resource template:
 - `list_pages(prefix?)` — returns `[{name, etag, size_bytes, last_modified_ms, created_ms}][]` (T28 widened the per-row shape from the v1.1 `[{name, etag}]` to the same envelope family the read/write tools use; sends `X-Sync-Mode: 1` so SB 2.x returns JSON from `GET /.fs` instead of 307-redirecting to the SPA). On this SB build the list payload omits the `etag` field, so etags are `null` unless the operator opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1` (one GET per row; partial failures leave the affected row's etag as `null` rather than failing the whole call).
 - `diff_pages(name, other_name?, other_body?)` — line-based unified diff between two pages (or a page and a literal string); returns `{diff, name, other?}`. The wire shape: `diff` is a `difflib.unified_diff` between the two bodies (empty string for a no-op diff), `name` is the read-side envelope for the first page (`{name, body, etag, size_bytes, last_modified_ms}`), and `other` is the same envelope for the second page (only present when `other_name` was given; `None` when `other_body` was given). Read-only — never writes. Pass exactly one of `other_name` / `other_body`; passing neither or both is `ToolError("pass exactly one of other_name or other_body")` upfront, no wasted read.
 - `list_tasks(page?, prefix?)` — enumerate checkbox bullets on a page (per-page form, always available via `GET /.fs/{page}`) or across the whole space (space-walk form, requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and `MCP_SILVERBULLET_SPACE_PATH`). Returns `[{name, ref, line, state, text}]`: `name` is the page, `ref` is the wikilink target on the same bullet (`[[Pages/Hobbies]]` → `"Pages/Hobbies"`; an aliased `[[target|alias]]` strips the alias so the ref is the wikilink *target*, not the display text) or `null` when the bullet has no wikilink (such bullets are not addressable by `check_task` — use `patch_page_lines` instead), `line` is the 1-indexed editor line number (frontmatter included, matching what an SB editor highlights), `state` is the literal checkbox character (`" "` for `[ ]`, `"x"` for `[x]`, `"X"` for `[X]`), `text` is the bullet content after the checkbox marker. Frontmatter-block bullets are skipped (they're YAML config keys, not tasks). The space-walk form requires `page=None` (omit `page`) and an optional `prefix` substring against filenames; without the journal gate, omitting `page` surfaces `ToolError("list_tasks without page argument requires the journal surface to be enabled")` so the agent knows to fall back to the per-page form.
+- `check_task(page, ref, state="done", if_match?, dry_run=False)` — flip a checkbox bullet's state by its wikilink ref. Reads the page, finds the unique bullet whose wikilink target equals `ref` (case-sensitive, matching `list_tasks` and SB's case-sensitive page lookup), flips the marker, and writes the body back via `PUT /.fs/{page}` with `If-Match: <read_etag>` so a concurrent edit fails 412 rather than silently clobbering the flip. `state="done"` (default) flips to `[x]`, `state="todo"` flips to `[ ]`, `state="cancelled"` flips to `[X]`; any other value is `ToolError("state must be one of: done, todo, cancelled")` upfront, no read round trip. The rest of the line (leading whitespace, the dash, the bullet text, the wikilink itself) is preserved verbatim — only the character inside the square brackets changes. Returns the T23 ack envelope (`{name, etag, size_bytes, last_modified_ms, created_ms}`). Errors: empty `ref` upfront → `ToolError("ref must not be empty")`; a missing page → standard `ToolError("page not found: {page}")`; no bullet on the page has a wikilink matching `ref` → `ToolError("no task with ref {ref} on page {page}; the task may not have a wikilink ref or may live on a different page")`; multiple bullets have matching wikilinks → `ToolError("ref {ref} matches multiple tasks on page {page}; narrow the ref or use patch_page_lines directly")` (the multi-match case is a caller error — two same-refed tasks on one page is the rare edge that needs disambiguation, not silent toggling of the first one); stale etag → standard 412 ToolError. `dry_run=True` returns the T26 preview envelope (`{dry_run, original, patched, diff}`) without writing — the read still happens, the in-memory flip is computed, `if_match=<etag>` is checked against the read's etag (a stale etag raises 412-equivalent ToolError so the agent sees one shape across both paths), and the tool reports back the line that would have changed. Pre-read input-validation errors (empty `ref`, unknown `state`) still fire on dry-run.
 - `silverbullet://page/{name}` — JSON envelope `{body, etag, size_bytes, last_modified_ms}` (same shape as `read_page`); MIME type is `application/json` in T24 (was `text/markdown` in v1.1)
 
 Every write tool honors `if_match` (`"*"` to require existence,
@@ -93,28 +94,29 @@ shape as the prior `None` ETag handling. DELETE surfaces
 DELETE response doesn't echo the `X-*` headers per the design doc
 § SilverBullet client contract.
 
-The seven write tools (`write_page`, `delete_page`,
+The eight write tools (`write_page`, `delete_page`,
 `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-`move_page`), the two read surfaces (`read_page`,
-`silverbullet://page/{name}`), and `list_pages` (T28) all
-return this same envelope family. `list_pages` returns one
-envelope per row (no `body` field per row — use `read_page`
-for the body).
+`move_page`, `check_task`), the two read surfaces
+(`read_page`, `silverbullet://page/{name}`), and `list_pages`
+(T28) all return this same envelope family. `list_pages`
+returns one envelope per row (no `body` field per row — use
+`read_page` for the body).
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
 
 ### Dry-run mode (T26)
 
-The three read-modify-write tools — `append_to_page`,
-`patch_page_lines`, `patch_page_replace` — accept a
-`dry_run: bool = False` knob. When `dry_run=True`:
+The four read-modify-write tools — `append_to_page`,
+`patch_page_lines`, `patch_page_replace`, `check_task` —
+accept a `dry_run: bool = False` knob. When `dry_run=True`:
 
 - The tool still reads the page (it needs the body to compute the
   patched version).
 - The in-memory patch is computed the same way the live path
   computes it (same separator rule for `append_to_page`, same
   trailing-newline preservation for `patch_page_lines`, same
-  `replace_all` semantics for `patch_page_replace`).
+  `replace_all` semantics for `patch_page_replace`, same
+  marker-slot swap for `check_task`).
 - No PUT is issued — the page is left untouched.
 - `if_match=<etag>` is checked against the **read's** etag. A
   stale etag raises 412-equivalent `ToolError("precondition failed;
@@ -229,10 +231,10 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's eleven tools — `read_page`,
+`/reload` in Pi and the bridge's twelve tools — `read_page`,
 `page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
 `patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
-`diff_pages`, `list_tasks` — register as direct Pi tools.
+`diff_pages`, `check_task`, `list_tasks` — register as direct Pi tools.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so

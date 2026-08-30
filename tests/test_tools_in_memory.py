@@ -8,21 +8,25 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All eleven ``/.fs``-backed tools (``read_page``, ``page_exists``,
-  ``write_page``, ``delete_page``, ``append_to_page``,
-  ``patch_page_lines``, ``patch_page_replace``, ``move_page``,
-  ``list_pages``, ``diff_pages``, ``list_tasks``) on the
-  200 happy path;
+- All twelve tools — the eleven ``/.fs``-backed tools
+  (``read_page``, ``page_exists``, ``write_page``,
+  ``delete_page``, ``append_to_page``, ``patch_page_lines``,
+  ``patch_page_replace``, ``move_page``, ``list_pages``,
+  ``diff_pages``, ``check_task``) plus the always-on bullet
+  enumerator (``list_tasks``) — on the 200 happy path;
   ``write_page`` / ``delete_page`` / ``append_to_page`` /
-  ``patch_page_lines`` / ``patch_page_replace`` return the ETag,
-  ``list_pages`` returns the file metas, ``read_page`` and the
-  resource template both surface the markdown body, ``page_exists``
-  returns ``bool`` (T25), ``diff_pages`` returns the unified diff
-  alongside the read-side envelopes (T27), ``list_tasks`` returns
-  one entry per checkbox bullet (T29). ``append_to_page`` (T19),
-  ``patch_page_lines`` (T20), ``patch_page_replace`` (T21), and
-  ``move_page`` (T22) are the read-modify-write / write-then-delete
-  tools.
+  ``patch_page_lines`` / ``patch_page_replace`` / ``move_page``
+  / ``check_task`` return the T23 write acknowledgement, the
+  read tools return the T24 read acknowledgement, ``list_pages``
+  returns one envelope per row, ``read_page`` and the resource
+  template both surface the markdown body inside the read
+  envelope, ``page_exists`` returns ``bool`` (T25),
+  ``diff_pages`` returns the unified diff alongside the
+  read-side envelopes (T27), ``list_tasks`` returns one entry
+  per checkbox bullet (T29). ``append_to_page`` (T19),
+  ``patch_page_lines`` (T20), ``patch_page_replace`` (T21),
+  ``check_task`` (T30), and ``move_page`` (T22) are the
+  read-modify-write / write-then-delete tools.
 - ``write_page`` carries the ``if_match`` straight through to
   ``sb_client`` (T3 covers the wire envelope; this test guards the
   MCP-tool-to-SB-client argument path).
@@ -31,7 +35,7 @@ Coverage:
   exact ToolError message: 404 → "page not found: <name>"; 412 →
   "precondition failed; check if_match/if_none_match"; 413 →
   "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
-  timeout → "silverbullet request timed out". Eight of the ten
+  timeout → "silverbullet request timed out". Nine of the twelve
   tools share the translation through :func:`server._translate_sb_errors`;
   ``page_exists`` (T25) translates 5xx and timeout inline because
   404 is the *answer* (not an error) for the existence question
@@ -39,6 +43,16 @@ Coverage:
   ``diff_pages`` (T27) threads two ``_translate_sb_errors`` blocks
   (one per read, keyed on the read's target page name) so a 404 on
   either side surfaces with the right page's name in the wording.
+  ``check_task`` (T30) wraps the read in
+  :func:`server._translate_sb_errors` for the same 404 / 5xx /
+  412 wording as the read tool; the write step at the bottom of
+  the read-modify-write dance is wrapped separately so a stale
+  ``if_match`` on the write surfaces as the unified 412 wording.
+  ``check_task`` also has three *application-level* errors
+  (``ref not found`` / ``ref matches multiple tasks`` /
+  ``state must be one of: done, todo, cancelled``) that fire before
+  any SB round trip or between the read and the write — distinct
+  from the wire-level ToolError wording and scoped to this tool.
 - The resource template returns the same body for the happy path and
   surfaces ``ToolError`` for a missing page (v1 keeps one error shape
   for both surfaces; T4 carry-forward note in the map).
@@ -57,7 +71,17 @@ the journal gate. ``list_tasks`` reuses
 space-walk branch surfaces a ``ToolError(\"list_tasks without
 page argument requires the journal surface to be enabled\")``
 when the journal gate is off (a different error shape, specific
-to the space-walk shape).
+to the space-walk shape). T30 (``check_task``) is the twelfth
+tool: a wikilink-ref-targeted checkbox flip that reads the
+page, finds the unique bullet whose wikilink equals ``ref``,
+flips the marker (``[ ]`` / ``[x]`` / ``[X]``), and writes the
+body back via ``write_page(if_match=<read_etag>)``. Application-
+level errors (``ref not found`` / ``ref matches multiple tasks``
+/ ``state must be one of: done, todo, cancelled``) fire
+without a SB round trip or between the read and the write;
+the wire-level read / write steps go through
+:func:`server._translate_sb_errors` for the unified 404 / 412
+wording.
 """
 
 from __future__ import annotations
@@ -4660,4 +4684,539 @@ async def test_list_tasks_without_page_without_journal_root_errors() -> None:
     text = _text(result)
     assert "list_tasks without page argument" in text
     assert "MCP_SILVERBULLET_JOURNAL_TOOLS" in text
+
+
+# --- check_task (T30) --------------------------------------------------
+#
+# ``check_task(page, ref, state=\"done\", if_match?, dry_run=False)``
+# flips a checkbox bullet's state by its wikilink ref. The
+# implementation is a read-modify-write: ``GET /.fs/{page}`` →
+# :func:`_find_task_bullet` (locate the unique bullet whose
+# wikilink equals ``ref``) → flip the marker (``[ ]`` / ``[x]`` /
+# ``[X]``) → ``PUT /.fs/{page}`` (with ``If-Match: <read_etag>``)
+# so a concurrent edit fails 412 rather than silently clobbering
+# the flip. ``dry_run=True`` skips the PUT and returns the T26
+# preview envelope (``{dry_run, original, patched, diff}``).
+#
+# Four application-level error surfaces that fire without a SB
+# round trip or between the read and the write:
+# 1. Empty ``ref`` upfront → ``ref must not be empty``.
+# 2. ``state`` not in ``{\"done\", \"todo\", \"cancelled\"}`` →
+#    ``state must be one of: done, todo, cancelled``.
+# 3. No bullet on the page has a wikilink matching ``ref`` →
+#    ``no task with ref {ref} on page {page}; the task may
+#    not have a wikilink ref or may live on a different page``.
+# 4. Multiple bullets have matching wikilinks → ``ref {ref}
+#    matches multiple tasks on page {page}; narrow the ref
+#    or use patch_page_lines directly`` (count is in the wording
+#    is implicit via \"multiple\"; the explicit count lives
+#    on the parser count, not the wire wording).
+#
+# Wire-level surfaces (404 / 412 / 5xx / timeout / 413) go
+# through :func:`server._translate_sb_errors` for the read and
+# the write separately, matching the read / write tools' wording.
+
+
+@pytest.mark.asyncio
+async def test_check_task_flips_todo_to_done_with_default_state() -> None:
+    """``check_task`` with default ``state=\"done\"`` flips ``[ ]`` → ``[x]``.
+
+    The whole ``read_page`` → flip → ``write_page`` cycle runs
+    in one tool call. The page body is read, the unique
+    bullet with the matching wikilink is located, the marker
+    is flipped, and the body is written back with
+    ``If-Match: <read_etag>`` so a concurrent edit fails 412.
+    """
+    body = "header\n- [ ] task [[Ref]] ref\n"
+    written_bodies: list[str] = []
+    written_if_match: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=body,
+                headers={"ETag": '"read-etag"'},
+            )
+        if request.method == "PUT":
+            written_bodies.append(request.read().decode("utf-8"))
+            written_if_match.append(request.headers.get("If-Match"))
+            return httpx.Response(
+                200,
+                text="",
+                headers={
+                    "ETag": '"write-etag"',
+                    "X-Content-Length": str(
+                        len(written_bodies[-1].encode("utf-8"))
+                    ),
+                    "X-Last-Modified": "1700000000000",
+                },
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "p", "ref": "Ref"}
+        )
+
+    assert result.is_error is False
+    assert written_bodies == ["header\n- [x] task [[Ref]] ref\n"]
+    # ``If-Match`` on the write is the read's etag, threaded
+    # automatically so the caller doesn't have to manage an
+    # etag round-trip just to flip a task.
+    assert written_if_match == ['"read-etag"']
+    # The T23 acknowledgement envelope — the write's meta, not
+    # the read's (same carry-forward as ``append_to_page``).
+    sc = result.structured_content
+    assert sc is not None
+    assert sc["name"] == "p"
+    assert sc["etag"] == '"write-etag"'
+    assert sc["last_modified_ms"] == 1700000000000
+
+
+@pytest.mark.asyncio
+async def test_check_task_returns_todo_state() -> None:
+    """``state=\"todo\"`` flips ``[x]`` → ``[ ]`` (the uncheck direction).
+
+    Round-tripping done → todo works the same way todo → done
+    does — the marker character in :data:`_STATE_TO_MARKER` is
+    the only thing that changes.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [x] task [[Ref]] ref\n",
+                headers={"ETag": '"e"'},
+            )
+        if request.method == "PUT":
+            return httpx.Response(
+                200,
+                text="",
+                headers={
+                    "ETag": '"w"',
+                    "X-Content-Length": str(
+                        len(request.read())
+                    ),
+                },
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "p", "ref": "Ref", "state": "todo"}
+        )
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_check_task_returns_cancelled_state() -> None:
+    """``state=\"cancelled\"`` flips ``[ ]`` → ``[X]`` (SB's third state).
+
+    Uppercase ``X`` distinguishes cancelled from done
+    (lowercase ``x``); the parser keeps the case so the
+    agent can read the state directly off the marker.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Ref]] ref\n",
+                headers={"ETag": '"e"'},
+            )
+        if request.method == "PUT":
+            body = request.read().decode("utf-8")
+            assert body == "- [X] task [[Ref]] ref\n"
+            return httpx.Response(
+                200, text="", headers={"ETag": '"w"'}
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "p", "ref": "Ref", "state": "cancelled"},
+        )
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_check_task_rejects_unknown_state_upfront() -> None:
+    """``state=\"complete\"`` (or any other typo) → ``ToolError`` upfront.
+
+    No GET, no PUT — the validation runs before the read.
+    The wording carries the allowed set so the agent sees
+    what it should have passed without trial-and-error.
+    ``assert_called_with(GET, ...)`` is enforced by the
+    transport's empty request log below.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        return httpx.Response(200, text="")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "p", "ref": "Ref", "state": "complete"},
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "state must be one of" in text
+    assert "done" in text
+    assert "todo" in text
+    assert "cancelled" in text
+    # Upfront validation — no GET happened.
+    assert requests_made == []
+
+
+@pytest.mark.asyncio
+async def test_check_task_rejects_empty_ref_upfront() -> None:
+    """``ref=\"\"`` → ``ToolError(\"ref must not be empty\")`` upfront.
+
+    Mirrors the other read-modify-write tools' upfront guards
+    (``append_to_page`'s empty-text, ``patch_page_replace`'s
+    empty-find). An empty ref is almost certainly a caller bug;
+    surfacing it loudly pins the bug at the call site and saves
+    the read round trip.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        return httpx.Response(200, text="")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "p", "ref": ""}
+        )
+
+    assert result.is_error is True
+    assert "ref must not be empty" in _text(result)
+    assert requests_made == []
+
+
+@pytest.mark.asyncio
+async def test_check_task_errors_when_no_bullet_matches_ref() -> None:
+    """No bullet with the ref → ``no task with ref {ref} on page {page}; …``.
+
+    The wording points the agent at the two most likely
+    causes (no wikilink ref on the bullet; the task lives on
+    a different page). Distinct from the 404 ``page not
+    found`` wording so the agent can tell a *page exists
+    but no matching task* from a *page is missing*.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Other]] ref\n",
+                headers={"ETag": '"e"'},
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "p", "ref": "Pages/Hobbies"}
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "no task with ref Pages/Hobbies" in text
+    assert "on page p" in text
+    # The read happened (we needed to know which tasks exist)
+    # but no PUT (no flip should land when there's no match).
+    assert requests_made == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_check_task_errors_when_multiple_bullets_match_ref() -> None:
+    """Multiple bullets with the same ref → ``matches multiple tasks`` wording.
+
+    Disambiguation hint in the error: the caller should
+    narrow the ref (use a more specific wikilink target) or
+    fall back to :func:`patch_page_lines` directly. Without
+    this error, ``check_task`` would silently flip the *first*
+    one — a confusing UX for a typo'd ref that's already in
+    use.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=(
+                    "- [ ] first [[Same]]\n"
+                    "- [ ] second [[Same]]\n"
+                ),
+                headers={"ETag": '"e"'},
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "p", "ref": "Same"}
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "matches multiple tasks" in text
+    assert "on page p" in text
+    assert "patch_page_lines" in text
+    assert requests_made == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_check_task_404_returns_tool_error() -> None:
+    """Page missing → standard ``ToolError(\"page not found: {name}\")`` wording.
+
+    Same translation :func:`_translate_sb_errors` provides for
+    every ``/.fs``-backed tool. ``check_task`` wraps the read
+    in this helper so an SB-side missing page looks identical
+    to the agent regardless of which tool surfaced it.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "missing", "ref": "Ref"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool check_task: page not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_check_task_stale_if_match_returns_412_tool_error() -> None:
+    """Caller passed ``if_match=<stale_etag>`` → unified 412 wording.
+
+    The read succeeds (the page exists, the etag was just
+    ``read_etag``); the write fails 412 because the caller's
+    ``if_match`` doesn't match the body the bridge would
+    write. The wording is the unified 412 / precondition-failed
+    shape the rest of the bridge uses so the agent sees one
+    error across all tools.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Ref]] ref\n",
+                headers={"ETag": '"read-etag"'},
+            )
+        if request.method == "PUT":
+            return httpx.Response(412, text="precondition failed")
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "p", "ref": "Ref", "if_match": '"stale-etag"'},
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool check_task: precondition failed; check if_match/if_none_match"
+
+
+@pytest.mark.asyncio
+async def test_check_task_dry_run_returns_envelope_without_writing() -> None:
+    """``dry_run=True`` → T26 envelope, no PUT issued.
+
+    Read still happens (the tool needs the body to compute
+    the patched version), the in-memory flip is computed,
+    ``If-Match`` is checked against the read's etag, and the
+    tool returns ``{dry_run: True, original: str, patched:
+    str, diff: str}``. The Layer-1 test asserts on the
+    request methods the bridge issues (no PUT on dry-run)
+    so a future refactor that mistakenly issues a write on
+    the dry-run path surfaces as test failure.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Ref]] ref\n",
+                headers={"ETag": '"e"'},
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "p", "ref": "Ref", "dry_run": True},
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content
+    assert sc is not None
+    assert sc["dry_run"] is True
+    assert sc["original"] == "- [ ] task [[Ref]] ref\n"
+    assert sc["patched"] == "- [x] task [[Ref]] ref\n"
+    assert "- [ ]" in sc["diff"]
+    assert "- [x]" in sc["diff"]
+    # The dry-run path: read happened, write did not.
+    assert requests_made == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_check_task_dry_run_stale_if_match_raises_412_tool_error() -> None:
+    """``dry_run=True`` + ``if_match=<stale>`` → 412-equivalent ToolError.
+
+    The dry-run path doesn't issue a PUT, so SB never gets to
+    enforce the precondition; the bridge-side mirror
+    (:func:`_validate_if_match_on_read`) catches the stale
+    etag so the agent sees the same wording as the live path.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Ref]] ref\n",
+                headers={"ETag": '"read-etag"'},
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {
+                "page": "p",
+                "ref": "Ref",
+                "if_match": '"stale-etag"',
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "precondition failed" in text
+
+
+@pytest.mark.asyncio
+async def test_check_task_dry_run_empty_ref_still_errors() -> None:
+    """``dry_run=True`` + ``ref=\"\"`` → upfront ``ref must not be empty``.
+
+    Pre-read input validation fires on the dry-run path the
+    same way it does on the live path — a caller that passes
+    a bad input gets the same specific ToolError, not a
+    vague preview.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        return httpx.Response(200, text="")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "p", "ref": "", "dry_run": True},
+        )
+
+    assert result.is_error is True
+    assert "ref must not be empty" in _text(result)
+    assert requests_made == []
+
+
+@pytest.mark.asyncio
+async def test_check_task_dry_run_no_match_still_errors() -> None:
+    """``dry_run=True`` + missing ref → ``no task with ref …`` (no PUT).
+
+    The application-level \"no match\" error fires between
+    the read and the write on the live path; on the dry-run
+    path it fires before the dry-run envelope is built, so
+    a caller with a typo'd ref never sees a fake preview.
+    """
+    requests_made: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="- [ ] task [[Other]] ref\n",
+                headers={"ETag": '"e"'},
+            )
+        return httpx.Response(500)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {
+                "page": "p",
+                "ref": "Pages/Hobbies",
+                "dry_run": True,
+            },
+        )
+
+    assert result.is_error is True
+    assert "no task with ref Pages/Hobbies" in _text(result)
+    assert requests_made == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_check_task_5xx_returns_tool_error() -> None:
+    """SB 5xx surfaces the unified ``ToolError(\"silverbullet error: <status>\")`` wording.
+
+    Same translation :func:`_translate_sb_errors` provides for
+    every ``/.fs``-backed tool. The read 5xx surfaces here;
+    a write 5xx would surface the same way under the live path.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "x", "ref": "Ref"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool check_task: silverbullet error: 503"
+
+
+@pytest.mark.asyncio
+async def test_check_task_timeout_returns_tool_error() -> None:
+    """httpx timeout → ``ToolError(\"silverbullet request timed out\")``.
+
+    Same wording as every other ``/.fs``-backed tool. The
+    timeout exception type (``httpx.TimeoutException``) is
+    caught by :func:`_translate_sb_errors` so ``check_task``
+    doesn't need its own timeout clause.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "x", "ref": "Ref"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool check_task: silverbullet request timed out"
 

@@ -11,6 +11,41 @@ tickets; this file records what's already shipped.
 ## [Unreleased] — v1.2 (agent-facing QOL + bullet primitives)
 
 Build map: [`docs/wayfinder/map-v1.2.md`](docs/wayfinder/map-v1.2.md).
+**Status: destination reached** — every ticket on the v1.2 map
+(T23–T30) is closed; the bridge now exposes twelve tools.
+
+### Added
+
+- **`check_task(page, ref, state="done", if_match?, dry_run=False)`**
+  — flip a checkbox bullet's state by its wikilink ref (T30).
+  Reads the page, finds the unique bullet whose wikilink target
+  equals `ref` (case-sensitive, matching `list_tasks` and SB's
+  case-sensitive page lookup), flips the marker character, and
+  writes the body back via `PUT /.fs/{page}` with `If-Match:
+  <read_etag>` so a concurrent edit fails 412 rather than
+  silently clobbering the flip. `state="done"` (default) flips
+  to `[x]`, `state="todo"` flips to `[ ]`, `state="cancelled"`
+  flips to `[X]` (SB's third state); any other value is
+  `ToolError("state must be one of: done, todo, cancelled")`
+  upfront, no read round trip. The rest of the line (leading
+  whitespace, the dash, the bullet text, the wikilink itself)
+  is preserved verbatim — only the character inside the square
+  brackets changes. Returns the T23 ack envelope
+  (`{name, etag, size_bytes, last_modified_ms, created_ms}`).
+
+  Errors:
+  - empty `ref` upfront → `ToolError("ref must not be empty")`;
+  - missing page → standard `ToolError("page not found: {page}")`;
+  - no bullet with the ref → `ToolError("no task with ref {ref} on page {page}; the task may not have a wikilink ref or may live on a different page")`;
+  - multiple bullets with the ref → `ToolError("ref {ref} matches multiple tasks on page {page}; narrow the ref or use patch_page_lines directly")`;
+  - stale etag → standard 412 ToolError.
+
+  `dry_run=True` returns the T26 preview envelope
+  (`{dry_run, original, patched, diff}`) without writing — the
+  read still happens, the in-memory flip is computed,
+  `if_match=<etag>` is checked against the read's etag, and the
+  pre-read input-validation errors (empty `ref`, unknown
+  `state`) still fire on dry-run.
 
 ### Changed
 

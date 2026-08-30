@@ -42,6 +42,7 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 from mcp.client import Client
+from mcp.server.mcpserver.exceptions import ToolError
 
 from mcp_silverbullet.journal import (
     JournalConfig,
@@ -471,3 +472,202 @@ async def test_list_tasks_space_walk_skips_unreadable_files(
     assert sc["result"] == [
         {"name": "good.md", "ref": None, "line": 1, "state": " ", "text": "good task"},
     ]
+
+
+# --- T30 / check_task parser-level tests ------------------------------
+#
+# These exercise the helpers :func:`mcp_silverbullet.server.check_task`
+# builds on. The full MCP-tool surface (404 / 412 / 5xx / timeout
+# wording, ``if_match`` plumbing, ``dry_run`` envelope) is covered
+# in ``tests/test_tools_in_memory.py`` under the
+# ``# --- check_task (T30) ---`` section header.
+
+
+def test_validate_check_task_state_accepts_the_three_documented_states() -> None:
+    """All three documented ``state`` names resolve to a checkbox character.
+
+    ``done`` → ``\"x\"``, ``todo`` → ``\" \"``,
+    ``cancelled`` → ``\"X\"``. Any other value is a ``ToolError``
+    (tested below) so the agent sees a single shape across both
+    paths.
+    """
+    from mcp_silverbullet.journal import _validate_check_task_state
+
+    assert _validate_check_task_state("done") == "x"
+    assert _validate_check_task_state("todo") == " "
+    assert _validate_check_task_state("cancelled") == "X"
+
+
+def test_validate_check_task_state_rejects_unknown_values() -> None:
+    """Unknown ``state`` names raise ``ToolError`` with the allowed-set wording.
+
+    A typo (``\"checked\"`` / ``\"complete\"`` / ``\"donee\"``) is
+    almost certainly a caller bug; surfacing the allowed set
+    upfront saves a wasted read round trip and pinpoints the
+    typo at the call site rather than as a downstream
+    ``find not in body`` or similar.
+    """
+    from mcp_silverbullet.journal import _validate_check_task_state
+
+    with pytest.raises(ToolError) as excinfo:
+        _validate_check_task_state("complete")
+    assert "done" in str(excinfo.value)
+    assert "todo" in str(excinfo.value)
+    assert "cancelled" in str(excinfo.value)
+
+
+def test_apply_checkbox_flip_flips_todo_to_done() -> None:
+    """``[ ]`` → ``[x]`` (default ``state=\"done\"``) on a unique match.
+
+    Locks the in-memory splice's exact output so a future
+    refactor that accidentally re-flows whitespace or drops the
+    trailing newline surfaces as test failure rather than a
+    silent byte-level drift (the underlying ``write_page``'s
+    etag reflects bytes; the agent's ``if_match`` chain
+    depends on the splice being byte-exact).
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] task with [[Ref]] ref\n"
+    result = _apply_checkbox_flip(body, "Ref", "done")
+    assert result is not None
+    new_body, editor_line, original, new = result
+    assert new_body == "- [x] task with [[Ref]] ref\n"
+    assert editor_line == 1
+    assert original == " "
+    assert new == "x"
+
+
+def test_apply_checkbox_flip_flips_done_to_todo() -> None:
+    """``[x]`` → ``[ ]`` (``state=\"todo\"``) — the \"uncheck\" direction.
+
+    Agents use this to roll back a flip they decided against,
+    or to move a task back to todo when the work it describes
+    is no longer the right step.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [x] task with [[Ref]] ref\n"
+    new_body, _line, original, new = _apply_checkbox_flip(body, "Ref", "todo")
+    assert new_body == "- [ ] task with [[Ref]] ref\n"
+    assert original == "x"
+    assert new == " "
+
+
+def test_apply_checkbox_flip_flips_cancelled_state() -> None:
+    """``[X]`` ↔ ``[ ]`` (``state=\"cancelled\"``) — the third SB state.
+
+    SB renders ``[X]`` as a separate visual state from
+    ``[x]``; the parser distinguishes them by case (uppercase
+    X = cancelled, lowercase x = done). Flipping to/from
+    ``[X]`` round-trips through the parser the same way the
+    other two states do.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] task with [[Ref]] ref\n"
+    new_body, _line, _original, new = _apply_checkbox_flip(
+        body, "Ref", "cancelled"
+    )
+    assert new_body == "- [X] task with [[Ref]] ref\n"
+    assert new == "X"
+
+
+def test_apply_checkbox_flip_preserves_trailing_newline_shape() -> None:
+    """The splice is byte-exact: the body's trailing newline (or lack) survives.
+
+    SB stores text with a trailing newline the way editors do;
+    a splice that *adds* or *drops* a trailing newline would
+    silently inflate the byte count and confuse the
+    ``if_match`` chain. The byte-offset math has to match —
+    this test pins the two shapes (with / without trailing
+    newline) so a future refactor that re-flows the splice
+    surfaces as test failure.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    with_nl = "header\n- [ ] task [[Ref]] ref\ntrailer\n"
+    new_with_nl, *_ = _apply_checkbox_flip(with_nl, "Ref", "done")
+    assert new_with_nl == "header\n- [x] task [[Ref]] ref\ntrailer\n"
+
+    without_nl = "header\n- [ ] task [[Ref]] ref"
+    new_without_nl, *_ = _apply_checkbox_flip(without_nl, "Ref", "done")
+    assert new_without_nl == "header\n- [x] task [[Ref]] ref"
+
+
+def test_apply_checkbox_flip_preserves_wikilink_aliases() -> None:
+    """Aliased wikilinks (``[[target|display]]``) survive the flip verbatim.
+
+    The flip is a single-character swap on the marker; the
+    rest of the line (leading whitespace, dash, post-marker
+    text, the wikilink itself) is byte-exact. Aliases must
+    not be re-rendered to the alias-stripped target — the
+    agent reading the page sees the display text it
+    authored, not the parser's internal target.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] see [[Pages/Hobbies|the hobbies page]]\n"
+    new_body, *_ = _apply_checkbox_flip(body, "Pages/Hobbies", "done")
+    assert new_body == "- [x] see [[Pages/Hobbies|the hobbies page]]\n"
+
+
+def test_apply_checkbox_flip_returns_none_when_no_match() -> None:
+    """Missing ref → ``None`` (caller surfaces the clear ``ToolError`` wording).
+
+    The MCP tool handler translates this into a louder
+    ``no task with ref {ref} on page {page}`` message
+    rather than relying on the ``None`` to communicate
+    failure; the parser-level ``None`` is the
+    sentinel-from-data position.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] task with [[Other]] ref\n"
+    assert _apply_checkbox_flip(body, "Pages/Hobbies", "done") is None
+
+
+def test_apply_checkbox_flip_uses_first_match_when_multiple() -> None:
+    """Multi-match → first match is flipped (caller is responsible for the count check).
+
+    The parser's contract is \"find the unique match or
+    report none\" — :func:`mcp_silverbullet.server.check_task`
+    does the explicit multi-match count *before* calling
+    :func:`_apply_checkbox_flip` (using
+    :func:`_parse_tasks` to count all bullets with the ref)
+    so a typo with a popular ref doesn't silently flip the
+    first one. The parser-level test pins the first-match
+    splice so a future refactor that picked the *last*
+    match would surface here.
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] first [[Same]]\n- [ ] second [[Same]]\n"
+    new_body, editor_line, *_ = _apply_checkbox_flip(
+        body, "Same", "done"
+    )
+    # Only the first line flips; the second stays a todo so
+    # the caller can see the splice landed on the expected
+    # line (and the multi-match count check is what protects
+    # us from doing this at the MCP layer).
+    assert new_body == "- [x] first [[Same]]\n- [ ] second [[Same]]\n"
+    assert editor_line == 1
+
+
+def test_apply_checkbox_flip_handles_nested_bullet_indent() -> None:
+    """Indented ``- [ ]`` bullets flip correctly (preserve the indent).
+
+    SB's editor treats nested ``- [ ]`` lines as
+    addressable tasks; the flip splice preserves the
+    leading whitespace so a nested task stays nested on
+    the patched body (no surprise indent change breaking
+    downstream ``list_tasks`` calls).
+    """
+    from mcp_silverbullet.journal import _apply_checkbox_flip
+
+    body = "- [ ] outer [[Outer]]\n  - [ ] nested [[Nested]]\n"
+    new_body, _line, *_ = _apply_checkbox_flip(body, "Nested", "done")
+    assert new_body == (
+        "- [ ] outer [[Outer]]\n  - [x] nested [[Nested]]\n"
+    )
+

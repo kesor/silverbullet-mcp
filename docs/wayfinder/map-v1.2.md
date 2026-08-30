@@ -58,7 +58,17 @@ The shape:
   finds the bullet by that ref, flips `[ ]` / `[x]` / `[X]`, and
   returns the new ETag.
 
-The destination is reached when all eight tickets are closed.
+### 🏁 Status: destination reached.
+
+T23 (write-tool ack envelope), T24 (read-tool ack envelope),
+T25 (`page_exists`), T26 (`dry_run=True` on the patch tools),
+T27 (`diff_pages`), T28 (`list_pages` metadata + opt-in
+etag-hydration), T29 (`list_tasks` per-page + space-walk),
+and T30 (`check_task` — wikilink-ref-targeted checkbox flip)
+are all resolved; the bridge now ships twelve tools plus one
+resource template. No more open tickets; the next map, if
+one is needed, will be a fresh effort under a new
+destination.
 
 ## Notes
 
@@ -1071,6 +1081,134 @@ resolution below -->
   this dev box (no live SB env). ``nix flake
   check`` not run (no Nix in this env).
 
+- **T30. `check_task(page, ref, state="done", if_match?,
+  dry_run=False)`** (commit pending): twelfth tool, the
+  wikilink-ref-targeted checkbox flip. The bridge gained a
+  new MCP tool that reads the page via `GET /.fs/{page}`,
+  locates the unique bullet whose wikilink target equals
+  ``ref`` (case-sensitive, matching ``list_tasks` and SB's
+  page lookup), flips the marker character (``" "`` ↔
+  ``"x"`` ↔ ``"X"``), and writes the body back via
+  ``PUT /.fs/{page}`` with ``If-Match: <read_etag>`` so a
+  concurrent edit fails 412 rather than silently
+  clobbering the flip. New module-level helpers in
+  ``src/mcp_silverbullet/journal.py``:
+  :data:`_STATE_TO_MARKER` (dict mapping ``done`` /
+  ``todo`` / ``cancelled`` to ``x`` / `` `` / ``X``),
+  :func:`_validate_check_task_state` (upfront guard
+  raises ``ToolError("state must be one of: done, todo,
+  cancelled")``), and :func:`_apply_checkbox_flip` (byte-
+  exact splice of the flipped marker via
+  :func:`_find_task_bullet`'s offsets — the rest of the
+  page is untouched, the trailing-newline shape survives,
+  wikilink aliases are preserved). New ``@mcp.tool("Check
+  task")`` handler in :func:`register_tools` closes over
+  the single ``sb_client`` and threads the read's etag
+  into the write so concurrent edits are caught without
+  the caller managing an etag round-trip; the same
+  :func:`_validate_if_match_on_read` / :func:`_dry_run_payload`
+  helpers the T26 patch tools use power the ``dry_run=True``
+  path so the agent sees one dry-run envelope shape
+  across all four read-modify-write tools. Wire shape
+  ``dict[str, object]`` (``return`` annotation) so the MCP
+  SDK routes through ``structured_content`` (matches the
+  rest of the write tools; the live path returns the T23
+  ack envelope, the dry-run path returns the T26
+  ``{dry_run, original, patched, diff}`` envelope).
+  Six application-level error surfaces — ``ref must not be
+  empty`` (pre-read), ``state must be one of: done, todo,
+  cancelled`` (pre-read), ``no task with ref {ref} on page
+  {page}; the task may not have a wikilink ref or may
+  live on a different page`` (post-read), ``ref {ref}
+  matches multiple tasks on page {page}; narrow the ref
+  or use patch_page_lines directly`` (post-read),
+  ``page not found: {name}`` (read-side via
+  :func:`_translate_sb_errors`), ``precondition failed;
+  check if_match/if_none_match`` (write-side via
+  :func:`_translate_sb_errors`). Multi-match disambiguation:
+  the handler counts matching refs via
+  :func:`_parse_tasks` *before* calling
+  :func:`_apply_checkbox_flip` so a typo'd ref that's
+  already in use surfaces as a clear error rather than
+  silently flipping the first one (the parser-level
+  helper returns the first match without counting; the
+  MCP-level handler is the one that raises the multi-
+  match error). Carry-forwards: ``tests/test_journal_gate.py``
+  ``SB_TOOL_NAMES`` extended from 11 to 12 entries
+  (``check_task`` joins the set); ``tests/test_http_auth.py``
+  sorted ``list_tools()`` shape carries the new tool;
+  ``tests/test_tools_in_memory.py`` module docstring
+  bumped from "eleven tools" to "twelve tools" with the
+  per-tool exception-translation note (``check_task` is
+  the tenth ``/.fs``-backed tool but ``list_tasks` is
+  also twelfth — twelve total``). New tests:
+  ``tests/test_tasks.py`` (10 new parser-level tests:
+  ``done`` / ``todo`` / ``cancelled`` markers,
+  trailing-newline shape preservation, wikilink-alias
+  preservation, multi-match first-occurrence splice,
+  nested-bullet indent preservation, ``None`` on missing
+  ref, three-state validation reject), ``tests/test_tools_in_memory.py``
+  (14 new MCP-level tests under the ``# --- check_task
+  (T30) ---`` section header: default-state flip,
+  ``todo`` flip, ``cancelled`` flip, unknown-state
+  upfront guard, empty-ref upfront guard, no-match
+  wording, multi-match wording, 404, stale ``if_match``
+  412, dry-run envelope without writing, dry-run
+  stale-etag 412, dry-run empty-ref upfront guard,
+  dry-run no-match wording, 5xx, timeout), and the live
+  e2e (``tests/test_e2e_live_sb.py`` grew a 75-line
+  T30 round-trip block in the existing live flow that
+  flips a marker via the bridge, verifies the new
+  state via a follow-up ``list_tasks`, runs a ``dry_run``
+  flip that doesn't land (verified via a third
+  ``list_tasks`` showing the dry-run was no-op), and
+  rolls back via the live path so the test leaves the
+  marker page in a known state). Documentation:
+  ``README.md`` ``What it exposes`` now lists twelve
+  tools (the ``check_task` bullet documents the wire
+  shape, the four application-level error surfaces, the
+  ``dry_run=True` envelope); the ``§ v1.2 wire-shape
+  changes`` "The seven write tools" sentence bumped to
+  "The eight write tools" with ``check_task` listed;
+  the ``### Dry-run mode (T26)`` section bumped from
+  "three read-modify-write tools" to "four"; the Pi-MCP
+  wiring paragraph bumped "eleven tools" to "twelve"
+  with the new tool in the list. ``CHANGELOG.md``
+  Unreleased ``### Added`` section gained a T30 entry
+  with the wire shape and the full error vocabulary.
+  ``docs/design.md`` Goal line bumped to list all
+  twelve tools, § Tools prose bumped to "Twelve tools,
+  one resource template" with the T29/T30 narrative
+  updated, Tools table grew a ``check_task` row with
+  the wire shape and error vocabulary, the
+  ``page_exists` / ``dry_run` cross-references in the
+  status-code mapping table now mention ``check_task`
+  by name (the 404 row's "ToolError("page not found:
+  {name}")" callout applies, the 412 row's
+  "precondition failed; check if_match/if_none_match"
+  callout applies, the 5xx and timeout rows apply).
+  Module docstring of ``server.py`` bumped from
+  "ten ``/.fs``-backed tools plus one bullet primitive
+  (``list_tasks`)" to "eleven ``/.fs``-backed tools
+  plus one bullet primitive (``list_tasks`)" and the
+  "T23/T24/T25/T26/T27/T28/T29 done; T30 next" status
+  line replaced with "T23/T24/T25/T26/T27/T28/T29/T30
+  done; destination reached"; the ``instructions``
+  string lists all twelve tool names with the
+  ``check_task` description; the ``register_tools`
+  docstring bumped "eleven" → "twelve" and "eight of
+  the eleven" → "nine of the twelve" for the
+  ``_translate_sb_errors` count. Test count: 311 pass +
+  2 skip (was 286 + 2 skip at the start of the T30
+  session; +25 net — 10 new parser-level tests + 14
+  new MCP-level tests + 1 new live-e2e round-trip +
+  T23–T29's carry-forwards bumping ``SB_TOOL_NAMES`
+  from 11 to 12 and the Layer-2 ``list_tools` assertion
+  to twelve names). ``nix flake check` not run (no
+  Nix in this env). **The map's destination ("v1.2:
+  agent-facing QOL + bullet primitives") is now reached;
+  every open ticket on the map is closed.**
+
 ## Tickets
 
 <!--
@@ -1466,11 +1604,12 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 ---
 
-### T30. `check_task(page, ref, state="done") -> {page, name, etag, ...}`
+### T30. `check_task(page, ref, state="done", if_match?, dry_run=False)`
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Assignee**: `minimax-m3` (claimed and resolved same session)
+> **Status**: ✅ resolved (see Decisions so far)
 > **Question**: How does the bridge flip a checkbox by ref?
 >
 > **Context**: SB's editor calls `index.updateTaskState(ref, ...)`
@@ -1519,6 +1658,219 @@ file; "blocking" is rendered by ticket ordering and an explicit
 >
 > **Blocks on**: T23 (the return shape), T29 (the matching logic
 > is shared). **Unblocks**: none.
+>
+> **Resolution**: New ``@mcp.tool("Check task")`` handler in
+> :func:`register_tools` closes over the single ``SBClient`` and
+> runs a read-modify-write through ``/.fs``:
+> ``read_page(page)`` → :func:`_find_task_bullet` to locate the
+> unique bullet whose wikilink target equals ``ref`` (case-
+> sensitive, matching :func:`_parse_tasks` / SB's case-sensitive
+> page lookup) → flip the marker character via
+> :func:`_apply_checkbox_flip` → ``write_page(page, new_body,
+> if_match=<read_etag>)`` so a concurrent edit fails 412 rather
+> than silently clobbering the flip. Six design calls baked
+> into the implementation, all aligned with the standing
+> preferences and the ticket body:
+>
+> - **State names map onto checkbox characters via
+>   :data:`_STATE_TO_MARKER`.** The bridge exposes the action
+>   vocabulary (``"done"`` / ``"todo"`` / ``"cancelled"``) so
+>   the agent doesn't have to remember whether the on-disk
+>   character is ``" "`` / ``"x"`` / ``"X"``. An unknown
+>   state is rejected upfront with
+>   ``ToolError("state must be one of: done, todo,
+>   cancelled")`` — the wording carries the allowed set so
+>   the agent sees what it should have passed without trial-
+>   and-error. Validated by
+>   :func:`_validate_check_task_state` *before* the read so
+>   a typo (``"complete"`` / ``"donee"`` / ``"checked"``)
+>   doesn't waste a round trip.
+>
+> - **Empty ``ref`` rejected upfront.** Mirrors the other
+>   read-modify-write tools' upfront guards
+>   (``append_to_page`'s empty-text, ``patch_page_replace`'s
+>   empty-find): ``ToolError("ref must not be empty")`` fires
+>   *before* the inner ``_translate_sb_errors`` block; no
+>   GET, no PUT. An empty ref would match no bullet anyway
+>   (``:func:`_find_task_bullet` treats ``""`` as a caller
+>   bug), but surfacing it upfront gives the agent a clearer
+>   failure than "no task with ref on page" and saves the
+>   read round trip.
+>
+> - **Multi-match is a caller error, not a silent "flip the
+>   first one".** The MCP-level handler explicitly counts
+>   matching refs via :func:`_parse_tasks` *before* calling
+>   :func:`_apply_checkbox_flip`, and raises
+>   ``ToolError("ref {ref} matches multiple tasks on page
+>   {page}; narrow the ref or use patch_page_lines
+>   directly")`` when the count is > 1. The parser-level
+>   helper :func:`_apply_checkbox_flip` returns the first
+>   match without counting (its contract is "find one or
+>   report none"); the MCP layer is the one that raises the
+>   multi-match error with a count-implicit wording. The
+>   disambiguation hint points the agent at the two paths
+>   forward: narrow the ref (use a more specific wikilink
+>   target) or fall back to :func:`patch_page_lines` for a
+>   line-indexed flip that doesn't go through the
+>   wikilink-matching layer.
+>
+> - **Byte-exact splice via :func:`_find_task_bullet`'s
+>   offsets.** :func:`_apply_checkbox_flip` reads the
+>   bullet line out of the body via the byte offsets
+>   :func:`_find_task_bullet` returns, re-applies
+>   :data:`_TASK_BULLET_RE` to the single line, and rebuilds
+>   with the new marker character. The rest of the page is
+>   byte-exact: leading whitespace, the dash, the post-
+>   marker text, the wikilink (including alias suffixes
+>   like ``[[target|display]]``) all survive verbatim. The
+>   trailing-newline shape survives too — a body ending in
+>   ``\n`` spliced in place is still byte-exact with a
+>   trailing ``\n`` afterwards. The etag from the underlying
+>   ``write_page`` reflects exactly the bytes the bridge
+>   just wrote, with no surprise line-ending changes that
+>   would confuse the caller's next ``if_match`` chain.
+>
+> - **Standard read-side / write-side error translation.**
+>   The read is wrapped in :func:`_translate_sb_errors`,
+>   so 404 / 412 / 5xx / timeout on the read surface with
+>   the unified wording (``page not found: {page}`` /
+>   ``precondition failed; check if_match/if_none_match`` /
+>   ``silverbullet error: {status}`` /
+>   ``silverbullet request timed out``). The write is also
+>   wrapped in :func:`_translate_sb_errors`, so a stale
+>   ``if_match`` (caller passed an explicit etag that
+>   doesn't match the body the bridge would write) fails
+>   412 with the same wording the live ``append_to_page` /
+>   ``patch_page_*` siblings use. ``dry_run=True`` skips
+>   the write entirely; the read's etag is checked against
+>   the caller's ``if_match`` via the same
+>   :func:`_validate_if_match_on_read` helper the T26
+>   patch tools use, so a stale etag on the dry-run path
+>   raises the same 412-equivalent wording as the live
+>   path. Pre-read input validation (empty ``ref``,
+>   unknown ``state``) still fires on dry-run — a caller
+>   with a bad input gets the same specific ToolError the
+>   live path would surface, not a vague preview.
+>
+> - **Wire shape ``dict[str, object]``.** The return
+>   annotation matches the rest of the write tools, so
+>   the MCP SDK routes through ``structured_content``
+>   rather than text-JSON-serializing the dict. The live
+>   path returns the T23 ack envelope; the dry-run path
+>   returns the T26 envelope (``{dry_run: True, original:
+>   str, patched: str, diff: str}``) via the same
+>   :func:`_dry_run_payload` helper the three T26 patch
+>   tools use. One helper, four callers (the four read-
+>   modify-write tools' dry-run paths all share the diff
+>   shape — a future agent that composes "preview via
+>   dry_run, then commit" doesn't have to switch shape
+>   mid-conversation depending on which tool it
+>   previewed).
+>
+> Wire shape: ``{name, etag, size_bytes, last_modified_ms,
+> created_ms}`` on the live path (T23 ack envelope,
+> identical to the other write tools — the etag / size /
+> timestamps reflect what was actually written, not what
+> was read, matching the v1.1 carry-forward from
+> ``append_to_page` / ``patch_page_lines` /
+> ``patch_page_replace`); ``{dry_run: True, original: str,
+> patched: str, diff: str}`` on the dry-run path (T26
+> envelope, identical to the other patch tools' dry-run
+> paths). ``if_match`` plumbing: forwarded to the *write*,
+> not the read, when ``if_match`` is not ``None``. When
+> the caller passes ``if_match=None`` (the default), the
+> bridge threads the read's etag into the write
+> automatically so a concurrent edit between the read and
+> the write fails 412 — the caller doesn't have to manage
+> an etag round-trip just to flip a task. An explicit
+> ``if_match`` from the caller is honored verbatim (a
+> stale etag fails 412 at SB / surfaces as the unified
+> ToolError via ``_translate_sb_errors``); ``if_match="*"``
+> means "require existence" and is honored the same way
+> the live read does — a missing page 404s on the read
+> itself, before any etag check.
+>
+> 14 new Layer-1 tests in
+> ``tests/test_tools_in_memory.py`` under the
+> ``# --- check_task (T30) ---`` section header cover
+> every case listed in the ticket's "Done when" plus the
+> full application-level error vocabulary (default-state
+> flip with ``If-Match`` plumbing asserted, ``todo`` /
+> ``cancelled`` round-trips, unknown-state upfront guard
+> with no GET issued, empty-ref upfront guard with no GET
+> issued, no-match wording after the read with no PUT
+> issued, multi-match wording after the read with no PUT
+> issued, 404 wording via ``_translate_sb_errors``,
+> stale ``if_match`` 412 wording via
+> ``_translate_sb_errors``, dry-run envelope without
+> writing, dry-run stale-etag 412, dry-run empty-ref
+> upfront guard, dry-run no-match wording, 5xx, timeout).
+> 10 new parser-level tests in ``tests/test_tasks.py``
+> cover :func:`_apply_checkbox_flip`'s exact output
+> (the three state transitions, trailing-newline
+> preservation in both shapes, wikilink-alias
+> preservation, ``None`` on missing ref, first-occurrence
+> splice on multi-match, nested-bullet indent
+> preservation) and :func:`_validate_check_task_state`'s
+> accept / reject surface. Live e2e in
+> ``tests/test_e2e_live_sb.py`` grew a 75-line T30
+> round-trip block in the existing live flow: flip
+> ``FirstTask`` from ``[ ]`` to ``[x]`` via the live
+> path, assert the T23 ack envelope (etag / size /
+> timestamps populated), confirm the new state via a
+> follow-up ``list_tasks`, run a ``dry_run=True`` flip
+> that doesn't land (verified via a third ``list_tasks`
+> showing the dry-run was no-op), then roll back via the
+> live path so the test leaves the marker page in a
+> known state. Carry-forwards: ``tests/test_journal_gate.py``
+> ``SB_TOOL_NAMES`` extended from 11 to 12 entries
+> (``check_task` joins the set); ``tests/test_http_auth.py``
+> sorted ``list_tools()`` shape carries the new tool;
+> the ``tests/test_tools_in_memory.py`` module docstring
+> bumped "eleven tools" → "twelve tools" with the
+> per-tool exception-translation paragraph updated
+> (the nine-of-twelve count for ``_translate_sb_errors``
+> carry-forwards). Drive-bys: ``README.md`` ``What it
+> exposes` bumped from "Eleven tools" to "Twelve tools"
+> with the new tool's bullet documenting the wire shape
+> and the full error vocabulary; ``§ v1.2 wire-shape
+> changes`` "The seven write tools" sentence bumped to
+> "The eight write tools" with ``check_task` listed;
+> the ``### Dry-run mode (T26)`` section bumped from
+> "three read-modify-write tools" to "four"; the Pi-MCP
+> wiring paragraph bumped "eleven tools" to "twelve"
+> with the new tool in the list. ``CHANGELOG.md``
+> Unreleased ``### Added`` section gained a T30 entry
+> with the wire shape, the four application-level
+> error surfaces, and the ``dry_run=True` envelope
+> shape. ``docs/design.md`` Goal line bumped to list
+> all twelve tools, ``§ Tools`` prose bumped to
+> "Twelve tools, one resource template" with the T29 /
+> T30 narrative updated, the Tools table grew a
+> ``check_task` row with the wire shape and error
+> vocabulary, the ``page_exists` / ``dry_run`
+> cross-references in the status-code mapping table
+> now mention ``check_task` by name (the 404 row's
+> "ToolError("page not found: {name}")" callout
+> applies, the 412 row's "precondition failed;
+> check if_match/if_none_match" callout applies, the
+> 5xx and timeout rows apply). Module docstring of
+> ``server.py`` bumped from "ten ``/.fs``-backed tools
+> plus one bullet primitive" to "eleven ``/.fs``-backed
+> tools plus one bullet primitive" and the
+> "T23/T24/T25/T26/T27/T28/T29 done; T30 next" status
+> line replaced with "T23/T24/T25/T26/T27/T28/T29/T30
+> done; destination reached"; the ``instructions``
+> string lists all twelve tool names with the
+> ``check_task` description; the ``register_tools`
+> docstring bumped "eleven" → "twelve" and "eight of
+> the eleven" → "nine of the twelve" for the
+> ``_translate_sb_errors` count. Test count: 311 pass
+> + 2 skip (was 286 + 2 skip at the start of the T30
+> session; +25 net). ``nix flake check` not run (no
+> Nix in this env). **The map's destination ("v1.2:
+> agent-facing QOL + bullet primitives") is now reached;
+> every open ticket on the map is closed.**
 
 ## Not yet specified
 

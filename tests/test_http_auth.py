@@ -282,6 +282,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                     tool_names = sorted(t.name for t in tools.tools)
                     assert tool_names == [
                         "append_to_page",
+                        "check_task",
                         "delete_page",
                         "diff_pages",
                         "list_pages",

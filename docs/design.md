@@ -8,10 +8,10 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes eleven MCP **tools** —
+file API on `/.fs/…`). The bridge exposes twelve MCP **tools** —
 `read_page`, `page_exists`, `write_page`, `append_to_page`,
 `patch_page_lines`, `patch_page_replace`, `move_page`, `delete_page`,
-`list_pages`, `diff_pages`, `list_tasks` —
+`list_pages`, `diff_pages`, `check_task`, `list_tasks` —
 and one MCP **resource template** — `silverbullet://page/{name}` —
 letting Grok read and write your SilverBullet pages as conversation
 context or as tool calls.
@@ -25,8 +25,9 @@ only the bridge is on the tunnel, and only Grok has the token.
 - **Goal**: Grok on the web can `read_page`, `write_page`,
   `append_to_page`, `patch_page_lines`, `patch_page_replace`,
   `move_page`, `delete_page`, `list_pages`, `page_exists`,
-  `diff_pages`, and `list_tasks` against SilverBullet, behind
-  the user's existing Cloudflare tunnel, with one bearer token.
+  `diff_pages`, `check_task`, and `list_tasks` against
+  SilverBullet, behind the user's existing Cloudflare tunnel,
+  with one bearer token.
 - **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search,
   multi-user, mutating silver bullet's source, hosting the bridge
   for other people.
@@ -242,7 +243,17 @@ form, always available via `GET /.fs/{page}`) or across the whole
 space (space-walk form, requires the journal surface to be on);
 returns `[{name, ref, line, state, text}]` where `ref` is the
 wikilink target on the same bullet, or `null` when the bullet has
-no wikilink. **Eleven tools, one resource template.**
+no wikilink. T30 adds `check_task(page, ref, state="done",
+if_match?, dry_run=False)` — a twelfth tool that flips a
+checkbox bullet's state by its wikilink ref. Implemented as a
+read-modify-write through `/.fs` (`GET /.fs/{page}` →
+locate the unique bullet whose wikilink target equals `ref` →
+flip the marker (`[ ]` ↔ `[x]` ↔ `[X]`) → `PUT /.fs/{page}`
+with `If-Match: <read_etag>` so a concurrent edit fails 412
+rather than silently clobbering the flip); the `state` argument
+maps the three SB checkbox characters (``" "``, ``"x"``, ``"X"``)
+onto action names (``"todo"``, ``"done"``, ``"cancelled"``).
+**Twelve tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
@@ -256,6 +267,7 @@ no wikilink. **Eleven tools, one resource template.**
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo `X-*` per the SB contract) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python (filter happens *before* hydration so the prefix reduces the per-page round-trip count) | `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` (T28 widened from the v1.1 minimal subset; ``etag`` is `None` for every row on this SB build because the list payload omits the field — an operator who needs ``if_match`` round-trips opts in to per-page hydration via `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS`) | none |
 | `diff_pages` | `name: str, other_name: Optional[str] = None, other_body: Optional[str] = None` (exactly one of `other_name` / `other_body`) | `GET /.fs/{name}` (and `GET /.fs/{other_name}` when `other_name` is given; one read per page, sequential, no writes) | `{diff: str, name: {name, body, etag, size_bytes, last_modified_ms}, other: same envelope or None}` (T27; line-based unified diff via `difflib.unified_diff`; `diff=""` when the two bodies are identical; `other=None` for the literal-string variant) | none (read-only — the tool tracks every request method and asserts only GETs were issued) |
+| `check_task` | `page: str, ref: str, state: Literal["done", "todo", "cancelled"] = "done", if_match: Optional[str] = None, dry_run: bool = False` | `GET /.fs/{page}` → `PUT /.fs/{page}` (read-modify-write; locates the unique checkbox bullet whose wikilink target equals `ref`, flips the marker (``" "`` ↔ ``"x"`` ↔ ``"X"``), writes the body back; `if_match="*"` requires the page to exist; `if_match=<etag>` requires the body hash to match; `dry_run=True` skips the PUT and returns a preview envelope) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run) | flips the matching bullet's marker; `if_match=<stale_etag>` raises the unified 412 ToolError; multi-match raises `ToolError("ref {ref} matches multiple tasks on page {page}; narrow the ref or use patch_page_lines directly")`; missing-match raises `ToolError("no task with ref {ref} on page {page}; the task may not have a wikilink ref or may live on a different page")`; unknown `state` raises `ToolError("state must be one of: done, todo, cancelled")` upfront (no GET/PUT); empty `ref` raises `ToolError("ref must not be empty")` upfront; `dry_run=True` raises the same 412-equivalent ToolError if `if_match=<stale_etag>` |
 | `list_tasks` | `page: Optional[str] = None, prefix: str = ""` | `GET /.fs/{page}` when `page` is given; otherwise walks the SB space directory directly (requires the journal surface) | `list[{name, ref, line, state, text}]` (T29; `name` is the page the bullet lives on; `ref` is the wikilink target on the same bullet (``[[Pages/Hobbies]]`` → ``"Pages/Hobbies"``, ``[[...|alias]]`` → stripped to the target) or `null` when the bullet has no wikilink; `line` is the 1-indexed editor line (frontmatter included); `state` is the literal checkbox character — `" "` for `[ ]`, `"x"` for `[x]`, `"X"` for `[X]`; `text` is the bullet content after the marker) | none |
 
 Resource template:
@@ -293,9 +305,9 @@ we are.
 | SB response | Tool behavior |
 |---|---|
 | `200 OK` | success — return body / `PageMeta` (read, write, list row) / `bool` |
-| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). `diff_pages` (T27) returns the same wording with `name` set to whichever page was missing (the first read's 404 short-circuits before the second; if the second read 404s the wording's `name` field is `other_name` so the agent can tell which side failed). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
-| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). `diff_pages` (T27) has no precondition surface; a 412 on one of its reads is highly unusual (a GET normally doesn't carry `If-Match`) but surfaces as the same wording if a proxy / SB misconfig triggers one. |
-| `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
+| `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` / `check_task` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). `diff_pages` (T27) returns the same wording with `name` set to whichever page was missing (the first read's 404 short-circuits before the second; if the second read 404s the wording's `name` field is `other_name` so the agent can tell which side failed). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
+| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) / `check_task` (T30, on the write step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). `diff_pages` (T27) — and `check_task`'s read step (T30) — have no precondition surface; a 412 on a read is highly unusual (a GET normally doesn't carry `If-Match`) but surfaces as the same wording if a proxy / SB misconfig triggers one. `check_task` *also* validates the precondition against the read's etag on the dry-run path so a stale-etag `dry_run=True` raises the same wording without issuing a write. |
+| `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) / `check_task` (T30, on the write step) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
 | `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions". A 5xx on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (transient SB hiccup, not an agent error). |
 | timeout | `ToolError("silverbullet request timed out")` — including the `list_pages` hydration walker (T28), which swallows per-page timeouts and leaves the row's `etag` as `null` rather than failing the whole call. |
 

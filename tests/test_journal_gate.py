@@ -63,6 +63,7 @@ SB_TOOL_NAMES = {
     "move_page",
     "page_exists",
     "diff_pages",
+    "check_task",
     "list_tasks",
 }
 

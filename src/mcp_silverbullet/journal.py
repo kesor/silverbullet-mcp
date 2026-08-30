@@ -167,6 +167,128 @@ _DAILY_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 # --- T29 / T30 bullet-primitive internals ------------------------------
 
 
+# Mapping from T30's ``state`` argument to the literal checkbox
+# character. Lives at module scope so the parser, the MCP tool
+# handler, and the tests all read from one source of truth — a
+# future SB editor change (e.g. a fourth state for "blocked") is
+# a one-line edit here plus the corresponding ``ToolError`` list
+# in :func:`_validate_check_task_state`.
+_STATE_TO_MARKER: dict[str, str] = {
+    "todo": " ",
+    "done": "x",
+    "cancelled": "X",
+}
+
+
+def _validate_check_task_state(state: str) -> str:
+    """Return the checkbox character for ``state`` or raise ``ToolError``.
+
+    The T30 ticket narrowed the public surface to three states
+    (``"done"`` / ``"todo"`` / ``"cancelled"``) so the agent
+    doesn't need to remember whether it's ``"x"`` / ``"X"`` /
+    ``" "`` (the on-disk characters) or ``"done"`` / ``"cancelled"``
+    / ``"todo"`` (the action names). The mapping lives in
+    :data:`_STATE_TO_MARKER`; this helper is the single error
+    surface so the validation wording stays in one place — a future
+    state addition (e.g. ``"blocked"``) updates both the dict and
+    this function's allowed-set string in one commit.
+
+    Raises :exc:`mcp.server.mcpserver.exceptions.ToolError` (a
+    design-doc-style error, surfaced to the agent via ``is_error=True``)
+    when ``state`` is not one of the three allowed names.
+    """
+    if state not in _STATE_TO_MARKER:
+        raise ToolError(
+            f"state must be one of: {', '.join(_STATE_TO_MARKER)}"
+        )
+    return _STATE_TO_MARKER[state]
+
+
+def _apply_checkbox_flip(
+    body: str, ref: str, target_state: str
+) -> tuple[str, int, str, str]:
+    """Flip the checkbox of the unique bullet whose wikilink ref matches.
+
+    Returns ``(new_body, editor_line, original_state, new_state)``
+    on a unique match, where ``new_body`` is the patched body
+    (same trailing-newline shape as the input — no implicit
+    newline added or removed). The byte offsets
+    :func:`_find_task_bullet` returns are spliced into a new body
+    so the rest of the page is byte-exact: a body like
+    ``"header\\n- [ ] task [[Ref]] ref\\n"`` spliced with
+    ``"REPLACED"`` for the bullet line produces
+    ``"header\\nREPLACED\\n"`` — same shape, only the bullet line
+    touched.
+
+    The four-character marker (``- [ ]`` → ``- [x]`` etc.) is the
+    only part of the line that changes; the rest of the line
+    (leading whitespace, the dash, the trailing text, the wikilink)
+    is preserved verbatim. This matches what the SB editor does on
+    a task-state click and keeps the byte-equal property the
+    caller relies on for ``if_match`` round-trips (the etag from
+    the underlying ``write_page`` reflects exactly the bytes the
+    bridge just wrote, with no surprise line-ending changes).
+
+    Returns ``None`` (sentinel) when no bullet matches ``ref`` —
+    the caller (:func:`mcp_silverbullet.server.check_task`)
+    surfaces a clearer ``ToolError("no task with ref …")` rather
+    than relying on the ``None`` to distinguish missing-ref from
+    any other failure mode. A multi-match is signalled the same
+    way; the caller's job is to *count* matches before flipping.
+
+    Parameters
+    ----------
+    body
+        The page body the tool just read.
+    ref
+        Wikilink target to match (case-sensitive; matches
+        :func:`_find_task_bullet`'s contract). An empty ref
+        matches no bullet (``_find_task_bullet` treats it as a
+        caller bug) — we surface the same ``None`` so the
+        caller's error wording is uniform.
+    target_state
+        One of the keys in :data:`_STATE_TO_MARKER`. The caller
+        is expected to have validated this *before* calling
+        :func:`_apply_checkbox_flip` (the MCP tool handler does
+        so via :func:`_validate_check_task_state`) — passing an
+        unknown state here would silently produce a broken marker
+        line.
+    """
+    match = _find_task_bullet(body, ref)
+    if match is None:
+        return None  # type: ignore[return-value]
+    editor_line, original_state, _text, start, end = match
+    new_marker = _STATE_TO_MARKER[target_state]
+    # The line is ``body[start:end]`` (byte-exact, no newline
+    # attached). Rebuild the marker prefix ``"  - [<state>] "`` by
+    # substituting the state character at the right offset; the
+    # regex :data:`_TASK_BULLET_RE` matched a marker at column 0
+    # plus optional leading whitespace (``(\\s*)-``), so the
+    # ``[`` is at the same offset every time. We don't try to
+    # recompute the prefix — we splice just the *character* at the
+    # bracket slot, which leaves the surrounding text alone.
+    #
+    # The marker slot inside ``body[start:end]`` is the 4th
+    # character (``"  - "`` then ``"["``); leading-whitespace
+    # length is whatever the regex captured (``_TASK_BULLET_RE``'s
+    # group 1). Easiest path: re-apply the regex to the
+    # single-line text and rebuild with the new state. That's
+    # still O(line length) and perfectly readable.
+    raw_line = body[start:end]
+    bullet_match = _TASK_BULLET_RE.match(raw_line)
+    assert bullet_match is not None, (
+        "_find_task_bullet returned a match for a line that doesn't "
+        "match _TASK_BULLET_RE — internal invariant broken"
+    )
+    leading = bullet_match.group(1)
+    _text2 = bullet_match.group(3)
+    new_line = f"{leading}- [{new_marker}] {_text2}"
+    new_body = body[:start] + new_line + body[end:]
+    return new_body, editor_line, original_state, new_marker
+
+
+
+
 @dataclass(frozen=True)
 class TaskEntry:
     """One checkbox bullet parsed from a SilverBullet page.
