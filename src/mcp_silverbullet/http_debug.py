@@ -85,9 +85,88 @@ def classify_inbound(data: bytes) -> str:
 
 
 def preview_bytes(data: bytes, limit: int = _PREVIEW_BYTES) -> str:
-    """ASCII-safe repr of the first ``limit`` bytes for log lines."""
-    chunk = data[:limit]
-    return repr(chunk) + ("…" if len(data) > limit else "")
+    """ASCII-safe repr of the first ``limit`` bytes with secrets stripped.
+
+    Bearer tokens, cookies, and CF-Access JWTs are replaced
+    with ``Header-Name: <truncated>`` (8-char prefix + 4-char
+    suffix when the value is long enough). The header *name* is
+    kept so the operator can see what kind of token it was
+    (``Bearer eyJ…XXXX`` vs a 200-char opaque blob); the
+    *value* is truncated so the systemd journal doesn't carry
+    the live secret. The line keeps its original byte count
+    so length comparisons against ``len(data)`` still work
+    in the caller.
+    """
+    return repr(_scrub_secrets(data)[:limit]) + (
+        "…" if len(data) > limit else ""
+    )
+
+
+def _scrub_secrets(data: bytes) -> bytes:
+    """Replace secret header values with a prefix/suffix trace.
+
+    Walks the bytes looking for ``\\r\\n``-terminated lines whose
+    name is in :data:`_REDACT_HEADERS`, then replaces the
+    header value with ``<8 chars>...<4 chars>`` when it's long
+    enough, or ``<redacted>`` when short. Header names and the
+    surrounding framing (``\\r\\n``) are preserved so the
+    preview remains a recognizable HTTP request line.
+    """
+    # Split into lines on CRLF (HTTP/1.1 framing). Tolerant of
+    # any trailing junk after the first malformed line — the
+    # preview is best-effort, not a parser.
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        # Find the end of this line.
+        j = data.find(b"\r\n", i)
+        if j == -1:
+            out.extend(data[i:])
+            break
+        line = data[i:j]
+        out.extend(_scrub_line(line))
+        out.extend(b"\r\n")
+        i = j + 2
+    return bytes(out)
+
+
+def _scrub_line(line: bytes) -> bytes:
+    # Header line: ``Name: value``. We split on the first
+    # colon only — values may contain colons (timestamps,
+    # JWT claims). Case-insensitive on the name.
+    if b":" not in line:
+        return line
+    name, _, value = line.partition(b":")
+    if name.decode("latin-1", errors="replace").strip().lower() not in (
+        _REDACT_HEADERS
+    ):
+        return line
+    padded = value.lstrip(b" ")
+    # ``Bearer <token>``: only the token is the secret; the
+    # scheme stays so the operator can tell the credential
+    # type apart from raw cookies. Other redacted headers
+    # (``CF-Access-Jwt-Assertion``, ``Cookie``, …) carry the
+    # full value as the secret.
+    if padded.startswith(b"Bearer "):
+        token = padded[len(b"Bearer "):]
+        scheme = b"Bearer "
+    else:
+        token = padded
+        scheme = b""
+    token_str = token.decode("latin-1", errors="replace")
+    if len(token_str) <= 24:
+        scrubbed = b"<redacted>"
+    else:
+        # ``…`` is U+2026; latin-1 doesn't cover it, so the
+        # bytes use utf-8. ``_scrub_secrets`` splits on
+        # ``\r\n`` which is pure ASCII, so the multi-byte
+        # ``\xe2\x80\xa6`` never crosses a line boundary in
+        # practice (HTTP request lines are short).
+        scrubbed = (token_str[:8] + "…" + token_str[-4:]).encode("utf-8")
+    # Preserve original whitespace around the colon (``Name: value``).
+    head = name + b":"
+    leading = b" " if value.startswith(b" ") else b""
+    return head + leading + scheme + scrubbed
 
 
 def redact_headers(headers: list[tuple[bytes, bytes]]) -> dict[str, str]:

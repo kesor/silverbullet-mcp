@@ -54,6 +54,79 @@ def test_preview_truncates() -> None:
     assert "xxxxxxxxxx" in text or "x" * 10 in text
 
 
+def test_preview_redacts_long_bearer_token() -> None:
+    """Long tokens get prefix/suffix trace; short tokens are <redacted>."""
+    import ast
+
+    token = b"eyJhbGciOiJSUzI1NiIsImtpZCI6Ijc0OTc5YzgxYmIzZWM4ZjU3NTllMjY2MzRlYzIwNGQ2MGE1Nzk4MmMyZjE1ZjkxYWQxNjExM2ExY2QzZjg3NDcifQ.fake-sig"
+    request = (
+        b"POST /mcp HTTP/1.1\r\n"
+        b"Host: bridge\r\n"
+        b"Authorization: Bearer " + token + b"\r\n"
+        b"Content-Length: 0\r\n"
+        b"\r\n"
+    )
+    out = preview_bytes(request, limit=10_000)
+    # ``preview_bytes`` returns ``repr(scrubbed_bytes)``. Use
+    # ``ast.literal_eval`` to recover the underlying bytes
+    # rather than substring-matching the escaped string form.
+    out_bytes = ast.literal_eval(out)
+    assert isinstance(out_bytes, bytes)
+    # Header name kept verbatim so the operator sees what was redacted.
+    assert b"Authorization:" in out_bytes
+    # Token's first 8 + ellipsis + last 4 chars survive.
+    assert token[:8] in out_bytes
+    assert b"\xe2\x80\xa6" in out_bytes  # utf-8 for "…"
+    assert token[-4:] in out_bytes
+    # The middle of the token does NOT leak.
+    assert token[10:-5] not in out_bytes
+
+
+def test_preview_redacts_short_bearer_token() -> None:
+    """Short tokens collapse to ``<redacted>`` (no useful prefix/suffix)."""
+    import ast
+
+    request = b"GET / HTTP/1.1\r\nAuthorization: Bearer abc\r\n\r\n"
+    out = preview_bytes(request)
+    out_bytes = ast.literal_eval(out)
+    assert isinstance(out_bytes, bytes)
+    assert b"Bearer abc" not in out_bytes
+    assert b"<redacted>" in out_bytes
+
+
+def test_preview_redacts_cf_access_jwt_header() -> None:
+    import ast
+
+    request = (
+        b"GET / HTTP/1.1\r\n"
+        b"CF-Access-Jwt-Assertion: " + (b"X" * 60) + b"\r\n\r\n"
+    )
+    out = preview_bytes(request)
+    out_bytes = ast.literal_eval(out)
+    assert isinstance(out_bytes, bytes)
+    assert b"CF-Access-Jwt-Assertion:" in out_bytes
+    # The full token must NOT appear together. Prefix/suffix trace
+    # is OK (8 X's + ellipsis + 4 X's), but the middle is gone.
+    assert b"X" * 60 not in out_bytes
+    assert b"X" * 20 not in out_bytes  # no contiguous run of the secret
+
+
+def test_preview_keeps_non_sensitive_headers_verbatim() -> None:
+    import ast
+
+    request = (
+        b"POST /mcp HTTP/1.1\r\n"
+        b"User-Agent: curl/8.0.0\r\n"
+        b"Content-Type: application/json\r\n"
+        b"\r\n"
+    )
+    out = preview_bytes(request)
+    out_bytes = ast.literal_eval(out)
+    assert isinstance(out_bytes, bytes)
+    assert b"User-Agent: curl/8.0.0" in out_bytes
+    assert b"Content-Type: application/json" in out_bytes
+
+
 def test_install_hooks_wraps_h11() -> None:
     """This env ships uvicorn with h11, not httptools."""
     from uvicorn.protocols.http.h11_impl import H11Protocol
