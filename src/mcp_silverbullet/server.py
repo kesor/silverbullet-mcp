@@ -2,11 +2,12 @@
 
 Locked at T4 of the prior map (three ``/.fs``-backed tools) and grown
 by v1.1: T18 added ``delete_page``, T19 added ``append_to_page``,
-T20 added ``patch_page_lines``, T21 added ``patch_page_replace``.
-Today the bridge registers seven ``/.fs``-backed tools
-(``read_page`` / ``write_page`` / ``delete_page`` / ``append_to_page``
-/ ``patch_page_lines`` / ``patch_page_replace`` / ``list_pages``) plus
-one resource template (``silverbullet://page/{name}``). Each tool
+T20 added ``patch_page_lines``, T21 added ``patch_page_replace``,
+T22 added ``move_page``. Today the bridge registers eight
+``/.fs``-backed tools (``read_page`` / ``write_page`` /
+``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
+``patch_page_replace`` / ``move_page`` / ``list_pages``) plus one
+resource template (``silverbullet://page/{name}``). Each tool
 closes over a single :class:`SBClient` opened at boot; SB's typed
 exceptions translate to :mcp_exc:`ToolError` with the exact wording
 from ``docs/design.md`` § Tools § Status-code mapping, all funneled
@@ -17,7 +18,7 @@ T10 of the current map adds an optional, gated journal surface
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
 space_path=...))`` adds the four journal tools; otherwise the bridge
-registers only the seven ``/.fs``-backed tools and the resource
+registers only the eight ``/.fs``-backed tools and the resource
 template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
@@ -74,21 +75,29 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     """Wrap a single ``sb_client`` call, mapping its exceptions to ``ToolError``.
 
     Every tool handler (``read_page``, ``write_page``, ``delete_page``,
-    ``list_pages``, ``append_to_page``) closes over the same
+    ``list_pages``, ``append_to_page``, ``patch_page_lines``,
+    ``patch_page_replace``, ``move_page``) closes over the same
     :class:`SBClient` and surfaces the same five exception types with
     the same wording from ``docs/design.md`` § Tools § Status-code
     mapping. Factoring the translation into this async context
     manager keeps the wording in one place — a future tightening of
     a code path (e.g. adding ``403`` → ``ToolError("forbidden")``)
-    is a single-line change.
+    is a single-line change. ``move_page`` (T22) wraps *part* of its
+    read-write-delete dance in this helper (the read and the
+    destination write) and translates the post-write-delete step
+    inline so the caller sees the atomicity-caveat wording ("moved
+    body to {new} but failed to delete {old}; both now exist")
+    instead of the unified 412 message.
 
     The 404 wording needs ``name`` (the page the caller asked for)
     rather than the URL the SB request hit — callers care about
     *which* page was missing, not the request's full URL. Tools
     that target a single page (``read_page``, ``write_page``,
-    ``delete_page``, ``append_to_page``) pass ``name``; ``list_pages``
-    passes an empty string (and doesn't actually raise ``PageNotFound``
-    on its current code path, so the wording never surfaces there).
+    ``delete_page``, ``append_to_page``, ``patch_page_lines``,
+    ``patch_page_replace``, ``move_page``) pass ``name``;
+    ``list_pages`` passes an empty string (and doesn't actually
+    raise ``PageNotFound`` on its current code path, so the wording
+    never surfaces there).
 
     Python's ``except`` only catches exceptions actually raised in
     the wrapped block, so it's safe to list all five clauses on
@@ -210,11 +219,11 @@ def build_mcp(
     mcp = MCPServer(
         name=name,
         instructions=(
-            "Read, write, append to, patch, delete, and list "
-            "SilverBullet pages. Seven tools (`read_page`, "
+            "Read, write, append to, patch, move, delete, and list "
+            "SilverBullet pages. Eight tools (`read_page`, "
             "`write_page`, `append_to_page`, `patch_page_lines`, "
-            "`patch_page_replace`, `delete_page`, `list_pages`) "
-            "plus one resource template "
+            "`patch_page_replace`, `move_page`, `delete_page`, "
+            "`list_pages`) plus one resource template "
             "`silverbullet://page/{name}` for attaching page "
             "bodies to conversation context."
         ),
@@ -232,14 +241,20 @@ def build_mcp(
 
 
 def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
-    """Attach the seven ``/.fs``-backed tools and one resource template to ``mcp``.
+    """Attach the eight ``/.fs``-backed tools and one resource template to ``mcp``.
 
     Pulled out of :func:`build_mcp` so tests can build a server and
     call the registration in isolation. ``mcp.tool()`` / ``mcp.resource()``
     are decorators that take the function; each tool handler wraps
     its ``sb_client`` call in :func:`_translate_sb_errors`, which
     maps SB exceptions to :exc:`ToolError` per the design doc's
-    status-code mapping. The resource template uses the SDK's
+    status-code mapping. ``move_page`` (T22) is the exception:
+    the post-write-delete sequence surfaces a partial-failure
+    ``ToolError`` directly from the handler so the caller can see
+    "moved body to {new} but failed to delete {old}; both now
+    exist" rather than the unified 412 wording — the source and
+    destination are distinct pages and the caller needs to know
+    which side refused. The resource template uses the SDK's
     separate ``ResourceError`` shapes (JSON-RPC protocol errors vs
     tool-handler ``is_error=True``) and keeps its own translation.
 
@@ -483,6 +498,149 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             return await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
+
+    @mcp.tool(
+        title="Move page",
+        description=(
+            "Rename a SilverBullet page from `name` to `new_name`, "
+            "preserving the body. Implemented as `read_page(name) → "
+            "write_page(new_name, body, if_none_match=True) → "
+            "delete_page(name, if_match=<etag>)`: write-then-delete "
+            "so the partial-failure case (delete fails after write "
+            "succeeds) leaves the body at `new_name` rather than "
+            "losing it. `if_match` on the outer call guards the "
+            "source read-delete pair (the etag from the read is "
+            "threaded into `delete_page`'s `If-Match`, so a concurrent "
+            "edit between read and delete fails the move with 412 "
+            "rather than silently moving the wrong body); the read "
+            "carries no precondition. The destination write always "
+            "uses `If-None-Match: *` — `move_page` never silently "
+            "overwrites an existing page, the caller would just "
+            "compose `read_page(new_name) → write_page(new_name, "
+            "merged) → delete_page(name)` themselves if they wanted "
+            "that. `name == new_name` is a no-op that verifies "
+            "existence via a read (no write/delete round trip) and "
+            "returns `None` for the etag (`read_page` doesn't surface "
+            "one); the `if_match` precondition is not honored in "
+            "this branch because there's no delete to guard and "
+            "`read_page` doesn't accept a precondition — callers "
+            "that need to verify the etag on a same-name no-op "
+            "should chain `write_page(name, body, if_match=\"<etag>\")` "
+            "themselves. Returns the new page's ETag on success. "
+            "Errors: 404-equivalent ToolError if the source is "
+            "missing (`page not found: {name}`), 412 from the "
+            "destination write surfaces as `destination page already "
+            "exists: {new_name}; refusing to overwrite` (clearer "
+            "than the generic 412 wording because the source and "
+            "destination are different pages — the caller needs to "
+            "know which side refused), 412 from the source delete "
+            "after a successful destination write surfaces as "
+            "`moved body to {new_name} but failed to delete {name}: "
+            "<reason>; both now exist` so the caller can clean up "
+            "the duplicate, 413 if the body exceeds 4 MiB on the "
+            "destination write."
+        ),
+    )
+    async def move_page(
+        name: str,
+        new_name: str,
+        if_match: str | None = None,
+    ) -> str | None:
+        # Same-name short-circuit: ``name == new_name`` is a no-op
+        # that returns the current etag without a write/delete
+        # round-trip. The caller is asking us to rename a page to
+        # itself — there is nothing to do, and running the dance
+        # would risk spurious 412s on the source delete (we'd have
+        # just written a fresh body to ``new_name`` — which is also
+        # ``name`` — so the etag from the read would be stale).
+        if name == new_name:
+            async with _translate_sb_errors(name):
+                # Same-name is a no-op, but a missing page would
+                # otherwise silently succeed. ``read_page`` is the
+                # cheapest existence check (no etag round-trip;
+                # ``list_pages`` doesn't carry etags on the v1 sync
+                # payload). The body is discarded — we just need
+                # the 404-or-200 signal. No etag to return because
+                # ``read_page`` doesn't surface one; ``None``
+                # mirrors the no-etag contract from the
+                # read-modify-write siblings.
+                #
+                # ``if_match`` is intentionally not honored here:
+                # the precondition guards the source delete, which
+                # doesn't run on a same-name no-op, and ``read_page``
+                # doesn't accept a precondition. Callers that want
+                # to verify the etag should chain
+                # ``write_page(name, body, if_match=<etag>)``
+                # themselves.
+                await sb_client.read_page(name)
+                return None
+        async with _translate_sb_errors(name):
+            # 1. Read the source body. No precondition — the source's
+            # ``If-Match`` guard lives on the delete (step 3), using
+            # the etag from this read. A 404 here surfaces the
+            # standard ``page not found: {name}`` wording.
+            body = await sb_client.read_page(name)
+            # 2. Write the body to ``new_name``. ``if_none_match=True``
+            # makes SB send ``If-None-Match: *`` and refuse if the
+            # destination already exists — ``move_page`` is rename,
+            # not merge, so a collision is a clear 412 the caller
+            # resolves by naming a different destination or by
+            # composing the merge themselves. The etag we read in
+            # step 1 doesn't apply here (it's the source's etag, not
+            # the destination's; the destination didn't exist until
+            # this write).
+            try:
+                new_etag = await sb_client.write_page(
+                    new_name, body, if_none_match=True
+                )
+            except PreconditionFailed as exc:
+                # Destination already exists — surface a clearer
+                # message than the unified 412 wording. The source
+                # hasn't been touched yet, so this is purely a
+                # caller-side decision (pick a different new_name
+                # or merge manually).
+                raise ToolError(
+                    f"destination page already exists: {new_name}; "
+                    f"refusing to overwrite"
+                ) from exc
+        # 3. Delete the source. This call sits outside the first
+        # ``_translate_sb_errors`` block because step 2 already
+        # succeeded: a 412 here means the source's etag went stale
+        # between read and delete (someone else wrote ``name`` in
+        # the gap). That's the atomicity-caveat case the ticket
+        # calls out — the body is now at *both* names — and the
+        # caller needs a clearer message than the unified 412
+        # wording to recover (``read_page(new_name) → write_page(
+        # name, …) → delete_page(new_name)``).
+        try:
+            await sb_client.delete_page(name, if_match=if_match)
+        except PreconditionFailed as exc:
+            raise ToolError(
+                f"moved body to {new_name} but failed to delete "
+                f"{name}: precondition failed; check if_match/if_none_match; "
+                f"both now exist"
+            ) from exc
+        except PageNotFound as exc:
+            # Edge case: ``name`` was deleted between step 1's read
+            # and step 3's delete. The body is at ``new_name``,
+            # which is what the caller wanted; ``name`` already
+            # gone is a feature, not a bug. Surface a clear message
+            # rather than the generic 404 wording.
+            raise ToolError(
+                f"moved body to {new_name} but {name} was already "
+                f"deleted before the cleanup step"
+            ) from exc
+        except ServerError as exc:
+            raise ToolError(
+                f"moved body to {new_name} but failed to delete "
+                f"{name}: {exc}; both now exist"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError(
+                f"moved body to {new_name} but failed to delete "
+                f"{name}: silverbullet request timed out; both now exist"
+            ) from exc
+        return new_etag
 
     @mcp.tool(
         title="List pages",

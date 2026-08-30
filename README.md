@@ -6,17 +6,18 @@ side-car on loopback; it does not provision tunnels.
 
 Architecture and threat model: [`docs/design.md`](docs/design.md).
 Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
-v1.1 map (full CRUD + editing, in progress): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
+v1.1 map (full CRUD + editing, destination reached with `move_page`): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
 
 ## What it exposes
 
-Seven tools and one resource template:
+Eight tools and one resource template:
 
 - `read_page(name)` — markdown body
 - `write_page(name, content, if_match?)` — create/update; returns the new ETag
 - `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the new ETag
 - `patch_page_lines(name, start_line, end_line, new_content, if_match?)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the new ETag
 - `patch_page_replace(name, find, new_string, replace_all=False, if_match?)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the new ETag
+- `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the new page's ETag
 - `delete_page(name, if_match?)` — hard delete; returns the deleted page's ETag
 - `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA)
 - `silverbullet://page/{name}` — same body as `read_page`, for attaching context
@@ -110,10 +111,10 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's seven tools — `read_page`,
+`/reload` in Pi and the bridge's eight tools — `read_page`,
 `write_page`, `append_to_page`, `patch_page_lines`,
-`patch_page_replace`, `delete_page`, `list_pages` — register as
-direct Pi tools.
+`patch_page_replace`, `move_page`, `delete_page`, `list_pages` —
+register as direct Pi tools.
 
 The bearer token is read at HTTP-connect time via the `!command`
 syntax, pointed at `~/.config/mcp-silverbullet/token` (mode 600) so

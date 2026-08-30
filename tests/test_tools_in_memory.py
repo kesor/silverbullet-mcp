@@ -8,15 +8,17 @@ test suite never needs a running SB. The full HTTP integration matrix
 
 Coverage:
 
-- All seven ``/.fs``-backed tools (``read_page``, ``write_page``,
+- All eight ``/.fs``-backed tools (``read_page``, ``write_page``,
   ``delete_page``, ``append_to_page``, ``patch_page_lines``,
-  ``patch_page_replace``, ``list_pages``) on the 200 happy path;
+  ``patch_page_replace``, ``move_page``, ``list_pages``) on the 200
+  happy path;
   ``write_page`` / ``delete_page`` / ``append_to_page`` /
   ``patch_page_lines`` / ``patch_page_replace`` return the ETag,
   ``list_pages`` returns the file metas, ``read_page`` and the
   resource template both surface the markdown body.
-  ``append_to_page`` (T19), ``patch_page_lines`` (T20), and
-  ``patch_page_replace`` (T21) are the read-modify-write tools.
+  ``append_to_page`` (T19), ``patch_page_lines`` (T20),
+  ``patch_page_replace`` (T21), and ``move_page`` (T22) are the
+  read-modify-write / write-then-delete tools.
 - ``write_page`` carries the ``if_match`` straight through to
   ``sb_client`` (T3 covers the wire envelope; this test guards the
   MCP-tool-to-SB-client argument path).
@@ -25,11 +27,15 @@ Coverage:
   exact ToolError message: 404 → "page not found: <name>"; 412 →
   "precondition failed; check if_match/if_none_match"; 413 →
   "body too large: limit is 4 MiB"; 5xx → "silverbullet error: <status>";
-  timeout → "silverbullet request timed out". The seven tools share
+  timeout → "silverbullet request timed out". The eight tools share
   the translation through :func:`server._translate_sb_errors`.
 - The resource template returns the same body for the happy path and
   surfaces ``ToolError`` for a missing page (v1 keeps one error shape
   for both surfaces; T4 carry-forward note in the map).
+
+T22 (``move_page``) is the eighth tool: write-then-delete rename
+with destination-collision and atomicity-caveat error wording
+distinct from the unified 412/404 shapes.
 """
 
 from __future__ import annotations
@@ -2008,6 +2014,400 @@ async def test_list_pages_5xx_returns_tool_error() -> None:
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool list_pages: silverbullet error: 500"
+
+
+# --- move_page --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_move_page_returns_new_etag_on_200() -> None:
+    """Happy path: read → write new → delete old, return new etag.
+
+    Locks the write-then-delete ordering (the ticket's atomicity
+    choice — write first so a partial-failure case leaves the body
+    at the new name rather than losing it). The new page's ETag
+    is returned; the source's ETag is discarded.
+    """
+    calls: list[tuple[str, str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content if request.method != "GET" else b""
+        calls.append((request.method, request.url.path, body))
+        if request.method == "GET":
+            assert request.url.path == "/.fs/old"
+            return httpx.Response(200, text="the body\n")
+        if request.method == "PUT":
+            assert request.url.path == "/.fs/new"
+            # If-None-Match: * on the destination write — move is
+            # rename, never silently overwrite.
+            assert request.headers.get("If-None-Match") == "*"
+            assert request.content == b"the body\n"
+            return httpx.Response(200, headers={"ETag": '"new-etag"'})
+        # DELETE
+        assert request.url.path == "/.fs/old"
+        return httpx.Response(200, headers={"ETag": '"old-etag"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is False
+    assert _text(result) == '"new-etag"'
+    # Order: GET source → PUT destination (with If-None-Match) →
+    # DELETE source. The write happens before the delete so a
+    # partial-failure leaves the body at the new name.
+    assert [(m, p) for m, p, _ in calls] == [
+        ("GET", "/.fs/old"),
+        ("PUT", "/.fs/new"),
+        ("DELETE", "/.fs/old"),
+    ]
+    # The body written to the destination matches what was read.
+    assert calls[1][2] == b"the body\n"
+
+
+@pytest.mark.asyncio
+async def test_move_page_same_name_is_no_op() -> None:
+    """``name == new_name`` short-circuits: read for existence, no PUT/DELETE.
+
+    Avoids the read-write-delete cycle (and the spurious 412 that
+    the dance would invite — we'd just write a fresh body to the
+    same path, making the etag from the read stale for the delete
+    that follows). The body is discarded; we return ``None``
+    because ``read_page`` doesn't surface an etag.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, text="body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "self", "new_name": "self"}
+        )
+
+    assert result.is_error is False
+    # Only the existence check ran.
+    assert calls == [("GET", "/.fs/self")]
+
+
+@pytest.mark.asyncio
+async def test_move_page_same_name_missing_returns_404_tool_error() -> None:
+    """Same-name short-circuit on a missing page surfaces 404 wording.
+
+    The short-circuit still needs to verify existence — silently
+    succeeding on a missing page would mask a caller typo.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "ghost", "new_name": "ghost"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool move_page: page not found: ghost"
+
+
+@pytest.mark.asyncio
+async def test_move_page_forwards_if_match_to_delete() -> None:
+    """``if_match`` is threaded into the source DELETE, not the GET.
+
+    Mirrors the append/patch contract: ``if_match`` guards the
+    *write* side (here the source delete — the etag from the read
+    is the natural anchor). The read carries no precondition; the
+    destination PUT carries ``If-None-Match: *`` (move is rename,
+    not merge).
+    """
+    seen_if_match: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_if_match.append(request.headers.get("If-Match", ""))
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(200, headers={"ETag": '"old"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        await client.call_tool(
+            "move_page",
+            {"name": "old", "new_name": "new", "if_match": '"v1"'},
+        )
+
+    # GET has no precondition; PUT has If-None-Match (not If-Match);
+    # DELETE carries the caller's if_match.
+    assert seen_if_match == ["", "", '"v1"']
+
+
+@pytest.mark.asyncio
+async def test_move_page_404_on_read_returns_tool_error() -> None:
+    """Source missing on the read surfaces the standard 404 wording."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "missing", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool move_page: page not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_move_page_destination_exists_returns_destination_collision_error() -> None:
+    """Destination PUT 412 (from ``If-None-Match: *``) → collision wording.
+
+    Distinct from the unified 412 wording: the caller asked to move
+    a *different* page to ``new_name`` and the destination already
+    exists. Saying "page not found: {name}" would be wrong;
+    saying just "precondition failed" would be ambiguous (source
+    or destination?). The destination-collision message names the
+    destination and refuses, period.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        # PUT to /new — already exists.
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: destination page already exists: new; refusing to overwrite"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_delete_412_returns_atomicity_caveat_error() -> None:
+    """Source DELETE 412 after a successful write → atomicity-caveat wording.
+
+    The destination already has the body; the source couldn't be
+    deleted (probably because its etag went stale — concurrent
+    edit between the read and the delete). Both names now point
+    at a page; the caller needs to clean up. The error names both
+    names and tells the caller to delete the duplicate.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        # DELETE fails 412 — source etag stale.
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: moved body to new but failed to delete old: precondition failed; check if_match/if_none_match; both now exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_delete_404_surfaces_atomicity_message_not_generic_404() -> None:
+    """Source DELETE 404 (deleted between read and delete) → atomicity message.
+
+    The body is at ``new_name`` already — that's what the caller
+    wanted. The source going missing during cleanup is a feature
+    (someone else deleted it for us), not a bug. The generic
+    "page not found: old" wording would be misleading.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: moved body to new but old was already deleted before the cleanup step"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_delete_5xx_returns_atomicity_caveat_error() -> None:
+    """Source DELETE 5xx after a successful write → atomicity-caveat wording.
+
+    Server-side failure during cleanup. The body is at both names;
+    the caller needs to know to retry the delete (or recover
+    manually).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(502, text="bad gateway")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: moved body to new but failed to delete old: silverbullet error: 502; both now exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_delete_timeout_returns_atomicity_caveat_error() -> None:
+    """Source DELETE timeout after a successful write → atomicity-caveat wording.
+
+    Timeouts during cleanup leave the body at both names; the
+    caller retries or recovers manually.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        raise httpx.ReadTimeout("simulated")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: moved body to new but failed to delete old: silverbullet request timed out; both now exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_destination_write_413_returns_tool_error() -> None:
+    """Destination write 413 → standard body-too-large wording.
+
+    The body read from the source exceeded SB's 4 MiB limit when
+    re-PUT to the destination. The source isn't deleted (the
+    PUT failed before the DELETE ran), so the body still lives at
+    ``name``. Standard wording — the partial-failure shape is
+    "destination write failed", not "source cleanup failed", so
+    the atomicity message doesn't apply.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        return httpx.Response(413, text="body too large")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert (
+        _text(result)
+        == "Error executing tool move_page: body too large: limit is 4 MiB"
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_page_read_5xx_returns_tool_error() -> None:
+    """Source read 5xx surfaces the unified 5xx wording."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream gone")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool move_page: silverbullet error: 503"
+
+
+@pytest.mark.asyncio
+async def test_move_page_returns_null_when_new_etag_header_missing() -> None:
+    """Destination write 200 with no ETag header → ``None``.
+
+    Mirror of the same shape on the other write tools. The wire
+    payload is ``{"result": null}`` so a future refactor that
+    returned ``""`` would be a confusing type drift.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        if request.method == "PUT":
+            return httpx.Response(200)
+        return httpx.Response(200, headers={"ETag": '"old"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is False
+    assert result.structured_content == {"result": None}
+
+
+@pytest.mark.asyncio
+async def test_move_page_does_not_delete_on_destination_collision() -> None:
+    """When the destination write fails, the source is not deleted.
+
+    The atomicity story is "write first, then delete". If the
+    write fails (412 from ``If-None-Match: *``), the source
+    DELETE never runs — the source is untouched. This pins down
+    the ordering so a future refactor that moved the DELETE
+    before the PUT (or ran them concurrently) doesn't silently
+    lose data on a destination collision.
+    """
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, text="body")
+        # Destination collision.
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "old", "new_name": "new"}
+        )
+
+    assert result.is_error is True
+    # Read, then failed PUT — no DELETE.
+    assert methods == ["GET", "PUT"]
 
 
 # --- resource template -------------------------------------------------

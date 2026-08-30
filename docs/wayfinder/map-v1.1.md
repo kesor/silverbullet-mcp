@@ -48,20 +48,22 @@ journal surface (T10–T13) is unchanged.
 
 ### Status
 
-T18 (commit `d9c07`), T19 (commit `aa369`), T20 (commit pending),
-and T21 (commit pending) resolved; the bridge now exposes seven
-`/.fs`-backed tools — `read_page`, `write_page`, `delete_page`,
-`append_to_page`, `patch_page_lines`, `patch_page_replace`,
-`list_pages` — plus the resource template. T20 was the line-range
-patch ticket (1-indexed inclusive ranges, trailing-newline
-preservation, out-of-range pre-read validation); T21 is the
-literal-substring find-and-replace counterpart (the
-read-modify-write shape T19 introduced, no line-splitting code
-shared). **T22 (`move_page`) is the only ticket remaining**;
-it's now unblocked (T18 delivered `delete_page`, T19 delivered
-the read-modify-write shape, T21 showed the inline-handler
-pattern composes cleanly — T22 builds a `read → write_new →
-delete_old` dance on the same primitives). T14–T17 from the
+T18 (commit `d9c07`), T19 (commit `aa369`), T20, T21, and T22
+(all resolved this session) shipped; the bridge now exposes
+**eight `/.fs`-backed tools** — `read_page`, `write_page`,
+`delete_page`, `append_to_page`, `patch_page_lines`,
+`patch_page_replace`, `move_page`, `list_pages` — plus the
+resource template. T20 was the line-range patch ticket
+(1-indexed inclusive ranges, trailing-newline preservation,
+out-of-range pre-read validation); T21 was the literal-substring
+find-and-replace counterpart (the read-modify-write shape T19
+introduced, no line-splitting code shared); T22 is the
+write-then-delete rename (destination ``If-None-Match: *``
+refuses overwrite, atomicity-caveat wording on the source-delete
+step, same-name short-circuit). **The map's destination is
+reached**: full CRUD + edit-tooling via MCP, every operation
+atomic, every operation gated by ``if_match`` (etags), every
+write operation returning the new etag. T14–T17 from the
 original "tunnel-ready v1.1" chart remain demoted to **Out of
 scope**.
 
@@ -250,6 +252,86 @@ scope**.
   skip (+14). `nix flake check` green.
 - **T20. `patch_page_lines(name, start_line, end_line, new_content, if_match?)`** (commit pending): sixth `/.fs`-backed tool, the line-range patch companion to `append_to_page`. New module-level helpers `_split_body_lines` and `_apply_line_patch` in `server.py` (line splitting + range replacement, factored out so future patch tools and tests can target them directly). Five design calls baked in: (a) split on `\n` (single newline, not `str.splitlines()`) — SB stores LF and `splitlines()` would silently strip `\r` from a stray CRLF body; the universal-newline test pins this down; (b) drop a trailing empty element from the split so line counts match an editor's "go to end" (`"a\nb\n"` is 2 lines, not 3); (c) preserve the page's trailing newline iff the body had one and the patched result is non-empty (an empty patched body has no trailing newline either way — mirrors editor semantics); (d) `start_line < 1`, `end_line < start_line` are pre-read validation errors (terse wording, no page-line-count known yet); (e) `end_line > line_count` is post-read validation with the page's line count in the wording — the ticket's recommended `"line range {start}..{end} out of bounds for page with {N} lines"` shape. Empty `new_content` deletes the range (standing preference: no separate `delete_lines` tool). `if_match="*"` and `<stale_etag>` semantics match `append_to_page` and `write_page` (forwarded to the write, not the read; 412 surfaces the unified wording). Type guards reject `bool` instances (Python's `bool` is a subclass of `int`, so `True`/`False` would otherwise sneak through as `1`/`0` line numbers). New `@mcp.tool("Patch page (lines)")` handler in `register_tools`; the 6-tool inventory assertions in `tests/test_journal_gate.py` (`SB_TOOL_NAMES`) and `tests/test_http_auth.py` (sorted `list_tools()` shape) carry forward. Drive-by: tightened `append_to_page`'s tool description (the prior wording claimed the tool's separator behavior "so callers that pass leading newlines get exactly one separator", which was misleading — the test `does_not_double_separator` documents the actual two-newline result when the caller does pass a leading `\n`). Live e2e round-trip: `patch_page_lines(name, 1, 1, "patched\n")` against body `"hello from T7 live e2e\nappended\n"` yields `"patched\nappended\n"` (the trailing `\n` from the original body is preserved). 21 new Layer-1 tests in `tests/test_tools_in_memory.py` cover: happy path, replace first/middle/last/all lines, empty `new_content` deletes range, trailing-newline preservation (both branches), `new_content` trailing-newline no-double-up, empty-body edge case (every range is out-of-bounds), single-line page, CRLF body (no `splitlines()` normalization), `if_match` plumbing (forwarded to write, not read), stale `if_match` 412, 404, 413, 5xx, no-ETag `None` round-trip, four out-of-range validation paths (`start=0`, `start=-1`, `end<start`, `end>line_count`). Test count: 148 pass + 2 skip (+21). `nix flake check` not run from this session; `pytest` runs in `.venv/` are green.
 - **T21. `patch_page_replace(name, find, new_string, replace_all=False, if_match?)`** (commit pending): seventh `/.fs`-backed tool, the literal-substring find-and-replace counterpart to T20. New `@mcp.tool("Patch page (replace)")` handler in `register_tools`; lives inline in `server.py` because `str.replace` is the only logic (no line-splitting code to share with T20, no separate `_patch.py` needed). Five design calls baked in: (a) **`find` treated as a literal substring** — `str.replace`, no regex/glob/fuzzy semantics; agents that want regex match `rg` or Python `re` client-side first, then call this tool with the literal result (a regex mode would invite "I forgot to escape" disasters; the literal-vs-regex test pins this down with `find="\\d"` against body `"the \\d placeholder"` — replaces the literal backslash+d, not "any digit"); (b) **`replace_all=False` by default** — the standing preference from the map: the find string should be unique unless the caller says otherwise. Multi-match + `replace_all=False` → `ToolError("find matched N times; pass replace_all=True or narrow find")` carrying the count; (c) **`find` not in body → `ToolError("find not found in body")`** — a silent no-op would mask a typo in the find string and look like success; (d) **empty `find` rejected upfront** → `ToolError("find must not be empty")` *before* the read (`str.replace("","X","abc")` is `"XaXbXcX"`, almost never what the caller wanted; mirrors `append_to_page`'s empty-text guard); (e) **`if_match` forwarded to the write, not the read** — same contract as T19/T20; `if_match="*"` semantics carry forward. Wire shape `str | None` (the new ETag, or `None` if SB's response didn't carry one — same contract as every other write tool). 18 new Layer-1 tests in `tests/test_tools_in_memory.py` cover: happy-path roundtrip with read-then-write ordering, default `replace_all=False` replaces the unique match, multi-match + default errors (carries count), multi-match + explicit `False` errors (same wording as default), `replace_all=True` replaces every match, `find` not found (errors even with `replace_all=True`), empty `find` errors upfront (no GET, no PUT), `find` not found vs `replace_all=True` independence, literal-vs-regex (replaces `\\d` literally), empty `new_string` deletes occurrences, `find` spanning newlines, `if_match` plumbing (forwarded to write, not read), `if_match="*"` semantics, stale `if_match` 412, 404, 413, 5xx, no-ETag `None` round-trip. Carry-forwards: `tests/test_journal_gate.py` `SB_TOOL_NAMES` extended from 6 to 7 elements; `tests/test_http_auth.py` sorted tool-names assertion updated; `tests/test_e2e_live_sb.py` grew a 15-line `patch_page_replace` roundtrip in the existing live flow (body `"patched\nappended\n"` → replace `patched` with `hello` → `"hello\nappended\n"`). Drive-by: `server.py` module docstring updated from "six `/.fs`-backed tools" to "seven"; `MCPServer.instructions` reworded to list all seven tool names; `register_tools` docstring updated from "five `/.fs`-backed tools" to "seven"; `README.md` tool list grew by `patch_page_replace` (with the safe-default explanation) and the Pi-MCP wiring paragraph now says "seven tools"; `docs/design.md` § Goals updated (mentions the seven verbs), § Tools table grew by `patch_page_replace` row with the literal-substring + safe-default note, and the "What we are not doing" list dropped the `patch_page_replace — not built yet` line. Test count: 166 pass + 2 skip (+18). `nix flake check` not run from this session; `pytest` runs in `.venv/` and `nix develop` are both green.
+- **T22. `move_page(name, new_name, if_match?)`** (commit pending):
+  eighth `/.fs`-backed tool, the write-then-delete rename T18 +
+  T19 + T21 unblocked. New `@mcp.tool("Move page")` handler in
+  :func:`register_tools` composes the existing `read_page` /
+  `write_page` / `delete_page` primitives inline — no new
+  `sb_client` method, no new layer, no new module. Five design
+  calls baked in: (a) **write-then-delete** ordering so the
+  partial-failure case leaves the body at `new_name` rather than
+  losing it (the ticket's recommended shape); (b) **destination
+  write uses `If-None-Match: *`** — `move_page` never silently
+  overwrites an existing page, rename is rename not merge; (c)
+  **distinct 412 wording for destination collision**
+  (`ToolError("destination page already exists: {new_name};
+  refusing to overwrite")`) — clearer than the unified 412
+  message because the source and destination are different pages
+  and the caller needs to know which side refused (the first
+  deviation from the v1.1 unified-wording convention, scoped to
+  this case only); (d) **atomicity-caveat wording on source-
+  delete failure** (`ToolError("moved body to {new_name} but
+  failed to delete {name}: <reason>; both now exist")`) for 412
+  / 5xx / timeout — the body is at both names and the caller
+  needs to know to recover, with a slightly different message
+  for the 404 case ("already gone, that's a feature") since that
+  outcome is the desired one not a failure to recover from;
+  (e) **same-name short-circuit** (`name == new_name` →
+  `read_page` for existence, no PUT / DELETE, returns `None`
+  for the etag since `read_page` doesn't surface one and a
+  write round trip would defeat the point) — the only branch
+  where the standing `if_match`-honored preference doesn't
+  apply (the precondition guards the source delete which
+  doesn't run, and `read_page` doesn't accept a precondition;
+  callers who want to verify the etag chain `write_page(name,
+  body, if_match="<etag>")` themselves). Wire shape `str | None`
+  (the new page's ETag from the destination write, or `None` if
+  SB's response didn't carry one — same contract as every
+  other write tool). `if_match` plumbing: forwarded to the
+  source DELETE only; read has no precondition; destination PUT
+  carries `If-None-Match: *` (the destination didn't exist
+  until this write, so the source's etag doesn't apply). 14 new
+  Layer-1 tests in `tests/test_tools_in_memory.py` cover the
+  happy path (with read-then-write-then-delete ordering and
+  `If-None-Match: *` on the PUT), same-name short-circuit
+  (existence-only, `None` etag), same-name on missing page
+  (404 wording), `if_match` plumbing, source 404, destination
+  collision (distinct wording), atomicity caveat on delete 412
+  / 404 / 5xx / timeout, destination 413 (standard wording),
+  read 5xx (standard wording), null-ETag round-trip, and the
+  "destination collision doesn't trigger source delete"
+  ordering invariant. Carry-forwards: `tests/test_journal_gate.
+  py` `SB_TOOL_NAMES` extended from 7 to 8 entries;
+  `tests/test_http_auth.py` sorted tool-names assertion
+  updated; `tests/test_e2e_live_sb.py` grew a 40-line
+  `move_page` round-trip in the existing live flow
+  (move MARKER → MARKER-moved, read back, move back) and
+  `_delete_marker` gained a best-effort cleanup of the
+  moved-name page in case the test fails mid-flight. Drive-by:
+  `server.py` module docstring updated from "seven
+  `/.fs`-backed tools" to "eight"; `MCPServer.instructions`
+  reworded to list all eight tool names; `register_tools`
+  docstring updated from "seven" to "eight" and now documents
+  the `move_page` exception (post-write-delete surfaces
+  atomicity-caveat `ToolError` directly from the handler);
+  `_translate_sb_errors` docstring extended to list all eight
+  tools and to call out the `move_page` post-write-delete
+  inline translation; `build_mcp` docstring updated from
+  "seven" to "eight"; `README.md` tool list grew by
+  `move_page` (with the rename-not-merge explanation in plain
+  English) and the Pi-MCP wiring paragraph now says "eight
+  tools"; `docs/design.md` § Goals updated (mentions the
+  eight verbs), § Tools table grew by `move_page` row with the
+  write-then-delete + destination-collides + `if_match` notes,
+  and the "What we are not doing" list dropped the
+  `move_page — not built yet` line; `tests/test_tools_in_memory.
+  py` module docstring updated to count eight tools, list
+  `move_page` as the eighth read-modify-write / write-then-
+  delete tool, and explain T22's distinct error wordings.
+  Test count: 180 pass + 2 skip (+14). `nix flake check`
+  passes. **This was the last open ticket in the v1.1 map.
+  The map's destination ("full CRUD + edit-tooling via MCP")
+  is now reached.**
 
 ## Tickets
 
@@ -677,10 +759,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: _(unclaimed)_
-> **Status**: open (now unblocked: T18 delivered `delete_page`,
-> T19 delivered the read-modify-write shape, T21 showed the
-> inline-handler pattern composes cleanly)
+> **Assignee**: `minimax-m3` (claimed and resolved same session)
+> **Status**: ✅ resolved (commit pending; see Decision above)
 > **Question**: How does the bridge expose page rename?
 > **Context**: SB has no native move; the bridge does
 > `read_page(name) → write_page(new_name, body, if_match=None) →
@@ -716,6 +796,152 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Blocks on**: T18 (delete_page is the last step of move).
 >
 > **Unblocks**: none.
+>
+> **Resolution**: New `@mcp.tool("Move page")` handler in
+> :func:`register_tools` composes the existing
+> ``read_page`` / ``write_page`` / ``delete_page`` primitives
+> inline (no new ``sb_client`` method, no new layer). Five
+> design calls baked into the implementation, all aligned with
+> the standing preferences and the ticket body:
+>
+> - **Write-then-delete.** :func:`move_page` writes the body
+>   to ``new_name`` first, then deletes the source. The
+>   ticket offered this as the default and the rationale is
+>   sound: if the source delete fails after the destination
+>   write succeeded, the body lives at *both* names and the
+>   caller can clean up; the alternative (delete first,
+>   write second) loses the body on partial failure, which is
+>   worse. The two exceptions to the dance (404 on the read,
+>   412 on the destination write) short-circuit *before* the
+>   delete runs, so the source is untouched on those failures.
+>
+> - **Destination write uses ``If-None-Match: *``.**
+>   :func:`move_page` never silently overwrites an existing
+>   page — rename is rename, not merge. The ticket offered
+>   "rename or fail" as one of two options for the write
+>   (``unconditional`` vs ``If-None-Match: *``); we picked the
+>   safer one. Callers who actually want a merge compose
+>   ``read_page(new_name) → write_page(new_name, merged) →
+>   delete_page(name)`` themselves.
+>
+> - **Distinct 412 wording for the destination collision.**
+>   When the destination write fails 412 (from ``If-None-Match:
+>   *``), the tool raises
+>   ``ToolError("destination page already exists: {new_name};
+>   refusing to overwrite")`` — clearer than the unified 412
+>   wording because the source and destination are different
+>   pages and the caller needs to know which side refused.
+>   This is the first deviation from the unified-wording
+>   convention the v1.1 map established (T18 / T19 / T20 /
+>   T21 all use the unified message); the deviation is
+>   scoped to the destination-collision case in
+>   :func:`move_page` only.
+>
+> - **Atomicity-caveat wording on the source-delete failure.**
+>   When the destination write succeeded but the source
+>   delete failed (412 from ``If-Match`` because the source's
+>   etag went stale between read and delete, or 404 because
+>   someone else deleted the source in the gap, or 5xx /
+>   timeout because SB hiccuped), the tool raises
+>   ``ToolError("moved body to {new_name} but failed to
+>   delete {name}: <reason>; both now exist")`` so the
+>   caller can recover (``read_page(new_name) → write_page(
+>   name, ...) → delete_page(new_name)`` to undo, or just
+>   ``delete_page(name)`` if they're OK with the stale body
+>   at the new name). The 404 case (source already gone)
+>   gets a slightly different message because the outcome is
+>   *the desired one* (body at new_name, source gone) — not a
+>   failure to recover from, just a noisy successful move.
+>
+> - **Same-name short-circuit.** ``name == new_name`` is a
+>   no-op that does a ``read_page`` for existence and returns
+>   ``None`` for the etag (the cheapest existence check; the
+>   body is discarded). ``if_match`` is intentionally *not*
+>   honored in this branch — the precondition guards the
+>   source delete, which doesn't run on a same-name no-op,
+>   and ``read_page`` doesn't accept a precondition. Callers
+>   that need to verify the etag on a same-name no-op chain
+>   ``write_page(name, body, if_match="<etag>")``
+>   themselves. This deviation from the standing
+>   "every write tool honors if_match" preference is scoped
+>   to the same-name branch only — the rename path honors
+>   ``if_match`` by forwarding it to the source delete.
+>
+> Wire shape: ``str | None`` (the new page's ETag from the
+> destination write, or ``None`` if SB's response didn't
+> carry one — same ``str | None`` contract as every other
+> write tool). ``{"result": null}`` for the no-etag case,
+> ``{"result": "<etag>"}`` for the happy path. Same-name
+> also returns ``None`` (honest "no etag available from the
+> read-modify-write shape we used") — the ticket's "returns
+> the current etag" wording was aspirational; the only way to
+> get an etag would be a write round trip, which defeats the
+> point of the short-circuit.
+>
+> ``if_match`` plumbing: forwarded to the source delete only.
+> The read carries no precondition (matches the read-modify-
+> write siblings). The destination write uses ``If-None-Match:
+> *`` rather than ``If-Match`` because the destination didn't
+> exist until this write — the source's etag doesn't apply to
+> the new page. Tested explicitly:
+> ``test_move_page_forwards_if_match_to_delete`` asserts
+> that ``If-Match`` shows up on the DELETE only and that the
+> PUT carries ``If-None-Match: *``.
+>
+> 14 new Layer-1 tests in ``tests/test_tools_in_memory.py``
+> cover the happy path (with read-then-write-then-delete
+> ordering and ``If-None-Match: *`` on the PUT), the
+> same-name short-circuit (existence-only, ``None`` etag),
+> the same-name short-circuit on a missing page (404
+> wording), ``if_match`` plumbing, source 404, destination
+> collision (distinct wording), atomicity caveat on
+> delete 412 (distinct wording), atomicity message on
+> delete 404 (the "already gone, that's a feature" case),
+> atomicity caveat on delete 5xx, atomicity caveat on
+> delete timeout, destination 413 (standard wording), read
+> 5xx (standard wording), null-ETag round-trip, and the
+> "destination collision doesn't trigger source delete"
+> ordering invariant. ``tests/test_journal_gate.py``
+> ``SB_TOOL_NAMES`` extended from 7 to 8 entries;
+> ``tests/test_http_auth.py`` sorted tool-names assertion
+> updated. Drive-by live e2e: ``tests/test_e2e_live_sb.py``
+> grew a 40-line ``move_page`` round-trip in the existing
+> live flow (``move_page(MARKER, MARKER-moved)`` →
+> ``read_page(MARKER)`` 404s → ``read_page(MARKER-moved)``
+> returns the body → ``move_page(MARKER-moved, MARKER)`` to
+> restore for the precondition block below);
+> ``_delete_marker`` gained a best-effort cleanup of the
+> moved-name page in case the test fails between the two
+> moves.
+>
+> Drive-bys that landed in this session: ``server.py`` module
+> docstring updated from "seven ``/.fs``-backed tools" to
+> "eight"; ``MCPServer.instructions`` reworded to list all
+> eight tool names; ``register_tools`` docstring updated
+> from "seven ``/.fs``-backed tools" to "eight" and now
+> documents the :func:`move_page` exception (post-write-
+> delete surfaces atomicity-caveat ``ToolError`` directly
+> from the handler); ``_translate_sb_errors`` docstring
+> extended to list all eight tools and to call out that
+> :func:`move_page` translates the post-write-delete step
+> inline; ``build_mcp`` docstring updated from "seven" to
+> "eight"; ``README.md`` tool list grew by ``move_page``
+> (with the rename-not-merge explanation in plain English)
+> and the Pi-MCP wiring paragraph now says "eight tools";
+> ``docs/design.md`` § Goals updated (mentions the eight
+> verbs), § Tools table grew by ``move_page`` row with the
+> write-then-delete + destination-collides + ``if_match``
+> notes, and the "What we are not doing" list dropped the
+> ``move_page — not built yet`` line; ``tests/test_tools_in_
+> memory.py`` module docstring updated to count eight
+> tools, list ``move_page`` as the eighth read-modify-write
+> / write-then-delete tool, and explain T22's distinct
+> error wordings.
+>
+> Test count: 180 pass + 2 skip (+14). ``nix flake check``
+> passes. **This was the last open ticket in the v1.1 map.**
+> The map's destination ("full CRUD + edit-tooling via MCP")
+> is now reached.
 
 ---
 

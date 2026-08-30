@@ -8,12 +8,12 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes seven MCP **tools** —
+file API on `/.fs/…`). The bridge exposes eight MCP **tools** —
 `read_page`, `write_page`, `append_to_page`, `patch_page_lines`,
-`patch_page_replace`, `delete_page`, `list_pages` — and one MCP
-**resource template** — `silverbullet://page/{name}` — letting Grok
-read and write your SilverBullet pages as conversation context or as
-tool calls.
+`patch_page_replace`, `move_page`, `delete_page`, `list_pages` —
+and one MCP **resource template** — `silverbullet://page/{name}` —
+letting Grok read and write your SilverBullet pages as conversation
+context or as tool calls.
 
 The bridge is meant to be **run behind the user's existing Cloudflare
 tunnel** alongside SilverBullet. Neither service is exposed directly;
@@ -23,9 +23,9 @@ only the bridge is on the tunnel, and only Grok has the token.
 
 - **Goal**: Grok on the web can `read_page`, `write_page`,
   `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-  `delete_page`, and `list_pages` against SilverBullet, behind the
-  user's existing Cloudflare tunnel, with one bearer token.
-- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search, move,
+  `move_page`, `delete_page`, and `list_pages` against SilverBullet,
+  behind the user's existing Cloudflare tunnel, with one bearer token.
+- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search,
   multi-user, mutating silver bullet's source, hosting the bridge
   for other people.
 
@@ -211,10 +211,10 @@ dev = [
 
 ## § Tools
 
-v1 locked three tools at T4; v1.1 grew the surface to seven (T18
+v1 locked three tools at T4; v1.1 grew the surface to eight (T18
 added `delete_page`, T19 added `append_to_page`, T20 added
-`patch_page_lines`, T21 added `patch_page_replace`). **Seven tools,
-one resource template.**
+`patch_page_lines`, T21 added `patch_page_replace`, T22 added
+`move_page`). **Eight tools, one resource template.**
 
 | Tool | Input (Python type hint) | SB call | Side effects |
 |---|---|---|---|
@@ -223,6 +223,7 @@ one resource template.**
 | `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | may append / refuse on `412` (concurrent-write protection) |
 | `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
 | `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront) | may patch / refuse on `412` |
+| `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
 | `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | hard delete; refuses on `412` |
 | `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | none |
 
@@ -264,7 +265,6 @@ we are.
 
 ### What we are not doing (v1)
 
-- `move_page` (v1.1's T22 candidate; not built yet).
 - `search_pages` via SB-side server-side query — would need either
   client-side filtering over `list_pages`, or SB-side Space-Lua,
   neither of which we want v1. v1.1's `pages_touching_topic` is a

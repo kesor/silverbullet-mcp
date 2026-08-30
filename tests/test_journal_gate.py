@@ -60,6 +60,7 @@ SB_TOOL_NAMES = {
     "append_to_page",
     "patch_page_lines",
     "patch_page_replace",
+    "move_page",
 }
 
 

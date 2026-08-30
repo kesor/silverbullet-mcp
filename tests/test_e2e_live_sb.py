@@ -77,8 +77,15 @@ async def _delete_marker(sb_url: str, sb_token: str) -> None:
     if sb_token:
         headers["Authorization"] = f"Bearer {sb_token}"
     async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        # The T22 move round-trip creates a ``{MARKER}-moved`` page
+        # and then moves it back; if the test fails between those
+        # two moves, the moved-name page is left in the live space.
+        # Best-effort cleanup of both — the suppress is per-page so
+        # a missing marker doesn't mask a missing moved-page.
         with suppress(httpx.HTTPError):
             await client.delete(f"/.fs/{MARKER}")
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{MARKER}-moved")
 
 
 @pytest.mark.asyncio
@@ -193,6 +200,42 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     )
                     assert after_replace.is_error is False, after_replace
                     assert after_replace.content[0].text == "hello\nappended\n"
+
+                    # ``move_page`` is the v1.1 T22 read-write-delete
+                    # tool; round-trip the rename against live SB so
+                    # the write-then-delete shape (and the new page's
+                    # read-back) is verified end-to-end, not just
+                    # under ``MockTransport``. Body is currently
+                    # ``hello\nappended\n``; move it to a new name and
+                    # read it back from there. The original ``MARKER``
+                    # name must be gone afterwards.
+                    moved_name = f"{MARKER}-moved"
+                    moved = await session.call_tool(
+                        "move_page",
+                        {"name": MARKER, "new_name": moved_name},
+                    )
+                    assert moved.is_error is False, moved
+
+                    after_move_old = await session.call_tool(
+                        "read_page", {"name": MARKER}
+                    )
+                    assert after_move_old.is_error is True, (
+                        "source page should be gone after move"
+                    )
+
+                    after_move_new = await session.call_tool(
+                        "read_page", {"name": moved_name}
+                    )
+                    assert after_move_new.is_error is False, after_move_new
+                    assert after_move_new.content[0].text == "hello\nappended\n"
+
+                    # Move it back so the precondition block below
+                    # can still find ``MARKER``.
+                    move_back = await session.call_tool(
+                        "move_page",
+                        {"name": moved_name, "new_name": MARKER},
+                    )
+                    assert move_back.is_error is False, move_back
 
                     # Reset the body for the precondition block
                     # below (which writes ``body`` and expects to
