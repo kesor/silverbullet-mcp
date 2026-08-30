@@ -8,10 +8,11 @@
 
 `mcp-silverbullet` is a small Python service that bridges **Grok on the
 web** (a remote MCP client) to a **local SilverBullet server** (an HTTP
-file API on `/.fs/…`). The bridge exposes twelve MCP **tools** —
-`read_page`, `page_exists`, `write_page`, `append_to_page`,
-`patch_page_lines`, `patch_page_replace`, `move_page`, `delete_page`,
-`list_pages`, `diff_pages`, `check_task`, `list_tasks` —
+file API on `/.fs/…`). The bridge exposes fourteen MCP **tools** —
+`read_page`, `page_exists`, `write_page`, `create_page`,
+`append_to_page`, `prepend_to_page`, `patch_page_lines`,
+`patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
+`diff_pages`, `check_task`, `list_tasks` —
 and one MCP **resource template** — `silverbullet://page/{name}` —
 letting Grok read and write your SilverBullet pages as conversation
 context or as tool calls.
@@ -23,14 +24,18 @@ only the bridge is on the tunnel, and only Grok has the token.
 ## Goals, non-goals
 
 - **Goal**: Grok on the web can `read_page`, `write_page`,
-  `append_to_page`, `patch_page_lines`, `patch_page_replace`,
-  `move_page`, `delete_page`, `list_pages`, `page_exists`,
-  `diff_pages`, `check_task`, and `list_tasks` against
-  SilverBullet, behind the user's existing Cloudflare tunnel,
-  with one bearer token.
-- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search,
-  multi-user, mutating silver bullet's source, hosting the bridge
-  for other people.
+  `create_page`, `append_to_page`, `prepend_to_page`,
+  `patch_page_lines`, `patch_page_replace`, `move_page`,
+  `delete_page`, `list_pages`, `page_exists`, `diff_pages`,
+  `check_task`, and `list_tasks` against SilverBullet, behind
+  the user's existing Cloudflare tunnel, with one bearer
+  token.
+- **Non-goals**: MCP Apps (UI resources), OAuth 2.1, search
+  (substring search via `search_pages` and backlink discovery
+  via `find_backlinks` are the v1.3 carve-outs; semantic /
+  BM25 / vector search remain out), multi-user, mutating
+  silver bullet's source, hosting the bridge for other
+  people.
 
 ## Architecture at a glance
 
@@ -253,14 +258,40 @@ with `If-Match: <read_etag>` so a concurrent edit fails 412
 rather than silently clobbering the flip); the `state` argument
 maps the three SB checkbox characters (``" "``, ``"x"``, ``"X"``)
 onto action names (``"todo"``, ``"done"``, ``"cancelled"``).
-**Twelve tools, one resource template.**
+
+**v1.3 added two more write tools and a uniform body-size
+cap**. T32 adds `create_page(name, content)` — a refuse-to-
+overwrite create primitive distinct from `write_page`'s
+overwrite-or-create default; surfaces `ToolError("page
+already exists: {name}; use write_page to overwrite")` on
+collision (a clean next-tool hint rather than the generic
+412 wording the agent would have to pattern-match on);
+implemented as `write_page(if_match="*")` with the 412
+translation. T33 adds `prepend_to_page(name, content,
+position="after_frontmatter"|"top", if_match?, dry_run=False)`
+— a top-of-body insert primitive with YAML frontmatter
+awareness; mirrors `append_to_page`'s read-modify-write +
+`dry_run` shape but inserts at the top. Default
+`position="after_frontmatter"` inserts the new content
+*between* the closing `---` of the frontmatter block and
+the first body line (the human-meaningful default for
+journal / daily-notes pages); `position="top"` overrides
+for the rare absolute-top intent. T36 adds a 256 KiB
+body-size cap applied uniformly across every write tool
+*before* the SB round trip; surfaces `ToolError("body
+too large: {size_bytes} bytes exceeds 256 KiB cap; chunk
+into append_to_page calls")` with the remediation hint
+naming the right next tool. **Fourteen tools, one
+resource template.**
 
 | Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
 |---|---|---|---|---|
 | `read_page` | `name: str` | `GET /.fs/{name}` | `{body, etag, size_bytes, last_modified_ms}` (T24; `name` and `created_ms` dropped — caller passed `name`, reads have no create-vs-update distinction) | none |
 | `page_exists` | `name: str` | `GET /.fs/{name}` (body bytes discarded) | `bool` (T25: `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken") | none |
 | `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may create / overwrite / refuse on `412` |
+| `create_page` | `name: str, content: str` (T32) | `PUT /.fs/{name}` with `If-Match: *` (refuse overwrite; same primitive `write_page(if_match="*")` accepts, specialized at the tool boundary) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | refuses to overwrite an existing page (`ToolError("page already exists: {name}; use write_page to overwrite")` on a 412; empty / whitespace-only `name` raises `ToolError("name must not be empty")` upfront; documented limitation: on SBs that don't honor `If-Match`, `create_page` silently overwrites — a `T32a` follow-up could close the gap with an `exists_page` round trip before the PUT) |
 | `append_to_page` | `name: str, text: str, if_match: Optional[str] = None, dry_run: bool = False` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one; `dry_run=True` skips the PUT and returns a preview envelope) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run; `diff` is a `difflib.unified_diff` of original vs patched) | may append / refuse on `412` (concurrent-write protection); `dry_run=True` raises the same 412-equivalent `ToolError` if `if_match=<stale_etag>`, so the agent sees one error shape across both paths |
+| `prepend_to_page` | `name: str, content: str, position: Literal["after_frontmatter", "top"] = "after_frontmatter", if_match: Optional[str] = None, dry_run: bool = False` (T33) | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; default `position="after_frontmatter"` inserts the new content *between* the closing `---` of the frontmatter block and the first body line; `position="top"` overrides for the absolute-top intent; `dry_run=True` skips the PUT and returns a preview envelope; malformed frontmatter — opening fence but no close — is treated as no-frontmatter; same raw-text-no-parser stance as the rest of the bridge; no YAML library) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run) | may prepend / refuse on `412` (concurrent-write protection); `dry_run=True` raises the same 412-equivalent `ToolError` if `if_match=<stale_etag>`; empty `content` raises `ToolError("content must not be empty")` upfront; unknown `position` raises `ToolError("position must be one of: after_frontmatter, top")` upfront |
 | `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None, dry_run: bool = False` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one; `dry_run=True` skips the PUT and returns a preview envelope) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run) | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT); `dry_run=True` raises the same 412-equivalent `ToolError` if `if_match=<stale_etag>` |
 | `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None, dry_run: bool = False` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront; `dry_run=True` skips the PUT and returns a preview envelope) | `{name, etag, size_bytes, last_modified_ms, created_ms}` (live) or `{dry_run: True, original: str, patched: str, diff: str}` (dry-run) | may patch / refuse on `412`; `dry_run=True` raises the same 412-equivalent `ToolError` if `if_match=<stale_etag>` |
 | `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | `{name=destination, etag, size_bytes, last_modified_ms, created_ms}` (same-name no-op returns the source's envelope) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
@@ -306,8 +337,8 @@ we are.
 |---|---|
 | `200 OK` | success — return body / `PageMeta` (read, write, list row) / `bool` |
 | `404 Not Found` | `read_page` / `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` / `check_task` return `ToolError("page not found: {name}")` (handler-level error → `isError=True`). `diff_pages` (T27) returns the same wording with `name` set to whichever page was missing (the first read's 404 short-circuits before the second; if the second read 404s the wording's `name` field is `other_name` so the agent can tell which side failed). The one exception: `page_exists` (T25) returns `False` rather than an error — 404 *is* the answer. A 404 on a `list_pages` per-page etag-hydration GET (T28) leaves that row's `etag` as `null` rather than failing the whole list. |
-| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) / `check_task` (T30, on the write step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). `diff_pages` (T27) — and `check_task`'s read step (T30) — have no precondition surface; a 412 on a read is highly unusual (a GET normally doesn't carry `If-Match`) but surfaces as the same wording if a proxy / SB misconfig triggers one. `check_task` *also* validates the precondition against the read's etag on the dry-run path so a stale-etag `dry_run=True` raises the same wording without issuing a write. |
-| `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) / `check_task` (T30, on the write step) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default) |
+| `412 Precondition Failed` | `write_page` / `delete_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the delete step) / `check_task` (T30, on the write step) return `ToolError("precondition failed; check if_match/if_none_match")`. `move_page`'s destination-collision 412 gets the special-case wording (see the tool row above). A 412 on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (proxy / SB misconfig, not an agent error). `diff_pages` (T27) — and `check_task`'s read step (T30) — have no precondition surface; a 412 on a read is highly unusual (a GET normally doesn't carry `If-Match`) but surfaces as the same wording if a proxy / SB misconfig triggers one. `check_task` *also* validates the precondition against the read's etag on the dry-run path so a stale-etag `dry_run=True` raises the same wording without issuing a write. `create_page` (T32) intercepts `PreconditionFailed` *before* `_translate_sb_errors` and re-raises as `ToolError("page already exists: {name}; use write_page to overwrite")` (a clean next-tool hint rather than the generic 412 wording; on SBs that don't honor `If-Match`, `create_page` silently overwrites — a `T32a` follow-up could close the gap). **T31b caveat**: on SBs that don't honor `If-Match` (T31's negative finding on this dev box), a 412 is not enforced — the write returns 200 on a stale etag. The bridge's post-write verification helper (`_verify_concurrency_token` in `server.py`) re-reads after the PUT and raises `ToolError("concurrent edit detected: the page changed since you read it at {expected_etag}; read it again and re-issue the write with the current etag")` on a drifted etag. On SBs that *do* honor `If-Match`, the 412 path above still wins (cheaper, fires before the helper). |
+| `413 Body Too Large` | `write_page` / `append_to_page` / `patch_page_lines` / `patch_page_replace` / `move_page` (on the destination write) / `check_task` (T30, on the write step) return `ToolError("body too large: limit is 4 MiB")` (the SDK's `max_request_body_size` default). **T36 cap**: before the SB round trip, every write tool checks the caller's body against a 256 KiB local cap (UTF-8 byte count). A body over 256 KiB surfaces `ToolError("body too large: {size_bytes} bytes exceeds 262144 byte (256 KiB) cap; chunk into append_to_page calls")` with the size, the cap, and the remediation hint — *before* the SB round trip, so a too-large body never reaches SB. 256 KiB exactly is the inclusive boundary (256 KiB passes; 256 KiB + 1 byte fails). The cap does NOT apply to read-side tools (`read_page`, `list_pages`, `page_exists`, `diff_pages`, `list_tasks`) or to the journal-discovery tools (`pages_touching_topic` / `search_pages` / `find_backlinks`). The cap composes cleanly with T31b: it fires *before* the PUT, so a too-large body never reaches T31b's verification path. |
 | `5xx` | `ToolError("silverbullet error: <status>")` — including for `page_exists`, where 5xx deliberately returns an error rather than `False` so the caller can distinguish "no, proceed" from "SB is broken, don't make decisions". A 5xx on a `list_pages` per-page hydration GET (T28) leaves that row's `etag` as `null` (transient SB hiccup, not an agent error). |
 | timeout | `ToolError("silverbullet request timed out")` — including the `list_pages` hydration walker (T28), which swallows per-page timeouts and leaves the row's `etag` as `null` rather than failing the whole call. |
 
@@ -350,6 +381,24 @@ We do not try to parse it as JSON; we map on status code only.
 requests that it must *not* exist. We expose `if_match` on
 `write_page` so that Grok can issue "create if absent, refuse if
 present" without clobbering.
+
+> **v1.3 caveat (T31's negative finding)**: this contract
+> describes SB's *intended* behavior, but the SB build on the
+> project's dev box (`127.0.0.1:63000`) does NOT honor
+> `If-Match: <etag>` on `PUT /.fs/{name}` (it silently
+> overwrites) AND does NOT return an `ETag` response header
+> on PUT (so the agent has nothing to thread). The bridge
+> compensates at the application layer: T31a synthesizes a
+> fallback etag from `X-Last-Modified` + `X-Content-Length`
+> when SB strips `ETag`; T31b adds a post-write verification
+> step that re-reads after the PUT and raises
+> `ToolError("concurrent edit detected: …")` on a stale
+> etag. On SBs that *do* honor `If-Match`, the 412 path still
+> wins (cheaper, fires before the verification step); the
+> helper is the fallback for SBs that don't. See
+> [`docs/wayfinder/map-v1.3.md`](wayfinder/map-v1.3.md) § T31
+> for the live-SB verification and the T31a + T31b
+> follow-up tickets.
 
 ### Auth header
 

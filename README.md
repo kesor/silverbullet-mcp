@@ -14,16 +14,21 @@ Subjective notes from that survey (judgment calls, predictions, what I considere
 
 ## What it exposes
 
-Twelve tools and one resource template (v1.3 plans five more — see
-[§ v1.3 roadmap](#v13-roadmap); the count below is the always-on
-`/.fs`-backed + bullet-primitive surface, the optional journal
-surface is listed under [§ Optional: journal surface](#optional-journal-surface-t10t12-t34)
-and includes the v1.3-shipped `search_pages`):
+Fourteen tools and one resource template (v1.3 closed on
+2026-08-30 — all six chartered tickets shipped; see
+[§ v1.3 roadmap](#v13-roadmap)); the count below is the
+always-on `/.fs`-backed + bullet-primitive surface, the
+optional journal surface is listed under
+[§ Optional: journal surface](#optional-journal-surface-t10t12-t34-t35)
+and includes the v1.3-shipped `search_pages` and
+`find_backlinks`):
 
 - `read_page(name)` — markdown body and metadata; returns `{body, etag, size_bytes, last_modified_ms}` (T24 ack envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
 - `page_exists(name)` — cheap existence check; returns `bool` (T25). `True` on 200, `False` on 404, `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken". Doesn't materialize the body.
 - `write_page(name, content, if_match?)` — create/update; returns `{name, etag, size_bytes, last_modified_ms, created_ms}` (T23 acknowledgement envelope)
+- `create_page(name, content)` (T32) — refuse-to-overwrite create; same T23 envelope as `write_page`. Distinct from `write_page`'s overwrite-or-create default: surfaces `ToolError("page already exists: {name}; use write_page to overwrite")` on collision rather than the generic 412 wording the agent would otherwise have to pattern-match. `if_match="*"` is implied — callers that want write-with-precondition call `write_page` directly.
 - `append_to_page(name, text, if_match?, dry_run=False)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the T23 ack envelope. With `dry_run=True` (T26) returns `{dry_run, original, patched, diff}` without writing — the read still happens and `if_match=<etag>` is checked against the read's etag so a stale etag raises 412-equivalent `ToolError` (the agent sees the same wording as the live path).
+- `prepend_to_page(name, content, position="after_frontmatter"|"top", if_match?, dry_run=False)` (T33) — top-of-body insert with YAML frontmatter awareness. Default `position="after_frontmatter"` inserts the new content *between* the closing `---` of the frontmatter block and the first body line (the human-meaningful default for journal / daily-notes pages with YAML frontmatter); `position="top"` overrides and inserts above the frontmatter (rare; almost always a bug in practice, but the tool exposes it). For pages without frontmatter, both positions produce the same splice. Mirrors `append_to_page`'s read-modify-write + `dry_run` shape; the read's etag auto-threads into the write's `if_match` when the caller passes `None` (T31b concurrency detection for free). Frontmatter detection: a leading `---\n…\n---\n` block (LF); a page that opens with `---` but doesn't close it (malformed frontmatter) is treated as no-frontmatter — the new content lands at the absolute top. Empty `content` raises `ToolError("content must not be empty")` upfront; unknown `position` raises `ToolError("position must be one of: after_frontmatter, top")`.
 - `patch_page_lines(name, start_line, end_line, new_content, if_match?, dry_run=False)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the T23 ack envelope. `dry_run=True` (T26) returns the same `{dry_run, original, patched, diff}` preview as `append_to_page`.
 - `patch_page_replace(name, find, new_string, replace_all=False, if_match?, dry_run=False)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the T23 ack envelope. `dry_run=True` (T26) returns the same `{dry_run, original, patched, diff}` preview as the others.
 - `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the destination's T23 ack envelope (the same-name no-op returns the source's)
@@ -50,18 +55,39 @@ on this dev box does not honor `If-Match` and does not return
 original six plus T31a (synthetic-etag fallback when SB
 strips `ETag`) and T31b (post-write verification helper that
 re-reads and compares etags when SB silently overwrites on
-stale `If-Match`). **T34 shipped on 2026-08-30** (now in
-[What it exposes](#what-it-exposes)). T32 / T33 / T36 are
-blocked on T31a + T31b; T31a / T31b / T35 are unblocked.
+stale `If-Match`). **T34, T31a, T31b, T35, and T32 have shipped**
+(in [What it exposes](#what-it-exposes) for T34 and T32; the
+T31a / T31b concurrency fallback is transparent to callers
+— it activates only on writes that thread an etag and that
+succeed with a drifted post-write re-read; T35 ships the
+second v1.3 discovery tool alongside T34). **T36 shipped
+2026-08-30 — all six v1.3 tickets have landed.**
 
-- **`create_page(name, content, if_match?)`** (T32) — distinct
-  from `write_page`'s overwrite-or-create default; surfaces a
-  clean `already_exists` `ToolError` instead of a 412 the agent
-  has to pattern-match on. **Blocked on T31a + T31b.**
+- **`create_page(name, content)`** (T32) — **SHIPPED
+  2026-08-30**. Distinct from `write_page`'s overwrite-or-
+  create default; refuses to overwrite a page that already
+  exists, surfacing a clean `ToolError("page already exists:
+  {name}; use write_page to overwrite")` rather than a 412
+  the agent has to pattern-match on. Same T23 ack envelope
+  return shape as `write_page` so an agent that learns one
+  shape has it for both tools. `if_match="*"` is implied
+  (no caller-controlled precondition — agents that want
+  write-with-precondition call `write_page` directly).
+  Empty / whitespace-only `name` raises
+  `ToolError("name must not be empty")` upfront, before
+  any SB round trip.
 - **`prepend_to_page(name, content, position="after_frontmatter"|"top",
-  if_match?, dry_run=False)`** (T33) — top-of-body insert with
-  YAML frontmatter awareness; mirrors `append_to_page`'s
-  `dry_run` shape. **Blocked on T31a + T31b.**
+  if_match?, dry_run=False)`** (T33) — **SHIPPED 2026-08-30**.
+  Top-of-body insert with YAML frontmatter awareness;
+  mirrors `append_to_page`'s read-modify-write + `dry_run`
+  shape. Default `position="after_frontmatter"` inserts the
+  new content *between* the closing `---` of the frontmatter
+  block and the first body line (the human-meaningful
+  default for journal / daily-notes pages); `position="top"`
+  overrides for the rare absolute-top intent. Frontmatter
+  detection: a leading `---\n…\n---\n` block; malformed
+  frontmatter (opening fence but no close) is treated as
+  no-frontmatter.
 - **`search_pages(query, prefix?, limit?)`** (T34) — **SHIPPED
   2026-08-30**. Substring content search delegating to the
   existing journal machinery; journal-gated like
@@ -70,30 +96,50 @@ blocked on T31a + T31b; T31a / T31b / T35 are unblocked.
   for the full description.
 - **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
   wikilink-target backlinks for the rename-pre-flight workflow;
-  journal-gated. **Unaffected by T31.**
+  journal-gated. **SHIPPED 2026-08-30.** See
+  [§ Optional: journal surface](#optional-journal-surface-t10t12-t34-t35)
+  for the full description.
 - **256 KiB body-size cap on every write tool** (T36) —
-  `body_too_large` `ToolError` with the remediation hint before
-  the SB round trip. **Blocked on T31a + T31b** (T36 applies
-  to all write tools, including the ones T31b re-points at
-  the post-write verification helper — the cap and the
-  helper compose).
+  **SHIPPED 2026-08-30**. `body_too_large` `ToolError` with
+  the remediation hint *before* the SB round trip. Applies
+  to every write tool (`write_page`, `create_page`,
+  `prepend_to_page`, `append_to_page`, `patch_page_lines`,
+  `patch_page_replace`, `move_page`, `check_task`) on the
+  *caller-supplied* body — the cap fires before the read
+  step on read-modify-write tools, so the read isn't
+  wasted on a doomed write. Does NOT apply to the read
+  side (`read_page`, `list_pages`, `page_exists`,
+  `diff_pages`, `list_tasks`) or to the journal-discovery
+  tools. 256 KiB exactly is inclusive (boundary); 256 KiB
+  + 1 byte raises the cap. The cap composes with T31b's
+  verification helper — the cap is enforced before the
+  PUT, so a too-large body never reaches the re-read path.
 - **T31 verification** (resolved 2026-08-30, **negative**) —
   `tests/test_e2e_live_sb.py::test_if_match_stale_etag_returns_412`
   asserts that `If-Match: <stale_etag>` returns 412 on
   `PUT /.fs/{name}`. It does not: live SB silently overwrote
-  the page with `is_error=False`. Two follow-ups charted:
-  - **T31a** — synthesize a fallback etag from
-    `X-Last-Modified` + `X-Content-Length` when SB strips
-    `ETag` (`synthesize_etag(last_modified_ms, size_bytes)`
-    helper in `sb_client.py`; stable across reads of the same
-    body, drifts on different bodies).
-  - **T31b** — replace the `If-Match`-only path with a
-    post-write verification step (re-read after the PUT and
-    compare the new etag against `if_match`; raise
-    `ToolError("concurrent edit detected: ...")` on mismatch).
-    Threaded into `write_page`, `append_to_page`,
-    `patch_page_lines`, `patch_page_replace`, `move_page`,
-    `check_task`.
+  the page with `is_error=False`. Two follow-ups shipped:
+  - **T31a** — **SHIPPED 2026-08-30**. Synthesize a fallback
+    etag from `X-Last-Modified` + `X-Content-Length` when SB
+    strips `ETag` (`synthesize_etag(last_modified_ms,
+    size_bytes)` helper in `sb_client.py`; stable across
+    reads of the same body, drifts on different bodies).
+    The fallback is invisible to callers: the envelope shape
+    is unchanged; callers that read ``result.etag`` get a
+    synthesized value that threads into ``if_match`` exactly
+    the way a real etag would.
+  - **T31b** — **SHIPPED 2026-08-30**. Replaces the
+    `If-Match`-only path with a post-write verification
+    step (re-read after the PUT and compare the new etag
+    against `if_match`; raise `ToolError("concurrent edit
+    detected: ...")` on mismatch). Threaded into
+    `write_page`, `append_to_page`, `patch_page_lines`,
+    `patch_page_replace`, `move_page`, `check_task`,
+    `delete_page`. The 412 path remains primary on SBs that
+    honor `If-Match`; the helper is the fallback for SBs
+    that don't (cheaper re-read still wins on the happy path
+    because the verification matches; only the racy path
+    surfaces the new error).
 
 ### v1.2 wire-shape changes
 
@@ -212,17 +258,18 @@ for showing a human what the patch would change. The agent can
 choose to apply the patch by calling the tool again with
 `dry_run=False`, or surface the diff to the user for confirmation.
 
-## Optional: journal surface (T10–T12, T34)
+## Optional: journal surface (T10–T12, T34, T35)
 
 If the bridge process also has read access to the SB space directory
 (typical on the same machine that runs SilverBullet; rare behind a
-containerized split), five direct-FS read tools can be enabled:
+containerized split), six direct-FS read tools can be enabled:
 
 - `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`
 - `tag_summary(prefix?)` — count occurrences of every `tags:` value
 - `recent_pages(limit?, prefix?)` — newest pages by mtime
 - `pages_touching_topic(query, prefix?)` — case-insensitive name+content substring search; returns `{name, match, snippet}[]` where `match` is `"name"`, `"content"`, or `"both"` and `snippet` is an ~80-char window centered on the content match (or a body excerpt for name-only matches). Uses `rg --json` when `rg` is on `PATH`; falls back to a pure-Python substring scan otherwise.
 - `search_pages(query, prefix?, limit=20)` (T34) — bounded variant of `pages_touching_topic` with a `limit` knob (default 20, hard cap 100). Same `{name, match, snippet}` wire shape; same `rg` / Python-fallback split. The agent that wants the top N hits uses `search_pages`; the agent that wants an unbounded scan uses `pages_touching_topic`.
+- `find_backlinks(target) -> [{file, line, text}]` (T35) — scan every `*.md` page under the SB space directory for wikilink references to `target`; returns one entry per matching line. `file` is the relative path to the linking page, `line` is the 1-indexed editor line number, `text` is the stripped line content. Target normalization: leading/trailing slashes and a trailing `.md` are stripped before matching, so `Projects/Foo`, `Projects/Foo.md`, and `/Projects/Foo/` all match the same canonical target. Aliases (`[[target|alias]]`) match the bare target (the alias is the *display* text, not a different page). Self-links are returned (filter client-side). Empty / whitespace-only `target` raises `ToolError("target must not be empty")` upfront, before any FS walk. No matches returns `[]`, not a `ToolError` (the agent might be querying pre-emptively for a rename-pre-flight check). Hidden directories (`*.cache`, `.git`, …) are skipped. The walker is best-effort: a single unreadable page (binary content, permissions error) doesn't abort the scan.
 
 They are strictly additive: the `/.fs`-backed tools above continue to
 work whether the journal surface is on or off. Set both
@@ -295,10 +342,11 @@ The repo ships with a project-local `.mcp.json` so a Pi session
 running in this checkout discovers the bridge automatically (via the
 `pi-mcp-adapter` extension). After `python -m mcp_silverbullet` (or
 `nix run .#mcp-silverbullet`) is running on `127.0.0.1:8000`, run
-`/reload` in Pi and the bridge's twelve always-on tools — `read_page`,
-`page_exists`, `write_page`, `append_to_page`, `patch_page_lines`,
-`patch_page_replace`, `move_page`, `delete_page`, `list_pages`,
-`diff_pages`, `check_task`, `list_tasks` — register as direct Pi
+`/reload` in Pi and the bridge's fourteen always-on tools — `read_page`,
+`page_exists`, `write_page`, `create_page`, `append_to_page`,
+`prepend_to_page`, `patch_page_lines`, `patch_page_replace`,
+`move_page`, `delete_page`, `list_pages`, `diff_pages`,
+`check_task`, `list_tasks` — register as direct Pi
 tools. The journal surface (including `search_pages`) registers
 additionally when `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and
 `MCP_SILVERBULLET_SPACE_PATH` are both set.
@@ -339,7 +387,7 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_PORT` | `8000` | Bind port |
 | `MCP_SILVERBULLET_ALLOWED_HOSTS` | *(unset → SDK loopback default)* | Extra `Host` values, comma-separated |
 | `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface |
-| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the five journal tools above (T10–T12, T34); requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
+| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the six journal tools above (T10–T12, T34, T35); requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable |
 | `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages` (T28). Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. Partial failures (404 / 412 / 5xx / timeout on one page) leave that row's etag as `null` rather than failing the whole call. |
 
 Live pytest against a real space (T7): set `MCP_SILVERBULLET_LIVE_SB_URL`
