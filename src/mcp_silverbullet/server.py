@@ -190,6 +190,32 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         return etag
 
     @mcp.tool(
+        title="Delete page",
+        description=(
+            "Delete a SilverBullet page (hard delete; SB has no "
+            "trash layer). `if_match=\"*\"` requires the page to "
+            "exist; `if_match=<etag>` requires the body hash to "
+            "match. Returns the ETag of the deleted page so the "
+            "caller can confirm what was removed. 404-equivalent "
+            "ToolError if the page is missing."
+        ),
+    )
+    async def delete_page(
+        name: str,
+        if_match: str | None = None,
+    ) -> str | None:
+        try:
+            return await sb_client.delete_page(name, if_match=if_match)
+        except PageNotFound as exc:
+            raise ToolError(f"page not found: {name}") from exc
+        except PreconditionFailed as exc:
+            raise ToolError("precondition failed; check if_match/if_none_match") from exc
+        except ServerError as exc:
+            raise ToolError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise ToolError("silverbullet request timed out") from exc
+
+    @mcp.tool(
         title="List pages",
         description=(
             "List pages in the SilverBullet space, optionally filtered "

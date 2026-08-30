@@ -280,7 +280,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
 
                     tools = await session.list_tools()
                     tool_names = sorted(t.name for t in tools.tools)
-                    assert tool_names == ["list_pages", "read_page", "write_page"]
+                    assert tool_names == ["delete_page", "list_pages", "read_page", "write_page"]
 
                     call_result = await session.call_tool(
                         "read_page", {"name": "index"}

@@ -245,6 +245,134 @@ async def test_write_page_5xx_returns_tool_error() -> None:
     assert _text(result) == "Error executing tool write_page: silverbullet error: 502"
 
 
+# --- delete_page -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_page_returns_etag_on_200() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == "/.fs/index"
+        return httpx.Response(200, headers={"ETag": '"abc123"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("delete_page", {"name": "index"})
+
+    assert result.is_error is False
+    assert _text(result) == '"abc123"'
+
+
+@pytest.mark.asyncio
+async def test_delete_page_returns_null_when_etag_header_missing() -> None:
+    """A 200 with no ETag header → ``None``.
+
+    Mirror of :func:`test_write_page_returns_null_when_etag_header_missing`:
+    the wire shape is ``{"result": null}`` and any future refactor
+    that returns ``""`` would be a confusing type drift.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("delete_page", {"name": "index"})
+
+    assert result.is_error is False
+    assert result.structured_content == {"result": None}
+
+
+@pytest.mark.asyncio
+async def test_delete_page_forwards_if_match_star() -> None:
+    """``if_match="*"`` requires the page to exist; the bridge forwards ``If-Match: *`` verbatim.
+
+    Mirrors :func:`test_write_page_forwards_if_match` for the
+    delete path so a future refactor doesn't drop the parameter on
+    one tool but not the other.
+    """
+    seen_match: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_match.append(request.headers.get("If-Match", ""))
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "delete_page",
+            {"name": "index", "if_match": "*"},
+        )
+
+    assert result.is_error is False
+    assert seen_match == ["*"]
+
+
+@pytest.mark.asyncio
+async def test_delete_page_404_returns_tool_error_with_design_doc_wording() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("delete_page", {"name": "missing"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool delete_page: page not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_delete_page_412_with_if_match_star_returns_tool_error() -> None:
+    """``if_match=\"*\"`` on a missing page returns 412 (not 404) at the SB layer.
+
+    SB's semantics: ``\"*\"`` is *must exist*; a missing page is a
+    precondition failure, not a not-found. The bridge surfaces the
+    unified 412 ToolError wording so callers don't need to distinguish
+    “missing” from “stale etag” — they just got refused; they can
+    ``read_page`` to figure out which.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "delete_page", {"name": "missing", "if_match": "*"}
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+
+
+@pytest.mark.asyncio
+async def test_delete_page_412_with_stale_if_match_returns_tool_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "delete_page",
+            {"name": "index", "if_match": '"stale"'},
+        )
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+
+
+@pytest.mark.asyncio
+async def test_delete_page_5xx_returns_tool_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="bad gateway")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("delete_page", {"name": "anything"})
+
+    assert result.is_error is True
+    assert _text(result) == "Error executing tool delete_page: silverbullet error: 502"
+
+
 # --- list_pages --------------------------------------------------------
 
 

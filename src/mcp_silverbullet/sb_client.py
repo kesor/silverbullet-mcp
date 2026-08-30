@@ -6,10 +6,11 @@ outbound half of the bridge; ``server.py`` calls into it from inside the
 MCP tool handlers and translates the exceptions to ``ToolError`` for the
 MCP wire.
 
-Three entry points:
+Four entry points:
 
 - :func:`read_page` — ``GET /.fs/{name}``
 - :func:`write_page` — ``PUT /.fs/{name}``
+- :func:`delete_page` — ``DELETE /.fs/{name}``
 - :func:`list_pages` — ``GET /.fs``
 
 The status-code mapping lives in :func:`_raise_for_status` and matches
@@ -47,6 +48,18 @@ _WRITE_HEADERS = {
     # Bridge has read+write on the space; SB rejects writes without
     # `X-Permission: rw`.
     "X-Permission": "rw",
+}
+
+# DELETE only needs ``X-Source`` — the design doc § SilverBullet
+# client contract DELETE row lists ``X-Source: external`` and an
+# optional ``If-Match`` and nothing else. We deliberately do NOT
+# reuse ``_WRITE_HEADERS`` here: that constant adds ``X-Permission:
+# rw``, which PUTs need and DELETEs are not documented to require
+# (and a future SB that tightens DELETE-only behavior — e.g.,
+# gating on ``X-Permission: rdonly`` — won't be confused by an
+# unsolicited header).
+_DELETE_HEADERS = {
+    "X-Source": "external",
 }
 
 
@@ -209,6 +222,48 @@ class SBClient:
         response = await self._client.put(
             f"/.fs/{name}",
             content=content,
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return response.headers.get("ETag")
+
+    async def delete_page(
+        self,
+        name: str,
+        *,
+        if_match: str | None = None,
+    ) -> str | None:
+        """Delete ``/.fs/{name}``.
+
+        Parameters
+        ----------
+        name
+            Page name (the SB path segment after ``/.fs/``).
+        if_match
+            Optional ``If-Match`` value (``"*"`` to require existence,
+            or an ETag for an exact-body match). ``None`` (default)
+            means unconditional delete.
+
+        Returns
+        -------
+        str | None
+            The ETag of the page that was deleted, taken from the
+            response ``ETag`` header, or ``None`` if the response
+            didn't carry one. SB echoes the deleted body's ETag so
+            the caller can confirm what was removed (paired with
+            their own ``if_match`` if they plumbed one in).
+            ``None`` is the same “older / proxy-stripped” warning
+            as :meth:`write_page`: a contract drift worth logging.
+
+        Raises
+        ------
+        PageNotFound, PreconditionFailed, ServerError
+        """
+        headers = dict(_DELETE_HEADERS)
+        if if_match is not None:
+            headers["If-Match"] = if_match
+        response = await self._client.delete(
+            f"/.fs/{name}",
             headers=headers,
         )
         _raise_for_status(response)

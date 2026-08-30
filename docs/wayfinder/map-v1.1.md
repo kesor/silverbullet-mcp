@@ -45,12 +45,18 @@ journal surface (T10–T13) is unchanged.
 
 ### Status
 
-Tickets charted, all open. The frontier is the unblocked set:
-T18 (`delete_page`), T19 (`append_page`), T20 (`patch_page_lines`),
-T21 (`patch_page_replace`), T22 (`move_page`). T14–T17 from the
-original "tunnel-ready v1.1" chart are demoted to **Out of scope**
-— the operator decided CRUD is the priority; tunnel polish can
-wait for v1.2.
+T18 resolved (commit pending). Per the ticket-by-ticket
+blocking notes, T19 (`append_page`) and T22 (`move_page`)
+were the tickets that explicitly cited T18 as a blocker
+(T19 — shares the 404 ToolError shape; T22 — `delete_page`
+is the last step of move). With T18 closed, both are now
+takeable: the 404 wording convention is landed, and `sb_client
+.delete_page` is wired through to SB's `DELETE /.fs/...`.
+Pick up T19 next: it produces the read-modify-write
+boilerplate that T20 and T21 also build on. T20 and T21
+remain blocked on T19 (not on T18). T14–T17 from the
+original "tunnel-ready v1.1" chart remain demoted to
+**Out of scope**.
 
 ## Notes
 
@@ -69,13 +75,15 @@ wait for v1.2.
     edits without re-reading. (`write_page` already does this;
     the new tools keep the contract.)
   - **Every write tool honors `if_match`.** Defaults to `None`
-    (unconditional). When provided, the bridge fetches the page
-    first to learn the etag, then performs the write. This means
-    the atomicity story for the new tools is "read-then-write"
-    under one etag — not transactional, but good enough for
-    single-agent workflows and concurrent-agent protection
-    (the second agent's write fails with 412 if the first one
-    landed in between).
+    (unconditional). When provided, the bridge forwards the value
+    verbatim to SB's `If-Match` header (PUT or DELETE) and lets SB
+    enforce the precondition — the bridge does NOT auto-fetch the
+    page first. The atomicity story is "caller does the read,
+    threads the etag back into its own next call": a concurrent
+    agent's stale etag fails 412 at SB; the bridge doesn't
+    arbitrate between them. Good enough for single-agent workflows
+    and concurrent-agent protection (the second agent's write
+    fails with 412 if the first one landed in between).
   - **`replace_all=False` by default for find-and-replace.**
     Safety: the find string should be unique unless the caller
     says otherwise. When `False` and the find matches multiple
@@ -127,6 +135,51 @@ wait for v1.2.
   matches the documentation). New Layer-1 test guards the
   null-ETag case so a future refactor doesn't regress it.
   Test count: 97 pass + 2 skip (1 new test).
+- **T18. `delete_page(name, if_match?)`** (commit pending):
+  new MCP tool that wraps `DELETE /.fs/{name}` and brings the
+  bridge to four `/.fs`-backed tools. `sb_client.delete_page`
+  sends `X-Source: external` (the design-doc DELETE row's
+  documented envelope) and optional `If-Match` from a new
+  `_DELETE_HEADERS` constant — deliberately NOT reusing
+  `_WRITE_HEADERS`, because PUTs need `X-Permission: rw` and
+  DELETEs are not documented to require it; keeping the
+  constants separate means a future SB tightening DELETEs
+  won't be confused by an unsolicited header. Return shape
+  mirrors `write_page` (`str | None`): the SB response's
+  `ETag` (the deleted body's hash) echoes back so the caller
+  can confirm what got removed, or `None` if the proxy
+  stripped the header. New handler in `register_tools` maps
+  `PageNotFound` → `ToolError("page not found: {name}")`,
+  `PreconditionFailed` → `ToolError("precondition failed;
+  check if_match/if_none_match")`, `ServerError` /
+  `httpx.TimeoutException` per the existing shared wording.
+  412 + `if_match="*"` is the interesting SB-side semantic:
+  SB treats "*" as "must exist", so a missing page returns
+  412 (not 404) at the SB layer; the bridge surfaces both
+  with the unified 412 ToolError so callers don't need to
+  distinguish "missing" from "stale etag" — they just got
+  refused; they can `read_page` to figure out which. Two
+  412 surfaces covered in tests: `if_match="*"` and
+  `if_match=<stale_etag>`. 9 new Layer-3 tests in
+  `tests/test_sb_client.py` (round-trip + etag round-trip,
+  HTTP method, `if_match` *and etag* forward, no-ETag
+  → `None`, 404, 412 with `*`, 412 with stale, 5xx) + 7 new
+  Layer-1 tests in `tests/test_tools_in_memory.py` (200 +
+  etag, `None` round-trip, `if_match="*"` forward, 404
+  wording, 412 + `*` wording, 412 + stale wording, 5xx
+  wording). Also touched `tests/test_journal_gate.py`
+  (extended `SB_TOOL_NAMES` from 3 to 4 elements) and
+  `tests/test_http_auth.py` (sorted tool-names assertion
+  updated to include `delete_page`); both carry the prior
+  shape forward verbatim — no behavior change. **Drive-by**: corrected
+  the standing preference for `if_match` plumbing
+  ("the bridge forwards the value verbatim to SB… the
+  bridge does NOT auto-fetch the page first") — the
+  original wording suggested an auto-fetch dance that
+  neither `write_page` nor `delete_page` implements; the
+  caller's read-then-write-thread-etag pattern is the
+  real contract. Test count: 113 pass + 2 skip (+16).
+  `nix flake check` green.
 
 ## Tickets
 
@@ -145,8 +198,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: _(unclaimed)_
-> **Status**: open
+> **Assignee**: `minimax-m3`
+> **Status**: ✅ resolved (commit pending; see Decision above)
 > **Question**: How does the bridge expose `DELETE /.fs/{name}`?
 > **Context**: SB supports it directly; the bridge just doesn't
 > surface it. v1.1 adds the tool. Same `if_match` semantics as
@@ -177,6 +230,29 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > **Unblocks**: T19 (append uses delete + write for atomicity
 > if needed — T19 will decide), T22 (move uses delete on the
 > old_name after a successful write on new_name).
+>
+> **Resolution**: new method `SBClient.delete_page(name,
+> if_match=None) -> str | None` issues `DELETE /.fs/{name}`
+> with `_DELETE_HEADERS = {"X-Source": "external"}` (separable
+> from `_WRITE_HEADERS` — the design-doc DELETE row does not
+> list `X-Permission: rw`) and optional `If-Match`. Returns
+> the response `ETag` (echoed by SB so the caller can confirm
+> what got removed), or `None` if the response didn't carry
+> one (`str | None` mirrors `write_page`'s new typing). New
+> `@mcp.tool("Delete page")` handler in `register_tools`
+> translates `PageNotFound` → `ToolError("page not found:
+> {name}")`, `PreconditionFailed` → `ToolError("precondition
+> failed; check if_match/if_none_match")` (same wording as
+> `write_page`), `ServerError` / `httpx.TimeoutException`
+> per the existing shared wording. No `BodyTooLarge` branch:
+> DELETE has no body. 9 new Layer-3 tests + 7 new Layer-1
+> tests cover: 200 + etag, no-ETag `None` round-trip,
+> `if_match="*"` forward (and 412), `if_match=<stale_etag>`
+> (and 412), 404, 5xx. Plus two carry-forwards: extended
+> `SB_TOOL_NAMES` in `tests/test_journal_gate.py` from 3 to
+> 4 entries, and the sorted tool-list assertion in
+> `tests/test_http_auth.py`. Front-of-map Status block and
+> Decisions-so-far updated to record this.
 
 ---
 

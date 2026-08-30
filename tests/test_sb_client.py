@@ -246,6 +246,141 @@ async def test_write_page_raises_server_error_on_5xx() -> None:
             await sb.write_page("index", "body")
 
 
+# --- delete_page -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_page_round_trip_and_returns_etag() -> None:
+    """DELETE echoes the deleted page's ETag so the caller can confirm what was removed."""
+
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(200, headers={"ETag": '"abc123"'})
+
+    async with _client(handler) as sb:
+        etag = await sb.delete_page("index")
+
+    assert etag == '"abc123"'
+    # Design-doc DELETE row: ``X-Source: external``, optional If-Match.
+    # ``X-Permission: rw`` is intentionally NOT sent (it's a PUT-only
+    # invariant; reusing ``_WRITE_HEADERS`` would invite a future SB
+    # tightening DELETE to reject or differentiate on ``X-Permission``).
+    assert captured["x-source"] == "external"
+    assert "x-permission" not in {k.lower() for k in captured}
+    assert "if-match" not in {k.lower() for k in captured}
+
+
+@pytest.mark.asyncio
+async def test_delete_page_uses_delete_method() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    async with _client(handler) as sb:
+        await sb.delete_page("index")
+
+    assert seen == [("DELETE", "/.fs/index")]
+
+
+@pytest.mark.asyncio
+async def test_delete_page_forwards_if_match_star() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    async with _client(handler) as sb:
+        await sb.delete_page("index", if_match="*")
+
+    assert captured["if-match"] == "*"
+
+
+@pytest.mark.asyncio
+async def test_delete_page_forwards_if_match_etag() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    async with _client(handler) as sb:
+        await sb.delete_page("index", if_match='"v1"')
+
+    assert captured["if-match"] == '"v1"'
+
+
+@pytest.mark.asyncio
+async def test_delete_page_returns_none_when_etag_header_missing() -> None:
+    """A 200 with no ETag header (older SB / proxy-stripped) → ``None``.
+
+    Mirror of the write_page ``None`` contract so callers that chain
+    delete-after-write know what to expect. ``None`` is the same
+    ``str | None`` shape documented on :meth:`write_page`.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    async with _client(handler) as sb:
+        etag = await sb.delete_page("anything")
+
+    assert etag is None
+
+
+@pytest.mark.asyncio
+async def test_delete_page_raises_page_not_found_on_404() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="page not found")
+
+    async with _client(handler) as sb:
+        with pytest.raises(PageNotFound):
+            await sb.delete_page("missing")
+
+
+@pytest.mark.asyncio
+async def test_delete_page_raises_precondition_failed_on_412_with_star() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    async with _client(handler) as sb:
+        with pytest.raises(PreconditionFailed):
+            await sb.delete_page("anything", if_match="*")
+
+
+@pytest.mark.asyncio
+async def test_delete_page_raises_precondition_failed_on_412_with_stale_etag() -> None:
+    """``if_match=<stale_etag>`` must produce 412 (not 404).
+
+    Locks the layered semantics: SB distinguishes “the page exists
+    with a different body” (412, because the etag didn't match) from
+    “the page is missing” (404). A future refactor that maps 412 to
+    PageNotFound would silently swallow lost-update protections for
+    callers that pass an explicit etag.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    async with _client(handler) as sb:
+        with pytest.raises(PreconditionFailed):
+            await sb.delete_page("index", if_match='"stale"')
+
+
+@pytest.mark.asyncio
+async def test_delete_page_raises_server_error_on_5xx() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="bad gateway")
+
+    async with _client(handler) as sb:
+        with pytest.raises(ServerError):
+            await sb.delete_page("anything")
+
+
 # --- list_pages --------------------------------------------------------
 
 
