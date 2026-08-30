@@ -29,11 +29,11 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 ### 🏁 Status: destination shifted.
 
 T1–T8 resolved (a runnable bridge end-to-end). The user asked
-for a `search_pages` tool (by name and/or by content), which is
-out of v1 scope per T4 of the prior map; ticket T9 added to
-settle the trade-offs. The new destination is **the bridge +
-search_pages, with the implementation picked by the operator
-on T9**.
+for a `search_pages` tool (by name and content); ticket T9
+opened, hit shape settled (name + match + snippet per hit;
+case-insensitive substring query), implementation path still
+to grill on. The new destination is **the bridge +
+search_pages**.
 
 ## Notes
 
@@ -370,6 +370,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:grilling`
 > **Type**: HITL (operator picks the implementation)
+> **Assignee**: pi (claimed 2026-08-28, partial resolution in flight)
 > **Status**: open
 > **Question**: How does the bridge expose search — by name and/or by
 > content — given the prior map ruled out both naive approaches?
@@ -394,31 +395,41 @@ file; "blocking" is rendered by ticket ordering and an explicit
 >   indexes if SB builds them. But the prior map called `/.shell`
 >   "a rich and dangerous axis" and locked it out for v1.
 >
-> Two open design questions to settle on a grilling round before
+> Two design questions to settle on a grilling round before
 > implementation:
 >
-> 1. **Client-side vs Space Lua.** Pick one. Client-side is what the
+> 1. **Settled — shape (per operator, this turn):** *search by both
+>    page name and content*. The query is a single substring,
+>    case-insensitive; the tool returns one entry per page that
+>    matched in either the name or the body. A `name` field on the
+>    hit carries the page name; a `match: "name" | "content" |
+>    "both"` field tells the agent *which* leg of the search hit so
+>    it doesn't have to call `read_page` to find out. A `snippet`
+>    field with the matched body region (Markdown-shaped, ~80
+>    chars of context around the match) lets the agent quote the
+>    relevant text directly without a follow-on read. Net surface:
+>    `name: str, match: str, snippet: str` per hit. A `query: str`
+>    parameter is the only input.
+>
+> 2. **Still open — implementation path.** Client-side is what the
 >    prior map's `search_pages` ban was actually protecting against
 >    (it requires a working list endpoint), so unlocking it is a
 >    narrower scope change than opening Space Lua. Space Lua opens
 >    arbitrary SB-side scripting surface and re-decides T4 of the
->    prior map.
-> 2. **What does a hit look like?** `name` + line/offset range?
->    `name` + matched snippet (Markdown-shaped)? Just `name`? The
->    shape drives how Grok consumes the result and whether the
->    bridge can use the resource-template pattern (`silverbullet://page/{name}`)
->    as the natural follow-on read.
+>    prior map. The bridge isn't on the list-endpoint fix path
+>    yet, so client-side needs that work first.
 >
 > **Resolution will land on**: a new `@mcp.tool()` named
 > `search_pages`, with one parameter (`query: str`, plain string,
-> case-insensitive substring) and one return shape (decided by the
-> operator). Implementation either in `sb_client.py` (client-side,
-> blocking until the list endpoint is fixed) or as a new module
-> that hits `/.shell` (Space Lua, requires re-deciding T4 of the
-> prior map). Layer-1 + Layer-2 tests on the chosen path.
-> **Done when**: the operator has chosen (1) and (2); the chosen
-> shape is implementable end-to-end; tests cover the success +
-> empty-result + 404-from-SB paths.
+> case-insensitive substring) and one return shape (the
+> `name` / `match` / `snippet` triple decided above).
+> Implementation either in `sb_client.py` (client-side, blocking
+> until the list endpoint is fixed) or as a new module that hits
+> `/.shell` (Space Lua, requires re-deciding T4 of the prior map).
+> Layer-1 + Layer-2 tests on the chosen path.
+> **Done when**: the operator has chosen the implementation path;
+> the chosen shape is implementable end-to-end; tests cover
+> success + empty-result + 404-from-SB paths.
 > **Blocks on**: (none — destination milestone shifted by operator
 > request).
 
