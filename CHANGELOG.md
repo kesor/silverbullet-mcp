@@ -11,42 +11,134 @@ tickets; this file records what's already shipped.
 ## [Unreleased] — v1.3 (agent-grade discovery + edit hygiene)
 
 Build map: [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).
-**Status: T31a / T31b / T32 / T33 / T34 / T35 / T36 all open** —
-T31 closed **negatively** on 2026-08-30. The live SB on this
-dev box (`127.0.0.1:63000`, the build v1 T6 / v1.1 T22 / v1.2
-T7 / T30 all ran against) does NOT honor `If-Match` on
-`PUT /.fs/{name}` (the second write in the verification
-silently overwrote the page with `is_error=False`) AND does
-NOT return an `ETag` response header on PUT (every `write_page`
-envelope on this SB has `etag=null`). Two separate SB facts,
-both fatal to the v1.2 `If-Match` story. The bridge's plumbing
-is correct (the test proves `If-Match` reaches SB verbatim);
-what's missing is the SB-side contract.
+**Status: T31a / T31b / T32 / T33 / T34 / T35 / T36 shipped
+(2026-08-30); v1.3 destination reached** — T31 closed
+**negatively** on
+2026-08-30, prompting the T31a + T31b follow-ups that are
+now landed. T33 / T36 are unblocked.
 
-**Ticket split**:
+The live SB on this dev box (`127.0.0.1:63000`, the build v1
+T6 / v1.1 T22 / v1.2 T7 / T30 all ran against) does NOT
+honor `If-Match` on `PUT /.fs/{name}` (the second write in
+the T31 verification silently overwrote the page with
+`is_error=False`) AND does NOT return an `ETag` response
+header on PUT (every `write_page` envelope on this SB had
+`etag=null` pre-T31a). Two separate SB facts, both fatal to
+the v1.2 `If-Match` story. The bridge's plumbing is correct
+(T31's test proved `If-Match` reaches SB verbatim); what's
+missing is the SB-side contract. T31a + T31b fix the
+concurrency story at the bridge layer: synthetic-etag fallback
+gives the bridge something to thread into `If-Match` when SB
+strips `ETag`; post-write verification detects the stale-etag
+overwrite when SB returns 200 instead of 412.
 
-- **T31a** (unblocked, ready to claim) — synthetic-etag
-  fallback in `sb_client.py` so the bridge has something to
-  put in `If-Match` when SB strips `ETag`.
-- **T31b** (depends on T31a) — post-write verification
-  helper in `server.py` so the bridge detects stale-etag
-  overwrites when SB returns 200 instead of 412.
-- **T32** (depends on T31a + T31b) — `create_page` tool.
-- **T33** (depends on T31a + T31b) — `prepend_to_page` tool.
-- **T34** (unblocked, ready to claim) — `search_pages`
-  journal-gated discovery tool.
-- **T35** (unblocked, ready to claim) — `find_backlinks`
-  journal-gated discovery tool.
-- **T36** (depends on T31a + T31b) — 256 KiB body-size cap.
+**Ticket split** (post-T31 pivot):
+
+- **T31a** — **SHIPPED 2026-08-30**. Synthetic-etag fallback
+  in `sb_client.py`. New `synthesize_etag(last_modified_ms,
+  size_bytes)` helper; `_etag_from_response` calls it when
+  SB returns no `ETag`. Format `"{ms}-{bytes}"` (or `"{ms}"`
+  alone when only the timestamp header is populated; `None`
+  when both are stripped).
+- **T31b** — **SHIPPED 2026-08-30**. Post-write concurrency
+  verification helper in `server.py`. New
+  `_verify_concurrency_token(sb_client, name,
+  post_write_meta, expected_etag, dry_run=False)` re-reads
+  the page after a successful PUT and raises
+  `ToolError("concurrent edit detected: …")` when the
+  post-write etag differs from the caller's `if_match`.
+  Threaded into `write_page`, `append_to_page`,
+  `patch_page_lines`, `patch_page_replace`, `move_page`,
+  `check_task`, `delete_page`. The 412 path remains primary
+  on SBs that honor `If-Match`; the helper is the fallback
+  for SBs that don't.
+- **T32** — `create_page` tool. **SHIPPED 2026-08-30** (see
+  `### Added`).
+- **T33** — `prepend_to_page` tool. **SHIPPED 2026-08-30** (see
+  `### Added`).
+- **T34** — `search_pages` journal-gated discovery tool.
+  **SHIPPED 2026-08-30** (see `### Added`).
+- **T35** — `find_backlinks` journal-gated discovery tool.
+  **SHIPPED 2026-08-30** (see `### Added`).
+- **T36** — 256 KiB body-size cap. **SHIPPED 2026-08-30**
+  (see `### Added`).
 
 See [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md)
-for the full T31 resolution + the T31a / T31b charter. T32 /
-T33 / T35 / T36 are still in the Planned bucket below
-because they haven't landed yet; T34 shipped on 2026-08-30
-(see `### Added`).
+for the full T31 resolution + the T31a / T31b charter. All
+v1.3 tickets (T31a / T31b / T32 / T33 / T34 / T35 / T36)
+shipped on 2026-08-30 (see `### Added`); the v1.3
+destination is reached.
 
 ### Added
 
+- **Synthetic-etag fallback when SB strips `ETag`** (T31a) —
+  new `synthesize_etag(last_modified_ms, size_bytes)` helper
+  in `sb_client.py`; `_etag_from_response` (extracted from
+  `_meta_from_response`) calls it when SB's response has no
+  `ETag` header. Format: `"{last_modified_ms}-{size_bytes}"`
+  when both `X-Last-Modified` and `X-Content-Length` are
+  populated (the normal case on this SB build);
+  `"{last_modified_ms}"` alone when only the timestamp is
+  populated; `None` when both are stripped. The wire shape
+  is unchanged from the caller's perspective — `etag` is
+  still a string (or `null`); the bridge just has *some*
+  value to thread into `If-Match` on SBs that strip
+  `ETag`. Out of scope for `list_pages` (T28 already
+  documented `etag=null` on this SB build for list rows;
+  changing it would alter list behavior on SBs that omit
+  etags everywhere — `list_pages_hydrate_etags` already
+  exists for the per-page-fetch opt-in).
+
+  Migration: no caller action needed. The fallback is
+  invisible — a caller that threads `read.etag` into
+  `write(if_match=…)` gets the same flow on SBs that emit
+  a real `ETag` and on SBs that strip it; the envelope
+  shape is the same. The only difference is the wire-level
+  `If-Match` value sent to SB, which callers never see.
+- **Post-write concurrency verification on SBs that don't
+  honor `If-Match`** (T31b) — new
+  `_verify_concurrency_token(sb_client, name,
+  post_write_meta, expected_etag, dry_run=False)` helper
+  in `server.py`. After a successful 200 write that
+  threaded an etag through `if_match`, the helper
+  re-reads the page (`read_page_meta`, body skipped for
+  cheapness) and compares the post-write etag against
+  the one the caller passed. A mismatch raises
+  `ToolError("concurrent edit detected: the page
+  changed since you read it at {expected_etag}; read it
+  again and re-issue the write with the current etag")`.
+
+  Threaded into every write tool that takes a concrete
+  `if_match`: `write_page`, `append_to_page`,
+  `patch_page_lines`, `patch_page_replace`, `move_page`
+  (post-delete, lightweight — re-read 404s, no-op),
+  `check_task`, `delete_page` (same lightweight shape as
+  `move_page`). Read-modify-write tools now auto-thread
+  the read's etag into the write's `if_match` when the
+  caller passes `if_match=None`, so a concurrent edit
+  between read and write surfaces as the unified
+  concurrency error even without the caller managing an
+  etag round-trip.
+
+  The existing 412 path remains primary on SBs that
+  honor `If-Match` (cheaper, fires before the helper
+  runs); the helper is the fallback for SBs that don't
+  (which is this dev box, per T31's negative resolution).
+  `if_match="*"` and `if_match=None` opt out of the
+  verification (no value to compare against); `dry_run=True`
+  opts out (no write happened to verify). Re-read 404
+  (page deleted out-of-band post-write) and 5xx
+  (transient SB failure) both degrade gracefully — no
+  false-positive concurrency errors.
+
+  Migration: no caller action needed on the happy path.
+  Callers that previously saw silent overwrites on
+  writes with stale etags now see a clear `ToolError`
+  they can recover from with a fresh read + retry.
+  Callers that want to bypass the verification can pass
+  `if_match=None` (the helper no-ops) — but the v1.3
+  recommended pattern is to leave the auto-thread
+  enabled and let the helper handle races.
 - **`search_pages(query, prefix?, limit=20)`** (T34) — bounded
   substring content search over the SB space directory.
   Thin wrapper over the v1 `pages_touching_topic` machinery
@@ -77,71 +169,201 @@ because they haven't landed yet; T34 shipped on 2026-08-30
   bounded result list (the default v1.3 agent pattern). The
   unbounded `pages_touching_topic` stays available for the
   rarer "scan everything" case.
-
-### Planned
-
-- **Synthetic-etag fallback when SB strips `ETag`** (T31a) —
-  `synthesize_etag(last_modified_ms, size_bytes)` helper in
-  `sb_client.py`; `_meta_from_response` calls it when SB
-  returns no `ETag`. Format: `"{last_modified_ms}-{size_bytes}"`,
-  matching SB's quoted-etag format. Same envelope shape
-  (`etag` is just a string either way — callers don't see a
-  "synthesized vs real" flag). Local fallback only — never
-  round-trips to SB. Out of scope for `list_pages` (T28 already
-  documented `etag=null` on this SB build; changing it would
-  alter list behavior on SBs that omit etags everywhere).
-  **Unblocked** (T31 closed); unblocks T32/T33/T36 by giving
-  them something to put in `if_match`.
-- **Post-write concurrency verification on SBs that don't
-  honor `If-Match`** (T31b) — new
-  `_verify_concurrency_token(post_write_meta, expected_etag)`
-  helper in `server.py`; re-reads the page after a successful
-  PUT and raises `ToolError("concurrent edit detected: …")`
-  when the new etag differs from the caller's `if_match`.
-  Threaded into `write_page`, `append_to_page`,
-  `patch_page_lines`, `patch_page_replace`, `move_page`,
-  `check_task`. The existing 412 path still wins on SBs that
-  honor `If-Match` (cheaper); the helper is the fallback for
-  SBs that don't. **Depends on T31a** (needs the synthetic etag
-  to thread); **Unblocked** once T31a ships.
-- **`create_page(name, content, if_match?)`** (T32) — refuse to
-  overwrite as a first-class operation, distinct from
-  `write_page`'s overwrite-or-create default. Thin wrapper over
-  `write_page(if_match="*")`; translates the 412 path into a
-  clean `ToolError("page already exists: {name}; use write_page
-  to overwrite")`. Returns the T23 ack envelope on success.
-  **Blocked on T31a + T31b** (T31 closed negatively; T32's
-  `If-Match="*"` path now goes through the T31b post-write
-  verification helper instead of relying on SB's 412).
-- **`prepend_to_page(name, content, position="after_frontmatter"|"top",
-  if_match?, dry_run=False)`** (T33) — mirrors `append_to_page`'s
-  read-modify-write + `dry_run` shape but inserts at the top.
-  Default `position="after_frontmatter"` (the human-meaningful
-  case for journal / daily-notes pages with YAML frontmatter);
-  `position="top"` overrides for the rare absolute-top intent.
-  **Blocked on T31a + T31b** (same reason as T32).
-- **`search_pages(query, prefix?, limit?)`** (T34) — substring
-  content search. Thin wrapper over the v1
-  `pages_touching_topic` journal machinery; returns the same
-  `{name, snippet, match}` shape. Gated behind the journal
-  surface (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` +
-  `MCP_SILVERBULLET_SPACE_PATH`). **Unaffected by T31** —
-  read-only, doesn't thread `If-Match`.
 - **`find_backlinks(target) -> [{file, line, text}]`** (T35) —
   wikilink-target backlinks. Walks the SB space directory,
   scans every `*.md` for `[[target]]` / `[[target|alias]]`
-  references; returns one entry per match. Journal-gated.
-  **Unaffected by T31** — read-only.
-- **256 KiB body-size cap on every write tool** (T36) — local
-  cap applied before the PUT; surfaces
-  `ToolError("body too large: {size_bytes} bytes exceeds 256
-  KiB cap; chunk into append_to_page calls")` with the
-  remediation hint naming the right next tool. Does NOT apply
-  to read-side tools (`read_page`, `list_pages`, `page_exists`,
-  `diff_pages`, `list_tasks`) or the journal-discovery tools.
-  **Blocked on T31a + T31b** (T36 applies to all write tools,
-  including the ones T31b re-points at the post-write
-  verification helper — the cap and the helper compose).
+  references; returns one entry per matching line.
+  `{file, line, text}` wire shape (closest reference input:
+  `lidiaev/me-db`'s `find_backlinks`). `line` is 1-indexed
+  (matching `patch_page_lines` / editor conventions);
+  `text` is the stripped line content; `file` is the
+  relative path to the linking page. Target normalization:
+  leading/trailing slashes and a trailing `.md` are stripped
+  before matching, so `Projects/Foo`, `Projects/Foo.md`, and
+  `/Projects/Foo/` all match the same canonical target. The
+  alias (`|alias` suffix on `[[target|alias]]`) is stripped
+  before matching — the alias is the *display* text, not a
+  different page. Self-links are returned (filter
+  client-side); multiple references on one line collapse to
+  one entry (per-line granularity, matching the T12
+  snippet shape). Empty / whitespace-only `target` raises
+  `ToolError("target must not be empty")` upfront, before
+  any FS walk. No matches returns `[]`, not a `ToolError`
+  (the agent might be querying pre-emptively for a
+  rename-pre-flight check). The walker reuses T11/T12's
+  `_iter_md` (hidden-directory skip); unreadable pages
+  (binary content, permissions error) are skipped silently
+  so a single bad page doesn't abort the scan.
+
+  Migration: an agent that currently calls
+  `pages_touching_topic("[[Projects/Foo]]")` and pattern-
+  matches the result itself to find references now has a
+  first-class `find_backlinks(target)` tool. The new tool
+  is the rename-pre-flight workflow the T35 ticket was
+  chartered for: before renaming a page, the agent lists
+  every backlink to it (the lines that would need
+  `[[old_name]]` → `[[new_name]]` rewrites); the bridge
+  doesn't rewrite links on rename (that's a separate
+  `move_page`-related concern, also out of scope for v1.3
+  per the standing preference).
+- **`create_page(name, content)`** (T32) — refuse-to-overwrite
+  create tool, distinct from `write_page`'s overwrite-or-create
+  default. Thin wrapper over `write_page(if_match="*")` that
+  translates the 412 path into a clean
+  `ToolError("page already exists: {name}; use write_page to
+  overwrite")`. Same T23 ack envelope return shape as
+  `write_page`, so an agent that learns one shape has it for
+  both tools. `if_match="*"` is implied (no caller-controlled
+  precondition — agents that want write-with-precondition
+  call `write_page` directly; exposing `if_match` on
+  `create_page` would be a misuse-of-API footgun). Empty /
+  whitespace-only `name` raises `ToolError("name must not be
+  empty")` upfront, before any SB round trip. Other SB error
+  types (404 / 5xx / timeout) bubble through the standard
+  `_translate_sb_errors` path for the unified
+  `page not found: {name}` / `silverbullet error: {status}`
+  wording. The `if_match="*"` path opts out of T31b's
+  post-write verification helper per the helper's contract
+  (`expected_etag == "*": return`).
+
+  Documented limitation: on SBs that don't honor
+  `If-Match` (T31's negative finding on this dev box),
+  `create_page` silently overwrites an existing page —
+  the `If-Match: *` precondition isn't enforced at the SB
+  layer, so the bridge can't distinguish a successful
+  create from a successful overwrite. The honest wire
+  shape is one that maps cleanly to SBs that *do* honor
+  `If-Match`; the silent-overwrite case is a documented
+  limitation, not a hidden bug. A `T32a` follow-up could
+  close the gap with an `exists_page` round trip before
+  the PUT (extra cost on the happy path for a rare edge
+  case) or with a synthesized-etag precondition + T31b
+  verification (relies on T31a's synthetic-etag fallback
+  but doesn't fit `if_match="*"`'s "no etag to compare"
+  semantics cleanly). The T32 charter is the 412 →
+  `already_exists` translation only.
+
+  Migration: an agent that currently does the
+  three-step recipe (`page_exists` → `write_page(name,
+  content, if_match="*")` → handle-412-if-it-fired) now
+  has a one-step `create_page` tool with a clear
+  `already_exists` error message that names the right
+  next tool. The existing `page_exists` /
+  `write_page(if_match="*")` flow stays available — the
+  agent that wants explicit pre-flight checking (e.g.,
+  to log the existence decision before deciding to
+  create) keeps the v1.2 surface.
+- **`prepend_to_page(name, content,
+  position="after_frontmatter"|"top", if_match?,
+  dry_run=False)`** (T33) — top-of-body insert with YAML
+  frontmatter awareness. Mirrors `append_to_page`'s
+  read-modify-write + `dry_run` shape but inserts at
+  the top. Default `position="after_frontmatter"` —
+  inserts the new content *between* the closing `---`
+  of the frontmatter block and the first body line
+  (the human-meaningful default for journal /
+  daily-notes pages with YAML frontmatter; the new
+  content lands at the top of the *body*, not above
+  the frontmatter). `position="top"` overrides for the
+  rare absolute-top intent. For pages without
+  frontmatter, both positions produce the same splice
+  (new content at the absolute top).
+
+  Frontmatter detection: a leading `---\n…\n---\n`
+  block (LF). A page that opens with `---` but doesn't
+  close it (a malformed frontmatter block) is treated
+  as no-frontmatter — the new content lands at the
+  absolute top, same as a page with no frontmatter at
+  all. The same "raw text, no parser" pattern the
+  rest of the bridge uses; no YAML library is pulled
+  in. The new `_split_frontmatter_block` helper lives
+  in `server.py` (module-private; not exported) and
+  returns `(frontmatter_str_or_None, rest_str)` where
+  `None` is the canonical "no frontmatter" signal.
+
+  Concurrency story inherits from T31b: `if_match=None`
+  auto-threads the read's etag into the write's
+  precondition (a concurrent edit between read and
+  write surfaces as `ToolError("concurrent edit
+  detected: …")` via the T31b helper, even without the
+  caller managing an etag round-trip). Explicit
+  `if_match=<etag>` from the caller wins verbatim.
+  `dry_run=True` returns the T26 `{dry_run, original,
+  patched, diff}` preview without writing (the read
+  still happens, `if_match` is validated against the
+  read's etag, T31b's helper no-ops per its
+  `dry_run=True` short-circuit).
+
+  Errors: empty / whitespace-only `content` upfront
+  `ToolError("content must not be empty")`; unknown
+  `position` upfront `ToolError("position must be one
+  of: after_frontmatter, top")`; 412 on stale
+  `if_match` (standard wording); 404 on missing page
+  (standard wording); 413 on a body > 4 MiB (standard
+  wording). Returns the T23 ack envelope on success.
+
+  Migration: an agent that currently does the
+  five-step recipe (`read_page` → manually split the
+  frontmatter from the body → splice the new content
+  above the body → re-attach the frontmatter → write
+  it back) now has a one-step `prepend_to_page` tool
+  that handles the frontmatter-aware splice correctly.
+  The frontmatter-defaults-correctly invariant is the
+  single most common bug in the manual recipe (an
+  agent that prepends *above* the YAML block breaks
+  every frontmatter consumer on the page); the new
+  tool makes the default safe.
+- **256 KiB body-size cap on every write tool** (T36) —
+  uniform guardrail applied *before* the SB round trip
+  on every write tool (`write_page`, `create_page`,
+  `prepend_to_page`, `append_to_page`,
+  `patch_page_lines`, `patch_page_replace`,
+  `move_page`, `check_task`). Surfaces
+  `ToolError("body too large: {size_bytes} bytes exceeds
+  {cap} byte (256 KiB) cap; chunk into append_to_page
+  calls")` with the size, the cap, and the remediation
+  hint (matches `xmatthewx/silverbullet-mcp-server`'s
+  error wording). The cap is on the caller-supplied
+  body — ``len(body.encode("utf-8"))`` measurement,
+  UTF-8 byte count (multi-byte chars count as their
+  UTF-8 byte count, not codepoint count). 256 KiB
+  exactly is the inclusive boundary (256 KiB passes,
+  256 KiB + 1 byte fails). `move_page` is the one
+  exception: the cap fires on the source body the
+  bridge reads (because there's no caller-supplied
+  body on `move_page` — the destination write carries
+  the source body verbatim). `check_task` caps the
+  post-shaping body (the page with the bullet
+  flipped). Does NOT apply to read-side tools
+  (`read_page`, `list_pages`, `page_exists`,
+  `diff_pages`, `list_tasks`) or to the
+  journal-discovery tools (`pages_touching_topic` /
+  `search_pages` / `find_backlinks`).
+
+  The cap composes cleanly with T31b's post-write
+  verification helper: the cap fires *before* the
+  PUT, so a too-large body never reaches the T31b
+  re-read path (which runs only after a successful
+  write). On the dry-run path, the cap fires before
+  the read — no wasted FS walk on a doomed dry-run.
+
+  Migration: no caller action needed. The cap is a
+  uniform guardrail on every write tool; an agent
+  that accidentally writes 600 KB to a journal page
+  sees the clear `body too large` `ToolError` with
+  the remediation hint, rather than a deferred
+  failure at SB. The agent that wants to write a
+  large page chunks via `append_to_page` (each chunk
+  is capped at 256 KiB independently).
+  that handles the frontmatter-aware splice correctly.
+  The frontmatter-defaults-correctly invariant is the
+  single most common bug in the manual recipe (an
+  agent that prepends *above* the YAML block breaks
+  every frontmatter consumer on the page); the new
+  tool makes the default safe.
+
+### Planned
+
 - **T31 verification** (resolved 2026-08-30, **negative**):
   `tests/test_e2e_live_sb.py::test_if_match_stale_etag_returns_412`
   exercises a write → read × 2 → write with first-read etag →
