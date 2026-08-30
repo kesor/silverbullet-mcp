@@ -37,3 +37,4 @@ result-*
 # Tracks the user's local bridge URL and bearer-token path. Downstream
 # contributors create their own.
 .mcp.jsonresult/
+.mcp.json
