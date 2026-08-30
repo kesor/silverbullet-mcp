@@ -63,7 +63,10 @@ gated journal surface** (T10–T13).
     the prior map. `MCP_SILVERBULLET_TOKEN` (inbound) →
     `Authorization: Bearer <T>` (outbound).
   - **Three tools + one resource template** — locked at T4. No
-    `delete_page`, no `search_pages`, no Space Lua, no MCP Apps.
+    `delete_page`, no Space Lua templates (`silverbullet://lua/...`),
+    no MCP Apps. **`pages_touching_topic` (T12) is the
+    journal-surface search tool, not a `/.fs`-backed search tool**;
+    it lives behind the journal-tools gate (T10) and is read-only.
   - **Live-SB end-to-end test** is **env-gated** — both
     `MCP_SILVERBULLET_LIVE_SB_URL` and `MCP_SILVERBULLET_LIVE_SB_TOKEN`
     must be set, otherwise the test skips with a clear message.
