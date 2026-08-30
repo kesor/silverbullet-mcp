@@ -1324,11 +1324,17 @@ can't yet phrase precisely -->
   kanban bullets" workflow appears.
 - **Token-level / word-level diff** in `diff_pages` — v1.2 ships
   line-based; finer-grained diffing is a v1.3 refinement.
-- **Migration guide for clients pinned to v1.1 wire shapes** — when
-  v1.2 lands, the wire shape for every read/write tool changes; a
-  short CHANGELOG / migration note for downstream consumers (Grok,
-  `mcp` CLI users) is needed. Could be a T23 drive-by or its own
-  ticket if the migration gets non-trivial.
+- **Migration guide for clients pinned to v1.1 wire shapes** — T23
+  already lands one-line migration notes in `README.md` § v1.2
+  wire-shape changes for each of the read / write / list surfaces
+  (the `result.text` → `payload["etag"]` swap for write tools, the
+  `result.text` → `payload["body"]` swap for the read tool, the
+  `text/markdown` → `application/json` MIME-type flip on the
+  resource template, the `result["result"]` envelope widening for
+  `list_pages`), and the `CHANGELOG.md` Unreleased section lists
+  each ticket's breaking-change with the same migration note.
+  Considered done unless a downstream consumer surfaces a
+  shape that the per-ticket notes don't cover.
 
 ## Out of scope
 
