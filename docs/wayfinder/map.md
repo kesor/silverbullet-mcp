@@ -28,8 +28,9 @@ is `docs/design.md`. Open tickets resolve the **work**, not the design.
 
 ### 🏁 Status: in flight.
 
-Three of eight tickets resolved (T1, T2, T3). Frontier is T4
-(`verifier.py` + `server.py`), T5, T6, T7, T8.
+Four of eight tickets resolved (T1, T2, T3, T4). Frontier is T5
+(HTTP integration tests), T6 (operator smoke run + README), T7
+(live-SB end-to-end test), T8 (write-envelope fog).
 
 ## Notes
 
@@ -65,7 +66,15 @@ Three of eight tickets resolved (T1, T2, T3). Frontier is T4
     allows hosts via `MCP_SILVERBULLET_ALLOWED_HOSTS` (default
     `127.0.0.1`; operator extends with `<mcp>.local` or
     `<tunnel>.trycloudflare.com` when going through nginx or
-    Cloudflare). No code change needed when the day comes.
+    Cloudflare). No code change needed when the day comes. T5 will
+    verify the rendered shape against the v2.1.1 SDK's
+    `TransportSecuritySettings` (which exposes `allowed_hosts: list[str]`,
+    not the v1-era `host=...` kwarg the design doc shows).
+  - **`AuthSettings` requires both `issuer_url` and `resource_server_url`**
+    to enable the bearer-auth middleware. v1 points both at the
+    resource URL (no separate authz server); the discovery doc will
+    therefore advertise `authorization_servers=[<resource_url>]`.
+    T5 will verify the rendered shape on a real HTTP socket.
   - **MIT license**, matches the upstream SDK (T8 of the prior map).
 - **Operator environment on this dev box** (for the live-SB test):
   SilverBullet is on `127.0.0.1:63000` with no auth token in this
@@ -79,6 +88,7 @@ Three of eight tickets resolved (T1, T2, T3). Frontier is T4
 - [T1. Repo skeleton + pyproject.toml](#t1-repo-skeleton--pyprojecttoml) (commit `dd478`): package shell at `src/mcp_silverbullet/` with smoke entry point, `pyproject.toml` pinning `mcp==2.1.1` + `httpx2>=2.5.0` + Starlette + uvicorn (plus `pytest`/`pytest-asyncio`/`respx` as the test extra), stub `README.md` (T6 replaces), `uv.lock` resolved against Python 3.13. `uv sync` resolves 42 packages; `python -m mcp_silverbullet` prints hello and exits 0.
 - [T2. `flake.nix` (uv2nix + pinned commits)](#t2-flakenix-uv2nix--pinned-commits) (commit `9aabc`): `flake.nix` consumes `uv.lock` via `pyproject-nix/build-system-pkgs` + `uv2nix` (the actual API, NOT the design doc's pseudocode — see resolution); four inputs pinned via `flake.lock` to known commits (nixpkgs `56c02bc...`, pyproject.nix `1b14855...`, uv2nix `4b59ab...`, build-system-pkgs `90ffde...`, all 2026-08). Python interpreter pinned to `pkgs.python313` (3.13.15) so the runtime venv and `uv.lock` agree on wheels (nixpkgs's `pkgs.python3` had drifted to 3.14). `packages.${system}.default` builds `mcp-silverbullet-env` from `workspace.deps.default` (no pytest/editables); `devShells.${system}.default` uses `mkEditablePyprojectOverlay` + `workspace.deps.all` for live-source development; `checks.${system}.pytest` is the uv2nix `passthru.tests` pattern — overrides the `mcp-silverbullet` package to add a derivation that runs `pytest` against `lib.cleanSource ./.` (whole repo minus .venv). Runtime venv smoke (`mcp==2.1.1`, `httpx2==2.12.0`, `python -m mcp_silverbullet` → "hello from mcp-silverbullet") and `nix flake check` both green on `x86_64-linux`. The devShell required two `pyproject.toml` carry-forwards: a `dev` dependency-group containing `editables` (so `mkEditablePyprojectOverlay` includes it in `workspace.deps.all`), and `editables` listed in `[build-system] requires` (so hatchling's `build_editable` finds it at build time, not just at install time). 16 Layer-3 tests pass in both `nix flake check` and `nix develop`.
 - [T3. `sb_client.py` (httpx adapter for /.fs)](#t3-sb_clientpy-httpx-adapter-for-fs) (commit `de944`): outbound bridge half — `SBClient` with `read_page`/`write_page`/`list_pages` against SB's `/.fs/...`, typed exceptions (`PageNotFound`, `PreconditionFailed`, `BodyTooLarge`, `ServerError`) per the § Tools status-code table, `FileMeta` dataclass (name + etag only), `write_page` PUT carries `X-Source: external` + `X-Permission: rw` + explicit `Content-Type: text/markdown` (httpx2 doesn't auto-set it for `content=str`); `If-Match` / `If-None-Match: *` both wired, `if_match` wins if both are passed. 16 Layer-3 tests under `httpx.MockTransport` (no real SB), all green in 0.07s; T1 smoke unbroken. Write-envelope fog (T8) deliberately not resolved here — `write_page` only sends the two headers the design doc requires, the real-write attempt is what decides the rest.
+- [T4. `verifier.py` + `server.py` (the MCP tools)](#t4-verifierpy--serverpy-the-mcp-tools) (commit `845b9`): inbound half + tool wiring — `StaticTokenVerifier` (constant-time `hmac.compare_digest`, returns `AccessToken` with scopes `['notes:read', 'notes:write']`); `build_mcp(sb_client, *, token, resource_url)` factory returning an `MCPServer` with `AuthSettings(issuer_url=resource_url, resource_server_url=resource_url)` (no separate authz server, v1 honest about that); three `@mcp.tool()` handlers (`read_page`, `write_page` with `if_match`, `list_pages` with `prefix`); one `@mcp.resource()` template `silverbullet://page/{name}` returning `text/markdown`. SB exceptions map to MCP exceptions per the § Tools status-code table: 404 → `ToolError('page not found: {name}')` in tools, `ResourceNotFoundError` (SEP-2164, -32602) in the resource template; 412 → `ToolError('precondition failed; X-Client-Id seen')`; 413 → `ToolError('body too large: limit is 4 MiB')`; 5xx → `ToolError('silverbullet error: {status}')`; timeout → `ToolError('silverbullet request timed out')`. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport`, all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. v2.x carry-forwards noted in code: `MCPServer` (not `FastMCP`); `AuthSettings` requires both URLs (so we point both at the resource URL); `ToolError` from a tool handler is wire-level `is_error=True`, from a resource handler becomes `UnexpectedResourceError` → `MCPError` (so the resource template uses `ResourceError` shapes for the same message text).
 
 ## Tickets
 
@@ -161,7 +171,8 @@ file; "blocking" is rendered by ticket ordering and an explicit
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: claude (claimed 2026-08-27, resolving now)
+> **Assignee**: claude (claimed 2026-08-27, resolved same day)
+> **Status**: ✅ resolved (commit `845b9`)
 > **Question**: Implement the `StaticTokenVerifier` (10-line
 > `hmac.compare_digest` against `MCP_SILVERBULLET_TOKEN`) and the
 > `MCPServer` with three `@mcp.tool(...)` registrations
@@ -176,6 +187,7 @@ file; "blocking" is rendered by ticket ordering and an explicit
 > `413`; resource template returns `text/markdown`.
 > **Blocks on**: T3.
 > **Unblocks**: T5 (Layer 2 HTTP tests).
+> **Resolution**: see commit `845b9`. Three v2.x SDK carry-forwards worth flagging for future server work: (1) `MCPServer` is the v2.x name (not `FastMCP` — that was the v1-era name); (2) `AuthSettings` requires both `issuer_url` and `resource_server_url` to enable the bearer-auth middleware, so v1 points both at `resource_url` (no separate authz server per T2 of the prior map); (3) `ToolError` raised from a *tool* handler becomes a wire-level `is_error=True` content block (prefixed `"Error executing tool <name>: "`), while `ToolError` raised from a *resource* handler becomes `UnexpectedResourceError` → `MCPError` (a JSON-RPC protocol error) — so the resource template raises `ResourceNotFoundError` (SEP-2164, `-32602`) for 404 and `ResourceError` (`-32603`) for everything else, with the same message text. 15 Layer-1 tests under `Client(mcp)` in-memory + `httpx.MockTransport` (no real SB), all green in 1.08s; 31 tests total green; T1 smoke unbroken; `nix flake check` green. The T6 ticket now has the missing boot-piece (the `MCPServer` factory) — T6 will wire it into `main.py` and drive `nix run .#mcp-silverbullet` against the live SB.
 
 ---
 
