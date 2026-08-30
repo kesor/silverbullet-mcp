@@ -5,7 +5,8 @@ and MCP clients (Grok Custom Connectors, `mcp` CLI, …). The bridge is a
 side-car on loopback; it does not provision tunnels.
 
 Architecture and threat model: [`docs/design.md`](docs/design.md).
-Build map: [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
+Build map (v1, destination reached): [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
+v1.1 map (full CRUD + editing, in progress): [`docs/wayfinder/map-v1.1.md`](docs/wayfinder/map-v1.1.md).
 
 ## What it exposes
 
