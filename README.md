@@ -13,20 +13,55 @@ v1.2 map (agent-facing QOL + bullet primitives, eight open tickets): [`docs/wayf
 
 Eight tools and one resource template:
 
-- `read_page(name)` — markdown body
-- `write_page(name, content, if_match?)` — create/update; returns the new ETag
-- `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the new ETag
-- `patch_page_lines(name, start_line, end_line, new_content, if_match?)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the new ETag
-- `patch_page_replace(name, find, new_string, replace_all=False, if_match?)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the new ETag
-- `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the new page's ETag
-- `delete_page(name, if_match?)` — hard delete; returns the deleted page's ETag
-- `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA)
+- `read_page(name)` — markdown body (T24 will widen to a meta envelope)
+- `write_page(name, content, if_match?)` — create/update; returns `{name, etag, size_bytes, last_modified_ms, created_ms}` (T23 acknowledgement envelope, see [§ v1.2 wire-shape changes](#v12-wire-shape-changes))
+- `append_to_page(name, text, if_match?)` — read-modify-write append (one newline separator inserted unless the body already ends in one); returns the T23 ack envelope
+- `patch_page_lines(name, start_line, end_line, new_content, if_match?)` — replace lines `start_line..end_line` (1-indexed, inclusive) with `new_content`; pass `new_content=""` to delete a range; preserves the page's trailing newline if it had one; returns the T23 ack envelope
+- `patch_page_replace(name, find, new_string, replace_all=False, if_match?)` — literal substring replace (no regex); `replace_all=False` (the safe default) errors if `find` matches more than once, so a typo never silently mass-edits; returns the T23 ack envelope
+- `move_page(name, new_name, if_match?)` — rename a page (write-then-delete so a partial failure leaves the body at the new name); destination always refuses to overwrite (`If-None-Match: *`); returns the destination's T23 ack envelope (the same-name no-op returns the source's)
+- `delete_page(name, if_match?)` — hard delete; returns `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo timestamps / size per SB's contract)
+- `list_pages(prefix?)` — names + etags (sends `X-Sync-Mode: 1`; this is what SB 2.x needs to get JSON back from `GET /.fs` instead of a 307 to the SPA). T28 widens to the full meta shape.
 - `silverbullet://page/{name}` — same body as `read_page`, for attaching context
 
 Every write tool honors `if_match` (`"*"` to require existence,
 `<etag>` to require an exact body match, `None` for unconditional).
 Concurrent edits from two clients fail with a 412 — the second
 client's stale etag does not overwrite the first client's write.
+
+### v1.2 wire-shape changes
+
+v1.2 is a **breaking change** for any client pinned to the v1.1 wire
+shapes. Every write tool's return value widens from a bare ETag
+string (or `None` when SB stripped the header) to an envelope dict:
+
+```jsonc
+{
+  "name": "<page>",
+  "etag": "\"abc123\"",        // string with the surrounding quotes; null if stripped
+  "size_bytes": 1024,           // UTF-8 byte count of the just-written body
+  "last_modified_ms": 1700000000123,  // epoch ms; null if stripped
+  "created_ms": 1700000000000         // epoch ms; null if stripped
+}
+```
+
+The migration for v1.1 callers is one line: replace `etag = result.text`
+with `etag = result["result"]["etag"]` (or read
+`result["result"]["size_bytes"]` / `last_modified_ms` / `created_ms`
+to skip the follow-up read that v1.1 had to do to learn the same
+facts).
+
+`size_bytes` is always populated from the body the bridge just wrote
+(independent of whether SB echoed `X-Content-Length` back). The
+`last_modified_ms` / `created_ms` / `etag` fields fall back to `null`
+on a fully-stripped response (older SB / proxy), same shape as the
+prior `None` ETag handling. DELETE surfaces `size_bytes=None` and
+both timestamps as `None` because SB's DELETE response doesn't echo
+the `X-*` headers per the design doc § SilverBullet client contract.
+
+The seven write tools (`write_page`, `delete_page`, `append_to_page`,
+`patch_page_lines`, `patch_page_replace`, `move_page`) all return
+this same envelope. `list_pages` and `read_page` keep their v1.1
+shapes for v1.2-rc1; T28 and T24 widen them in the same map.
 
 Inbound MCP and outbound SilverBullet share one bearer secret by default.
 

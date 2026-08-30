@@ -26,6 +26,7 @@ import pytest
 from mcp_silverbullet.sb_client import (
     BodyTooLarge,
     FileMeta,
+    PageMeta,
     PageNotFound,
     PreconditionFailed,
     SBClient,
@@ -61,15 +62,94 @@ def _client(handler) -> SBClient:
 
 @pytest.mark.asyncio
 async def test_read_page_returns_body_on_200() -> None:
+    """``read_page`` returns ``PageMeta`` whose ``.body`` is the markdown text.
+
+    v1.1 returned ``str``; v1.2 T23 client-side change widens the
+    return to :class:`PageMeta` so the read-tool (T24) and the
+    write-tool (T23) share one envelope. The MCP ``read_page`` tool
+    still unwraps ``.body`` for v1.2-rc1; T24 widens the read tool
+    itself.
+    """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert request.url.path == "/.fs/index"
         return httpx.Response(200, text="# hello")
 
     async with _client(handler) as sb:
-        body = await sb.read_page("index")
+        page = await sb.read_page("index")
 
-    assert body == "# hello"
+    assert page.body == "# hello"
+    # No ``X-*`` headers in this response: every meta field except
+    # name + body is ``None``. The dataclass is a strict superset of
+    # the prior string return so a future T24 unwrap is a one-liner.
+    assert page.name == "index"
+    assert page.etag is None
+    assert page.size_bytes is None
+    assert page.last_modified_ms is None
+    assert page.created_ms is None
+
+
+@pytest.mark.asyncio
+async def test_read_page_extracts_meta_from_response_headers() -> None:
+    """``X-*`` headers from SB's GET response populate :class:`PageMeta`.
+
+    Locks the T23 client-side contract: every documented header on
+    the design doc § SilverBullet client contract GET row
+    (``ETag`` / ``X-Created`` / ``X-Last-Modified`` /
+    ``X-Content-Length``) is extracted into the matching
+    :class:`PageMeta` field. A future refactor that drops one of the
+    three ``X-*`` headers would silently leave the agent's view of
+    the page incomplete; this test fails loudly so the regression
+    is caught at CI.
+    """
+    headers = {
+        "ETag": '"abc123"',
+        "X-Created": "1700000000000",
+        "X-Last-Modified": "1700000000123",
+        "X-Content-Length": "42",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="# hello", headers=headers)
+
+    async with _client(handler) as sb:
+        page = await sb.read_page("index")
+
+    assert page.etag == '"abc123"'
+    assert page.created_ms == 1700000000000
+    assert page.last_modified_ms == 1700000000123
+    assert page.size_bytes == 42
+    assert page.body == "# hello"
+
+
+@pytest.mark.asyncio
+async def test_read_page_tolerates_non_numeric_x_meta_headers() -> None:
+    """Malformed ``X-*`` headers become ``None``, not ``ValueError``.
+
+    Defensive parse: a misconfigured proxy that substitutes a
+    non-numeric string for ``X-Created`` shouldn't crash the read.
+    The field becomes ``None`` — same shape as a missing header —
+    so an agent always sees ``int | None`` and never has to handle
+    a parse error.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Created": "not-a-number",
+                "X-Last-Modified": "1700000000123",
+                "X-Content-Length": "also-not-a-number",
+            },
+        )
+
+    async with _client(handler) as sb:
+        page = await sb.read_page("index")
+
+    assert page.created_ms is None  # malformed → None
+    assert page.last_modified_ms == 1700000000123
+    assert page.size_bytes is None  # malformed → None
+    assert page.body == "body"
 
 
 @pytest.mark.asyncio
@@ -97,16 +177,42 @@ async def test_read_page_raises_server_error_on_5xx() -> None:
 
 @pytest.mark.asyncio
 async def test_write_page_round_trip_body_and_returns_etag() -> None:
+    """``write_page`` returns :class:`PageMeta` with the response ``ETag``.
+
+    v1.1 returned ``str | None`` (the raw ETag); v1.2 T23 widens the
+    return to :class:`PageMeta` with ``name``, ``etag``,
+    ``size_bytes`` (always populated from the *request* body byte
+    count — see :func:`test_write_page_size_bytes_from_request_body`),
+    ``last_modified_ms``, ``created_ms``. Locks the response-side
+    extraction: when SB echoes ``X-Last-Modified`` / ``X-Created``
+    back, those surface as integers on the meta.
+    """
     captured: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.update(request.headers)
-        return httpx.Response(200, headers={"ETag": '"abc123"'})
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Created": "1700000000000",
+            },
+        )
 
     async with _client(handler) as sb:
-        etag = await sb.write_page("index", "# new body")
+        meta = await sb.write_page("index", "# new body")
 
-    assert etag == '"abc123"'
+    assert isinstance(meta, PageMeta)
+    assert meta.name == "index"
+    assert meta.etag == '"abc123"'
+    assert meta.last_modified_ms == 1700000000123
+    assert meta.created_ms == 1700000000000
+    # ``size_bytes`` is from the request body byte count (always
+    # populated), not the response ``X-Content-Length`` — see
+    # :func:`test_write_page_size_bytes_from_request_body` for the
+    # detailed rationale.
+    assert meta.size_bytes == 10
     assert captured["x-source"] == "external"
     assert captured["x-permission"] == "rw"
     assert captured["content-type"] == "text/markdown"
@@ -117,6 +223,55 @@ async def test_write_page_round_trip_body_and_returns_etag() -> None:
     # ``X-Content-Length`` is the UTF-8 byte count of the body,
     # matching SB's ``meta.size`` (``# new body`` = 10 bytes).
     assert captured["x-content-length"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_write_page_size_bytes_from_request_body() -> None:
+    """``size_bytes`` is the request-body UTF-8 byte count, not the response.
+
+    The bridge threads ``size_bytes`` from the body it *wrote*
+    (``len(content.encode("utf-8"))``) so the field is always
+    populated on a successful write — independent of whether the
+    proxy / SB echoes ``X-Content-Length`` back. An agent that asks
+    "how big is the page now?" gets the size of what it just wrote,
+    which matches SB's view even when the response header is stripped.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No response-side X-Content-Length — emulate a proxy-stripped
+        # response.
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    body = "héllo"  # 5 codepoints, 6 UTF-8 bytes
+    async with _client(handler) as sb:
+        meta = await sb.write_page("index", body)
+
+    assert meta.size_bytes == 6
+
+
+@pytest.mark.asyncio
+async def test_write_page_meta_is_none_when_response_headers_stripped() -> None:
+    """Older SB / proxy-stripped response → meta fields ``None`` where applicable.
+
+    Mirrors the v1.1 None-ETag stance for the full meta envelope:
+    every documented response header that the proxy drops becomes
+    ``None`` rather than fabricated. ``size_bytes`` is the only
+    exception — it's always populated from the request body (the
+    byte count we just wrote).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No ``X-*`` headers, no ``ETag`` — emulate the v1.1
+        # proxy-stripped response that originally motivated the
+        # ``None`` handling.
+        return httpx.Response(200)
+
+    async with _client(handler) as sb:
+        meta = await sb.write_page("index", "body")
+
+    assert meta.etag is None
+    assert meta.last_modified_ms is None
+    assert meta.created_ms is None
+    # ``size_bytes`` is still populated (request-side derivation).
+    assert meta.size_bytes == 4
 
 
 @pytest.mark.asyncio
@@ -251,7 +406,15 @@ async def test_write_page_raises_server_error_on_5xx() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_page_round_trip_and_returns_etag() -> None:
-    """DELETE echoes the deleted page's ETag so the caller can confirm what was removed."""
+    """DELETE echoes the deleted page's ETag so the caller can confirm what was removed.
+
+    v1.2 T23 widens the return to :class:`PageMeta`; the etag is
+    ``meta.etag`` and the size / timestamp fields are ``None`` per
+    the design doc DELETE row (no ``X-*`` meta carried on DELETE
+    responses). An agent that wants the timestamps of what it just
+    deleted reads the page first and threads them through the
+    ``if_match`` precondition.
+    """
 
     captured: dict[str, str] = {}
 
@@ -260,9 +423,15 @@ async def test_delete_page_round_trip_and_returns_etag() -> None:
         return httpx.Response(200, headers={"ETag": '"abc123"'})
 
     async with _client(handler) as sb:
-        etag = await sb.delete_page("index")
+        meta = await sb.delete_page("index")
 
-    assert etag == '"abc123"'
+    assert meta.etag == '"abc123"'
+    assert meta.name == "index"
+    # DELETE doesn't echo ``X-*`` per the design doc; the bridge
+    # surfaces ``None`` rather than fabricating.
+    assert meta.size_bytes is None
+    assert meta.last_modified_ms is None
+    assert meta.created_ms is None
     # Design-doc DELETE row: ``X-Source: external``, optional If-Match.
     # ``X-Permission: rw`` is intentionally NOT sent (it's a PUT-only
     # invariant; reusing ``_WRITE_HEADERS`` would invite a future SB
@@ -316,20 +485,25 @@ async def test_delete_page_forwards_if_match_etag() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_page_returns_none_when_etag_header_missing() -> None:
-    """A 200 with no ETag header (older SB / proxy-stripped) → ``None``.
+    """A 200 with no ETag header (older SB / proxy-stripped) → ``meta.etag is None``.
 
     Mirror of the write_page ``None`` contract so callers that chain
-    delete-after-write know what to expect. ``None`` is the same
-    ``str | None`` shape documented on :meth:`write_page`.
+    delete-after-write know what to expect. The Meta envelope shape
+    stays stable — every meta field except ``name`` becomes ``None``
+    on a fully-stripped response.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200)
 
     async with _client(handler) as sb:
-        etag = await sb.delete_page("anything")
+        meta = await sb.delete_page("anything")
 
-    assert etag is None
+    assert meta.etag is None
+    assert meta.size_bytes is None
+    assert meta.last_modified_ms is None
+    assert meta.created_ms is None
+    assert meta.name == "anything"
 
 
 @pytest.mark.asyncio

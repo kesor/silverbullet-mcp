@@ -3,9 +3,15 @@
 Locked at T4 of the prior map (three ``/.fs``-backed tools) and grown
 by v1.1: T18 added ``delete_page``, T19 added ``append_to_page``,
 T20 added ``patch_page_lines``, T21 added ``patch_page_replace``,
-T22 added ``move_page``. Today the bridge registers eight
-``/.fs``-backed tools (``read_page`` / ``write_page`` /
-``delete_page`` / ``append_to_page`` / ``patch_page_lines`` /
+T22 added ``move_page``. v1.2's T23 widens every write tool's
+return type from ``str | None`` (the new ETag) to a
+:class:`PageMeta` acknowledgement envelope so an agent that just
+made a write knows ``size_bytes`` / ``last_modified_ms`` /
+``created_ms`` without a follow-up read. T24 (next ticket) widens
+the read-side tool shape to match. T28 widens ``list_pages``. The
+bridge still registers eight ``/.fs``-backed tools
+(``read_page`` / ``write_page`` / ``delete_page`` /
+``append_to_page`` / ``patch_page_lines`` /
 ``patch_page_replace`` / ``move_page`` / ``list_pages``) plus one
 resource template (``silverbullet://page/{name}``). Each tool
 closes over a single :class:`SBClient` opened at boot; SB's typed
@@ -13,7 +19,7 @@ exceptions translate to :mcp_exc:`ToolError` with the exact wording
 from ``docs/design.md`` § Tools § Status-code mapping, all funneled
 through :func:`_translate_sb_errors`.
 
-T10 of the current map adds an optional, gated journal surface
+T10 of the v1.1 map adds an optional, gated journal surface
 (``journal_histogram`` / ``tag_summary`` / ``recent_pages`` /
 ``pages_touching_topic``) that reads the SB space directory directly.
 The gate is opt-in: ``build_mcp(..., journal=JournalConfig(enabled=True,
@@ -23,8 +29,10 @@ template. See :mod:`mcp_silverbullet.journal` for the gate logic.
 
 See ``docs/design.md`` § Tools for the tool surface, § SilverBullet
 client contract for the SB-side status codes, and
-``docs/wayfinder/map.md`` (v1) / ``docs/wayfinder/map-v1.1.md`` (v1.1)
-for the T3/T4/T10/T18/T19/T20/T21 decisions this implements.
+``docs/wayfinder/map.md` (v1) / ``docs/wayfinder/map-v1.1.md` (v1.1)
+for the T3/T4/T10/T18/T19/T20/T21 decisions this implements. The
+v1.2 build map at ``docs/wayfinder/map-v1.2.md` tracks the
+agent-facing QOL tickets (T23 done; T24/T28 next).
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ from mcp_silverbullet.journal import JournalConfig, register_journal_tools
 from mcp_silverbullet.sb_client import (
     BodyTooLarge,
     FileMeta,
+    PageMeta,
     PageNotFound,
     PreconditionFailed,
     SBClient,
@@ -117,6 +126,37 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
         raise ToolError(str(exc)) from exc
     except httpx.TimeoutException as exc:
         raise ToolError("silverbullet request timed out") from exc
+
+
+def _write_meta_to_payload(meta: PageMeta) -> dict[str, object]:
+    """Project a :class:`PageMeta` down to the T23 write-tool wire shape.
+
+    T23's wire shape is ``{name, etag, size_bytes, last_modified_ms,
+    created_ms}`` (no ``body`` — writes return meta only). The
+    underlying :class:`PageMeta` carries the same fields plus an
+    optional ``body`` (set on reads; ``None`` on every write); this
+    helper subsets it to the v1.2 write-side wire contract so the
+    MCP SDK's structured-content serializer doesn't accidentally
+    include the body field on write returns. ``body`` is omitted
+    rather than serialized as ``None`` so the wire stays clean
+    (the SDK doesn't add stray ``None`` keys for unset fields and
+    a future migration that drops ``body`` from :class:`PageMeta`
+    entirely doesn't leave a dead ``body: null`` field on every
+    write response).
+
+    Centralizing this here (rather than inlining ``dataclasses.
+    asdict(meta)`` with a manual ``body`` pop in every handler)
+    keeps the field subset in one place — T28 widens the read-side
+    shape and T29/T30 add bullet primitives, all of which go
+    through this same helper or a sibling.
+    """
+    return {
+        "name": meta.name,
+        "etag": meta.etag,
+        "size_bytes": meta.size_bytes,
+        "last_modified_ms": meta.last_modified_ms,
+        "created_ms": meta.created_ms,
+    }
 
 
 def _split_body_lines(body: str) -> tuple[list[str], bool]:
@@ -267,35 +307,45 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         title="Read page",
         description=(
             "Read the raw markdown body of a SilverBullet page. "
-            "Returns 404-equivalent ToolError if the page is missing."
+            "Returns 404-equivalent ToolError if the page is missing. "
+            "v1.2 T23 keeps the read tool returning the body string "
+            "(the write-tool wire shape is the breaking change); T24 "
+            "widens this to `{body, etag, size_bytes, last_modified_ms}` "
+            "matching the write-tool envelope."
         ),
     )
     async def read_page(name: str) -> str:
         async with _translate_sb_errors(name):
-            return await sb_client.read_page(name)
+            # Unwrap the body's ``.body`` so the MCP tool's wire
+            # shape stays ``str`` for T23 (T24 widens it). The
+            # underlying client now returns :class:`PageMeta`
+            # because T23 needs the same envelope on the write side
+            # and T24's read-side widening is a one-liner from here.
+            page = await sb_client.read_page(name)
+        return page.body or ""
 
     @mcp.tool(
         title="Write page",
         description=(
             "Create or update a SilverBullet page. `if_match=\"*\"` "
             "requires the page to exist; `if_match=<etag>` requires "
-            "the body hash to match. Returns 412-equivalent ToolError "
-            "on precondition failure, 413 on body > 4 MiB."
+            "the body hash to match. Returns the write "
+            "acknowledgement `{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}` so the caller can chain "
+            "edits without a follow-up read (T23). 412-equivalent "
+            "ToolError on precondition failure, 413 on body > 4 MiB."
         ),
     )
     async def write_page(
         name: str,
         content: str,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         async with _translate_sb_errors(name):
-            etag = await sb_client.write_page(
+            meta = await sb_client.write_page(
                 name, content, if_match=if_match
             )
-        # ``write_page`` returns ``None`` when the SB response didn't
-        # carry an ETag (older or proxy-stripped); surface that as the
-        # JSON ``null`` rather than mangling the type.
-        return etag
+        return _write_meta_to_payload(meta)
 
     @mcp.tool(
         title="Delete page",
@@ -303,17 +353,23 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "Delete a SilverBullet page (hard delete; SB has no "
             "trash layer). `if_match=\"*\"` requires the page to "
             "exist; `if_match=<etag>` requires the body hash to "
-            "match. Returns the ETag of the deleted page so the "
-            "caller can confirm what was removed. 404-equivalent "
-            "ToolError if the page is missing."
+            "match. Returns the write acknowledgement `{name, "
+            "etag, size_bytes=None, last_modified_ms=None, "
+            "created_ms=None}` (T23) — DELETE doesn't echo the "
+            "body length or timestamps per the design doc, so "
+            "those fields are `None`. The ETag (when present) "
+            "echoes the deleted body's hash so the caller can "
+            "confirm what was removed. 404-equivalent ToolError "
+            "if the page is missing."
         ),
     )
     async def delete_page(
         name: str,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         async with _translate_sb_errors(name):
-            return await sb_client.delete_page(name, if_match=if_match)
+            meta = await sb_client.delete_page(name, if_match=if_match)
+        return _write_meta_to_payload(meta)
 
     @mcp.tool(
         title="Append to page",
@@ -327,20 +383,21 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "so `append_to_page(name, \"\\nworld\")` against a body "
             "of `\"hello\"` produces `\"hello\\n\\nworld\"` (one "
             "separator from the tool, one from the caller). Returns "
-            "the new ETag so the caller can chain edits without "
-            "re-reading. `if_match=\"*\"` requires the page to exist; "
-            "`if_match=<etag>` requires the body hash to match "
-            "(protects against concurrent appends landing out of "
-            "order). 404-equivalent ToolError if the page is "
-            "missing; 412 if the precondition fails; 413 if the "
-            "combined body exceeds 4 MiB."
+            "the write acknowledgement `{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}` so the caller can chain "
+            "edits without a follow-up read (T23). `if_match=\"*\"` "
+            "requires the page to exist; `if_match=<etag>` requires "
+            "the body hash to match (protects against concurrent "
+            "appends landing out of order). 404-equivalent ToolError "
+            "if the page is missing; 412 if the precondition fails; "
+            "413 if the combined body exceeds 4 MiB."
         ),
     )
     async def append_to_page(
         name: str,
         text: str,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         # An empty append is almost certainly a caller bug (the
         # caller meant to write something and forgot to fill it in);
         # surface it loudly upfront so the read-modify-write round
@@ -350,15 +407,16 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         if not text:
             raise ToolError("text must not be empty")
         async with _translate_sb_errors(name):
-            body = await sb_client.read_page(name)
+            body = (await sb_client.read_page(name)).body or ""
             new_body = (
                 body + "\n" + text
                 if body and not body.endswith("\n")
                 else body + text
             )
-            return await sb_client.write_page(
+            meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
+        return _write_meta_to_payload(meta)
 
     @mcp.tool(
         title="Patch page (lines)",
@@ -377,12 +435,13 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "`if_match=\"*\"` requires the page to exist; "
             "`if_match=<etag>` requires the body hash to match "
             "(the same read-modify-write contract as "
-            "`append_to_page`). Returns the new ETag. "
-            "`start_line < 1`, `end_line < start_line`, and "
-            "`end_line` past the last line all raise `ToolError` "
-            "with the page's line count; 404 if the page is "
-            "missing; 412 if the precondition fails; 413 if the "
-            "patched body exceeds 4 MiB."
+            "`append_to_page`). Returns the write acknowledgement "
+            "`{name, etag, size_bytes, last_modified_ms, "
+            "created_ms}` (T23). `start_line < 1`, `end_line < "
+            "start_line`, and `end_line` past the last line all "
+            "raise `ToolError` with the page's line count; 404 if "
+            "the page is missing; 412 if the precondition fails; "
+            "413 if the patched body exceeds 4 MiB."
         ),
     )
     async def patch_page_lines(
@@ -391,7 +450,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         end_line: int,
         new_content: str,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         # Cheap, no-read input validation first: a non-positive
         # start_line or an inverted range can't be helped by reading
         # the page (line_count is undefined until then), so the
@@ -413,7 +472,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
                 f"end_line ({end_line}) must be >= start_line ({start_line})"
             )
         async with _translate_sb_errors(name):
-            body = await sb_client.read_page(name)
+            page = await sb_client.read_page(name)
+            body = page.body or ""
             lines, had_trailing_newline = _split_body_lines(body)
             line_count = len(lines)
             if end_line > line_count:
@@ -431,9 +491,10 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             # trailing newline either way.
             if had_trailing_newline and new_body:
                 new_body += "\n"
-            return await sb_client.write_page(
+            meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
+        return _write_meta_to_payload(meta)
 
     @mcp.tool(
         title="Patch page (replace)",
@@ -456,9 +517,10 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "`if_match=<etag>` requires the body hash to match "
             "(same read-modify-write contract as "
             "`append_to_page` and `patch_page_lines`). Returns the "
-            "new ETag. 404 if the page is missing; 412 if the "
-            "precondition fails; 413 if the patched body exceeds "
-            "4 MiB."
+            "write acknowledgement `{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}` (T23). 404 if the page "
+            "is missing; 412 if the precondition fails; 413 if the "
+            "patched body exceeds 4 MiB."
         ),
     )
     async def patch_page_replace(
@@ -467,7 +529,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         new_string: str,
         replace_all: bool = False,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         # Cheap, no-read input validation first. ``find == ""`` would
         # match between every character (``"abc".replace("", "X")``
         # is ``"XaXbXcX"``) — almost certainly a caller bug, not
@@ -478,7 +540,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         if not find:
             raise ToolError("find must not be empty")
         async with _translate_sb_errors(name):
-            body = await sb_client.read_page(name)
+            page = await sb_client.read_page(name)
+            body = page.body or ""
             occurrences = body.count(find)
             if occurrences == 0:
                 raise ToolError("find not found in body")
@@ -495,9 +558,10 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             new_body = body.replace(
                 find, new_string, -1 if replace_all else 1
             )
-            return await sb_client.write_page(
+            meta = await sb_client.write_page(
                 name, new_body, if_match=if_match
             )
+        return _write_meta_to_payload(meta)
 
     @mcp.tool(
         title="Move page",
@@ -520,24 +584,27 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             "merged) → delete_page(name)` themselves if they wanted "
             "that. `name == new_name` is a no-op that verifies "
             "existence via a read (no write/delete round trip) and "
-            "returns `None` for the etag (`read_page` doesn't surface "
-            "one); the `if_match` precondition is not honored in "
-            "this branch because there's no delete to guard and "
+            "returns the page's full acknowledgement envelope (T23). "
+            "The `if_match` precondition is not honored in this "
+            "branch because there's no delete to guard and "
             "`read_page` doesn't accept a precondition — callers "
             "that need to verify the etag on a same-name no-op "
             "should chain `write_page(name, body, if_match=\"<etag>\")` "
-            "themselves. Returns the new page's ETag on success. "
-            "Errors: 404-equivalent ToolError if the source is "
-            "missing (`page not found: {name}`), 412 from the "
-            "destination write surfaces as `destination page already "
-            "exists: {new_name}; refusing to overwrite` (clearer "
-            "than the generic 412 wording because the source and "
-            "destination are different pages — the caller needs to "
-            "know which side refused), 412 from the source delete "
-            "after a successful destination write surfaces as "
-            "`moved body to {new_name} but failed to delete {name}: "
-            "<reason>; both now exist` so the caller can clean up "
-            "the duplicate, 413 if the body exceeds 4 MiB on the "
+            "themselves. Returns the new page's write "
+            "acknowledgement `{name, etag, size_bytes, "
+            "last_modified_ms, created_ms}` on success (T23), "
+            "where `name` is the *destination* name. Errors: "
+            "404-equivalent ToolError if the source is missing "
+            "(`page not found: {name}`), 412 from the destination "
+            "write surfaces as `destination page already exists: "
+            "{new_name}; refusing to overwrite` (clearer than the "
+            "generic 412 wording because the source and destination "
+            "are different pages — the caller needs to know which "
+            "side refused), 412 from the source delete after a "
+            "successful destination write surfaces as `moved body "
+            "to {new_name} but failed to delete {name}: <reason>; "
+            "both now exist` so the caller can clean up the "
+            "duplicate, 413 if the body exceeds 4 MiB on the "
             "destination write."
         ),
     )
@@ -545,25 +612,24 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         name: str,
         new_name: str,
         if_match: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, object]:
         # Same-name short-circuit: ``name == new_name`` is a no-op
-        # that returns the current etag without a write/delete
-        # round-trip. The caller is asking us to rename a page to
-        # itself — there is nothing to do, and running the dance
-        # would risk spurious 412s on the source delete (we'd have
-        # just written a fresh body to ``new_name`` — which is also
-        # ``name`` — so the etag from the read would be stale).
+        # that returns the page's current acknowledgement without a
+        # write/delete round-trip. The caller is asking us to rename
+        # a page to itself — there is nothing to do, and running the
+        # dance would risk spurious 412s on the source delete (we'd
+        # have just written a fresh body to ``new_name`` — which is
+        # also ``name`` — so the etag from the read would be stale).
         if name == new_name:
             async with _translate_sb_errors(name):
                 # Same-name is a no-op, but a missing page would
                 # otherwise silently succeed. ``read_page`` is the
                 # cheapest existence check (no etag round-trip;
                 # ``list_pages`` doesn't carry etags on the v1 sync
-                # payload). The body is discarded — we just need
-                # the 404-or-200 signal. No etag to return because
-                # ``read_page`` doesn't surface one; ``None``
-                # mirrors the no-etag contract from the
-                # read-modify-write siblings.
+                # payload). T23: read_page now returns the page's
+                # full meta, so the same-name no-op can hand the
+                # caller a real acknowledgement — size, timestamps,
+                # etag — without an extra round trip.
                 #
                 # ``if_match`` is intentionally not honored here:
                 # the precondition guards the source delete, which
@@ -572,8 +638,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
                 # to verify the etag should chain
                 # ``write_page(name, body, if_match=<etag>)``
                 # themselves.
-                await sb_client.read_page(name)
-                return None
+                page = await sb_client.read_page(name)
+                return _write_meta_to_payload(page)
         async with _translate_sb_errors(name):
             # 1. Read the source body. No precondition — the source's
             # ``If-Match`` guard lives on the delete (step 3) and is
@@ -584,7 +650,8 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             # ``read_page → move_page(name, new_name, if_match=<etag>)``.
             # A 404 here surfaces the standard
             # ``page not found: {name}`` wording.
-            body = await sb_client.read_page(name)
+            page = await sb_client.read_page(name)
+            body = page.body or ""
             # 2. Write the body to ``new_name``. ``if_none_match=True``
             # makes SB send ``If-None-Match: *`` and refuse if the
             # destination already exists — ``move_page`` is rename,
@@ -595,7 +662,7 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             # the destination's; the destination didn't exist until
             # this write).
             try:
-                new_etag = await sb_client.write_page(
+                new_meta = await sb_client.write_page(
                     new_name, body, if_none_match=True
                 )
             except PreconditionFailed as exc:
@@ -645,7 +712,11 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
                 f"moved body to {new_name} but failed to delete "
                 f"{name}: silverbullet request timed out; both now exist"
             ) from exc
-        return new_etag
+        # Successful move: return the destination's acknowledgement.
+        # ``new_meta`` already has ``name=new_name`` (write_page
+        # threads the name through), so the payload's ``name`` field
+        # is the destination, not the source.
+        return _write_meta_to_payload(new_meta)
 
     @mcp.tool(
         title="List pages",
@@ -671,13 +742,22 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
         title="SilverBullet page",
         description=(
             "Raw markdown body of a SilverBullet page, for attaching "
-            "to conversation context."
+            "to conversation context. v1.1 returned the markdown "
+            "body string; v1.2's T23 keeps the resource returning a "
+            "string (the resource template isn't in T23's scope) and "
+            "T24 will widen it to `{body, etag, size_bytes, "
+            "last_modified_ms}` matching the read-tool envelope."
         ),
         mime_type="text/markdown",
     )
     async def silverbullet_page(name: str) -> str:
         try:
-            return await sb_client.read_page(name)
+            # ``read_page`` returned ``str`` in v1.1; the client now
+            # returns :class:`PageMeta` (T23 client-side change that
+            # T24 unwraps for the read tool). The resource template
+            # unwraps the body itself for now so the wire stays a
+            # markdown string until T24 widens it to the full meta.
+            page = await sb_client.read_page(name)
         except PageNotFound as exc:
             # 404 is a ResourceNotFoundError per the SDK's two-shape
             # split: ``-32602 invalid params`` for "doesn't exist"
@@ -691,6 +771,14 @@ def register_tools(mcp: MCPServer, sb_client: SBClient) -> None:
             raise ResourceError(str(exc)) from exc
         except httpx.TimeoutException as exc:
             raise ResourceError("silverbullet request timed out") from exc
+        return page.body or ""
 
 
-__all__ = ["build_mcp", "register_tools", "FileMeta", "SBError", "JournalConfig"]
+__all__ = [
+    "build_mcp",
+    "register_tools",
+    "FileMeta",
+    "PageMeta",
+    "SBError",
+    "JournalConfig",
+]

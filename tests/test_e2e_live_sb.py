@@ -124,6 +124,18 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         {"name": MARKER, "content": body},
                     )
                     assert written.is_error is False, written
+                    # T23 envelope: ``{name, etag, size_bytes, ...}``.
+                    # ``size_bytes`` comes from the request body byte
+                    # count (``len("hello from T7 live e2e\n") == 23``),
+                    # which the live SB echoes back via
+                    # ``X-Content-Length``. ``name`` is what we asked
+                    # to write. Other meta fields may or may not be
+                    # populated depending on the live SB build.
+                    wpayload = written.structured_content or {}
+                    assert wpayload.get("name") == MARKER
+                    assert wpayload.get("size_bytes") == len(
+                        body.encode("utf-8")
+                    )
 
                     read_back = await session.call_tool(
                         "read_page", {"name": MARKER}
@@ -142,6 +154,11 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         {"name": MARKER, "text": "appended\n"},
                     )
                     assert appended.is_error is False, appended
+                    # T23 envelope: combined body is
+                    # ``hello from T7 live e2e\nappended\n`` = 32 bytes.
+                    assert (appended.structured_content or {}).get(
+                        "size_bytes"
+                    ) == 32
 
                     after_append = await session.call_tool(
                         "read_page", {"name": MARKER}
@@ -170,6 +187,11 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         },
                     )
                     assert patched.is_error is False, patched
+                    # T23 envelope: patched body is
+                    # ``patched\nappended\n`` = 16 bytes.
+                    assert (patched.structured_content or {}).get(
+                        "size_bytes"
+                    ) == 16
 
                     after_patch = await session.call_tool(
                         "read_page", {"name": MARKER}
@@ -194,6 +216,11 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         },
                     )
                     assert replaced.is_error is False, replaced
+                    # T23 envelope: replaced body is
+                    # ``hello\nappended\n`` = 15 bytes.
+                    assert (replaced.structured_content or {}).get(
+                        "size_bytes"
+                    ) == 15
 
                     after_replace = await session.call_tool(
                         "read_page", {"name": MARKER}
@@ -215,6 +242,12 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         {"name": MARKER, "new_name": moved_name},
                     )
                     assert moved.is_error is False, moved
+                    # T23 envelope: ``name`` is the *destination*
+                    # (``moved_name``), not the source. The body
+                    # is ``hello\nappended\n`` = 15 bytes.
+                    mpayload = moved.structured_content or {}
+                    assert mpayload.get("name") == moved_name
+                    assert mpayload.get("size_bytes") == 15
 
                     after_move_old = await session.call_tool(
                         "read_page", {"name": MARKER}
@@ -236,6 +269,11 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                         {"name": moved_name, "new_name": MARKER},
                     )
                     assert move_back.is_error is False, move_back
+                    # T23 envelope: moved back, ``name`` is the
+                    # destination (``MARKER``).
+                    assert (move_back.structured_content or {}).get(
+                        "name"
+                    ) == MARKER
 
                     # Reset the body for the precondition block
                     # below (which writes ``body`` and expects to

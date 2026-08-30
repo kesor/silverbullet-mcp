@@ -216,16 +216,16 @@ added `delete_page`, T19 added `append_to_page`, T20 added
 `patch_page_lines`, T21 added `patch_page_replace`, T22 added
 `move_page`). **Eight tools, one resource template.**
 
-| Tool | Input (Python type hint) | SB call | Side effects |
-|---|---|---|---|
-| `read_page` | `name: str` | `GET /.fs/{name}` | none |
-| `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | may create / overwrite / refuse on `412` |
-| `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | may append / refuse on `412` (concurrent-write protection) |
-| `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
-| `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront) | may patch / refuse on `412` |
-| `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
-| `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | hard delete; refuses on `412` |
-| `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | none |
+| Tool | Input (Python type hint) | SB call | Returns (T23+) | Side effects |
+|---|---|---|---|---|
+| `read_page` | `name: str` | `GET /.fs/{name}` | `str` (markdown body); T24 widens to `{body, etag, size_bytes, last_modified_ms}` | none |
+| `write_page` | `name: str, content: str, if_match: Optional[str] = None` | `PUT /.fs/{name}` (body = `content`, headers `X-Source: external`, `X-Permission: "rw"`, optional `If-Match`) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may create / overwrite / refuse on `412` |
+| `append_to_page` | `name: str, text: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; one newline separator inserted unless the existing body already ends in one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may append / refuse on `412` (concurrent-write protection) |
+| `patch_page_lines` | `name: str, start_line: int, end_line: int, new_content: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; lines are 1-indexed and inclusive; body split on `\\n` with trailing empty dropped; trailing newline preserved iff body had one) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may patch / refuse on `412`; out-of-range or inverted ranges raise `ToolError` upfront (no GET/PUT) |
+| `patch_page_replace` | `name: str, find: str, new_string: str, replace_all: bool = False, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{name}` (read-modify-write; `find` is a literal substring, no regex; `replace_all=False` errors when `find` matches more than once; `find` not in body is an error; empty `find` is rejected upfront) | `{name, etag, size_bytes, last_modified_ms, created_ms}` | may patch / refuse on `412` |
+| `move_page` | `name: str, new_name: str, if_match: Optional[str] = None` | `GET /.fs/{name}` → `PUT /.fs/{new_name}` (with `If-None-Match: *`) → `DELETE /.fs/{name}` (with `If-Match`) | `{name=destination, etag, size_bytes, last_modified_ms, created_ms}` (same-name no-op returns the source's envelope) | rename; write-then-delete so a partial failure leaves the body at the new name; destination always refuses to overwrite; `name == new_name` is a no-op; refuses on `412` (collision) or atomicity-caveat `ToolError` on the source-delete step |
+| `delete_page` | `name: str, if_match: Optional[str] = None` | `DELETE /.fs/{name}` (header `X-Source: external`, optional `If-Match`) | `{name, etag, size_bytes=None, last_modified_ms=None, created_ms=None}` (DELETE doesn't echo `X-*` per the SB contract) | hard delete; refuses on `412` |
+| `list_pages` | `prefix: str = ""` | `GET /.fs` then filter in Python | `list[{name, etag}]`; T28 widens to `list[{name, etag, size_bytes, last_modified_ms, created_ms}]` | none |
 
 Resource template:
 

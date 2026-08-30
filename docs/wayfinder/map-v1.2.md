@@ -40,10 +40,10 @@ preferences; this map inherits them.
 The shape:
 
 - **Acknowledge-shape pair (T23, T24)**: every write tool returns
-  `{name, etag, size_bytes, last_modified_ms, created}`. Read tools
-  return `{body, etag, size_bytes, last_modified_ms}`. These two
-  land together because the wire-shape decision is the same and the
-  test surface overlaps heavily.
+  `{name, etag, size_bytes, last_modified_ms, created_ms}`. Read
+  tools return `{body, etag, size_bytes, last_modified_ms}`. These
+  two land together because the wire-shape decision is the same and
+  the test surface overlaps heavily.
 - **Lightweight helpers (T25, T26, T27)**: `page_exists(name) -> bool`,
   `dry_run=True` mode on the patch tools, `diff_pages(name,
   other_name?)` / vs a literal string.
@@ -76,16 +76,18 @@ The destination is reached when all eight tickets are closed.
     the prior maps' `pages_touching_topic` (T12) already does
     substring matching with `str.find` / `re.search`; reuse those
     helpers, no new deps.
-  - **Backwards-compatible wire shapes.** v1.2 changes the *return
-    type* of every read/write tool. The MCP wire payload for the
-    existing string / list-of-dict returns grows an outer dict;
-    tests have to be updated to match. MCP clients that consume
-    the old shape will break — note this loudly in the README +
-    CHANGELOG when T23 lands. The new shape is the right call
-    (the user's framing: "indication regarding their success with
-    enough content and information so that the agent wouldn't
-    need to guess") but it's a breaking change for any client
-    pinned to the v1.1 wire shape.
+  - **Breaking wire-shape changes are *not* avoided.** v1.2
+    changes the *return type* of every read/write tool (T23/T24
+    widen to a meta envelope; T28 widens list_pages to the same
+    envelope). The MCP wire payload for the existing string /
+    list-of-dict returns grows an outer dict; tests have to be
+    updated to match. MCP clients that consume the old shape will
+    break — note this loudly in the README + CHANGELOG when T23
+    lands. The new shape is the right call (the user's framing:
+    "indication regarding their success with enough content and
+    information so that the agent wouldn't need to guess") but
+    it's a breaking change for any client pinned to the v1.1 wire
+    shape.
   - **`dry_run` is pure.** T26 must NOT call `sb_client.write_page`
     on the dry-run path. The whole point is "show me what would
     happen"; a dry run that mutates is a bug.
@@ -116,7 +118,91 @@ The destination is reached when all eight tickets are closed.
 <!-- index only — one line per closed ticket, link to the ticket's
 resolution below -->
 
-*(none yet — the map just opened)*
+- **T23. Write-tool acknowledgement shape.** (commit pending):
+  Every write tool (`write_page` / `delete_page` / `append_to_page` /
+  `patch_page_lines` / `patch_page_replace` / `move_page`) now
+  returns `{name, etag, size_bytes, last_modified_ms, created_ms}`
+  instead of `str | None`. The change rides on a new `PageMeta`
+  dataclass in `sb_client.py` (single-source-of-truth envelope)
+  that all three client entry points (`read_page` / `write_page` /
+  `delete_page`) now return; the MCP tool layer subsets the envelope
+  to the T23 wire shape via `_write_meta_to_payload` in `server.py`.
+  `read_page` (the MCP tool) keeps returning `str` for v1.2-rc1;
+  T24 widens it to `{body, etag, size_bytes, last_modified_ms}`
+  with the same one-line unwrap that the resource template already
+  uses. `list_pages` keeps its v1.1 `list[{name, etag}]` shape; T28
+  widens it. The client-side `list_pages` stays returning `FileMeta`
+  until T28, then both widen together.
+
+  **Field-by-field contract**: `name` is the page the caller asked
+  about; `etag` is `None` when SB stripped the response header;
+  `size_bytes` is the UTF-8 byte count of the just-written body
+  (always populated on writes — independent of whether SB echoes
+  `X-Content-Length` back, so a stripped response still surfaces a
+  real number); `last_modified_ms` and `created_ms` come from
+  `X-Last-Modified` / `X-Created` and are `None` when SB stripped
+  them. `delete_page` returns `size_bytes=None` and both
+  timestamps as `None` because SB's DELETE response doesn't carry
+  the `X-*` headers per the design doc § SilverBullet client
+  contract DELETE row — honest wire shape, no fabricated numbers.
+  `move_page` returns the **destination's** envelope on success;
+  the same-name no-op (`name == new_name`) returns the source's
+  envelope (the read on the existence check surfaces full meta
+  since the client side was widened in the same change).
+
+  **Breaking change, loudly called out**: the README and a new
+  `CHANGELOG.md` flag the wire-shape change with a one-line
+  migration note (`result.text` → `result["result"]["etag"]`,
+  plus the new meta fields so the agent can skip the v1.1
+  follow-up read). `docs/design.md` § Tools table got a "Returns"
+  column reflecting the new shape on every write tool (plus a
+  pointer to T24 / T28 for the read-side / list widening).
+
+  **Files touched**: `src/mcp_silverbullet/sb_client.py` (added
+  `PageMeta` dataclass + `_meta_from_response` + `_parse_int_header`
+  helpers; widened `read_page` / `write_page` / `delete_page`
+  return types), `src/mcp_silverbullet/server.py` (added
+  `_write_meta_to_payload` projection; widened every write tool's
+  return type from `str | None` to `dict[str, object]`; updated
+  tool descriptions to call out the new shape; resource template
+  unwraps `page.body` for now, ready for T24's one-line widening),
+  `tests/test_sb_client.py` (+4 tests: `read_page` returns
+  PageMeta; `read_page` extracts X-* meta from response headers;
+  `read_page` tolerates malformed X-* headers;
+  `write_page` size_bytes from request body; write_page meta is
+  None when response stripped), `tests/test_tools_in_memory.py`
+  (12 happy-path / None-ETG tests updated to assert on the new
+  envelope; `move_page` same-name no-op test updated to assert
+  on the source envelope), `tests/test_e2e_live_sb.py` (every
+  write call now also asserts on `size_bytes` and the right
+  `name` field — destination for `move_page`, source for the
+  same-name no-op), `README.md` (new "v1.2 wire-shape changes"
+  section under "What it exposes" with the migration snippet),
+  `CHANGELOG.md` (new file, Keep-a-Changelog format, v1.2
+  breaking-change called out at the top), `docs/design.md` §
+  Tools table (added "Returns" column).
+
+  **Bonus improvements visible while doing it**: the
+  `_translate_sb_errors` docstring's prior v1.1 contract
+  (PageMeta as `str | None`) is gone; the move-page same-name
+  no-op now returns real meta (it used to return `None` because
+  `read_page` didn't surface an etag); the read-modify-write
+  tools (`append_to_page` / `patch_page_lines` /
+  `patch_page_replace`) now thread the *write's* meta back, not
+  the read's, so the etag / size / timestamps reflect what was
+  actually written rather than what was read.
+
+  **Unblocks**: T24 (read tool widens to the same envelope —
+  client already returns PageMeta), T28 (list_pages widens to
+  `list[PageMeta]` — dataclass already exists), T30 (check_task
+  returns the same T23 ack envelope, so client change is shared
+  with `move_page`).
+
+  Test count: 184 pass + 2 skip (was 180 pass + 2 skip; +4 new
+  sb_client tests + net +0 in-memory tests, since the existing
+  13 wire-shape tests were rewritten in place to assert on the
+  new envelope rather than split into more tests). `nix flake
+  check` green.
 
 ## Tickets
 
@@ -132,11 +218,11 @@ file; "blocking" is rendered by ticket ordering and an explicit
 "Blocks:" line per ticket).
 -->
 
-### T23. Write-tool acknowledgement shape
+### T23. Write-tool acknowledgement shape ✅
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Status**: ⬜ open
+> **Status**: ✅ closed (see Decisions so far)
 > **Question**: What does every write tool return?
 >
 > **Context**: Today every write tool returns `str | None` (the new

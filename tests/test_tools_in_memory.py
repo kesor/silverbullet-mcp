@@ -132,9 +132,28 @@ async def test_read_page_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_write_page_returns_etag_on_200() -> None:
+async def test_write_page_returns_ack_envelope_on_200() -> None:
+    """``write_page`` returns the T23 acknowledgement envelope.
+
+    v1.1 returned ``str`` (the new ETag) or ``None` (older SB /
+    proxy-stripped). v1.2 T23 widens the return to
+    ``{name, etag, size_bytes, last_modified_ms, created_ms}`` so
+    the agent knows how big the body is, when it was written, and
+    whether the write was a create vs an update without a
+    follow-up read.
+
+    Locks the write-tool wire shape — every write tool (the seven
+    in ``/.fs``) returns this same envelope per T23.
+    """
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"ETag": '"abc123"'})
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"abc123"',
+                "X-Last-Modified": "1700000000123",
+                "X-Created": "1700000000000",
+            },
+        )
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -144,15 +163,30 @@ async def test_write_page_returns_etag_on_200() -> None:
         )
 
     assert result.is_error is False
-    assert _text(result) == '"abc123"'
+    # ``size_bytes`` is the UTF-8 byte count of the just-written body
+    # (``# new body`` = 10 bytes), surfaced from the request body.
+    # The SDK surfaces the dict return directly under
+    # ``structured_content`` (not wrapped in ``{"result": …}`` the
+    # way single-value returns are — a dict return IS the
+    # structured payload).
+    assert result.structured_content == {
+        "name": "index",
+        "etag": '"abc123"',
+        "size_bytes": 10,
+        "last_modified_ms": 1700000000123,
+        "created_ms": 1700000000000,
+    }
 
 
 @pytest.mark.asyncio
-async def test_write_page_returns_null_when_etag_header_missing() -> None:
-    """A 200 with no ETag header (older SB / proxy-stripped) → ``None``.
+async def test_write_page_ack_envelope_is_none_when_meta_stripped() -> None:
+    """A 200 with no ``X-*`` / ``ETag`` headers → ack envelope with Nones.
 
-    Guard against a future refactor that drops the ``None`` fallback
-    and instead returns ``""`` (a different and confusing wire shape).
+    Mirror of the v1.1 None-ETag handling on the wider T23 envelope:
+    a proxy-stripped response surfaces ``None`` for every optional
+    meta field (etag / last_modified_ms / created_ms). ``size_bytes``
+    is still populated (request-body derivation — the bridge always
+    knows how many bytes it wrote).
     """
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200)
@@ -165,9 +199,13 @@ async def test_write_page_returns_null_when_etag_header_missing() -> None:
         )
 
     assert result.is_error is False
-    # ``str | None`` returns are wrapped in ``{"result": ...}`` by the
-    # SDK; missing ETag becomes JSON ``null``.
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "index",
+        "etag": None,
+        "size_bytes": 10,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -261,7 +299,16 @@ async def test_write_page_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_page_returns_etag_on_200() -> None:
+async def test_delete_page_returns_ack_envelope_on_200() -> None:
+    """``delete_page`` returns the T23 acknowledgement envelope.
+
+    DELETE doesn't echo ``X-*`` meta per the design doc, so the
+    envelope's size / timestamp fields are ``None`` (the honest
+    answer — we don't fabricate them). The ETag echoes the deleted
+    body's hash so the caller can confirm what was removed. An agent
+    that wants the timestamps of what it's about to delete reads
+    the page first and threads the etag into ``if_match``.
+    """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
         assert request.url.path == "/.fs/index"
@@ -272,16 +319,22 @@ async def test_delete_page_returns_etag_on_200() -> None:
         result = await client.call_tool("delete_page", {"name": "index"})
 
     assert result.is_error is False
-    assert _text(result) == '"abc123"'
+    assert result.structured_content == {
+        "name": "index",
+        "etag": '"abc123"',
+        "size_bytes": None,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 @pytest.mark.asyncio
-async def test_delete_page_returns_null_when_etag_header_missing() -> None:
-    """A 200 with no ETag header → ``None``.
+async def test_delete_page_ack_envelope_when_etag_header_missing() -> None:
+    """No ``ETag`` on the response → envelope with etag ``None``.
 
-    Mirror of :func:`test_write_page_returns_null_when_etag_header_missing`:
-    the wire shape is ``{"result": null}`` and any future refactor
-    that returns ``""`` would be a confusing type drift.
+    Same envelope shape as the success case; only ``etag`` differs.
+    Locks the DELETE envelope so a future refactor that drops one of
+    the ``None`` fields changes the wire shape loudly.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -292,7 +345,13 @@ async def test_delete_page_returns_null_when_etag_header_missing() -> None:
         result = await client.call_tool("delete_page", {"name": "index"})
 
     assert result.is_error is False
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "index",
+        "etag": None,
+        "size_bytes": None,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -389,13 +448,15 @@ async def test_delete_page_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_append_to_page_returns_etag_on_200() -> None:
+async def test_append_to_page_returns_ack_envelope_on_200() -> None:
     """Happy path: existing body + new text → read-modify-write round trip.
 
     Captures the GET (read) and PUT (write) the tool issues so we
     can assert: (a) the read happened first, (b) the write carries
-    the combined body, (c) the tool returns the write's ETag, not
-    the read's.
+    the combined body, (c) the tool returns the write's T23 ack
+    envelope (not the read's). The envelope's ``size_bytes`` is the
+    UTF-8 byte count of the just-written combined body
+    (``hello\nworld`` = 11 bytes).
     """
     calls: list[tuple[str, str]] = []
 
@@ -406,7 +467,14 @@ async def test_append_to_page_returns_etag_on_200() -> None:
         # PUT
         calls.append(("PUT", request.url.path))
         assert request.content == b"hello\nworld"
-        return httpx.Response(200, headers={"ETag": '"v2"'})
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"v2"',
+                "X-Last-Modified": "1700000000123",
+                "X-Created": "1700000000000",
+            },
+        )
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -416,7 +484,13 @@ async def test_append_to_page_returns_etag_on_200() -> None:
         )
 
     assert result.is_error is False
-    assert _text(result) == '"v2"'
+    assert result.structured_content == {
+        "name": "index",
+        "etag": '"v2"',
+        "size_bytes": 11,  # ``hello\nworld`` = 11 UTF-8 bytes
+        "last_modified_ms": 1700000000123,
+        "created_ms": 1700000000000,
+    }
     # Read first, then write — locks the read-modify-write ordering.
     assert calls == [
         ("GET", "/.fs/index"),
@@ -726,13 +800,13 @@ async def test_append_to_page_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_append_to_page_returns_null_when_etag_header_missing() -> None:
-    """A successful write with no ``ETag`` header → ``None``.
+async def test_append_to_page_ack_envelope_when_etag_header_missing() -> None:
+    """A successful write with no ``ETag`` / ``X-*`` headers → ack envelope with Nones.
 
-    Mirror of the same shape on :func:`test_write_page_returns_null_when_etag_header_missing`
-    and ``delete_page``. The wire payload is ``{"result": null}``
-    and any future refactor that returned ``""`` would be a
-    confusing type drift for callers chaining edits.
+    Mirror of :func:`test_write_page_ack_envelope_is_none_when_meta_stripped`
+    on the append path. ``size_bytes`` is still populated from the
+    request body (the combined body the bridge just wrote:
+    ``hello\nworld`` = 11 bytes).
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
@@ -746,7 +820,13 @@ async def test_append_to_page_returns_null_when_etag_header_missing() -> None:
         )
 
     assert result.is_error is False
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "index",
+        "etag": None,
+        "size_bytes": 11,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 # --- patch_page_lines --------------------------------------------------
@@ -782,7 +862,13 @@ async def test_patch_page_lines_returns_etag_on_200() -> None:
         )
 
     assert result.is_error is False
-    assert _text(result) == '"v2"'
+    assert result.structured_content == {
+        "name": "index",
+        "etag": '"v2"',
+        "size_bytes": 7,  # ``a\nB\nC\nd`` = 7 UTF-8 bytes
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
     # a\nB\nC\nd — lines 2-3 (b, c) replaced by B\nC; the surrounding
     # lines (a, d) are untouched.
     assert seen_writes == [b"a\nB\nC\nd"]
@@ -1357,13 +1443,13 @@ async def test_patch_page_lines_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_patch_page_lines_returns_null_when_etag_header_missing() -> None:
-    """A successful write with no ``ETag`` header → ``None``.
+async def test_patch_page_lines_ack_envelope_when_etag_header_missing() -> None:
+    """A successful write with no ``ETag`` / ``X-*`` headers → ack envelope with Nones.
 
-    Mirror of the same shape on ``write_page``, ``delete_page``, and
-    ``append_to_page``: the wire payload is ``{\"result\": null}``
-    and any future refactor that returned ``\"\"`` would be a
-    confusing type drift for callers chaining edits.
+    Mirror of :func:`test_write_page_ack_envelope_is_none_when_meta_stripped`
+    on the patch-lines path. ``size_bytes`` is the just-written
+    patched body (``A\nb`` = 3 UTF-8 bytes — line 1 replaced with
+    ``A``, line 2 left as ``b``).
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
@@ -1383,7 +1469,13 @@ async def test_patch_page_lines_returns_null_when_etag_header_missing() -> None:
         )
 
     assert result.is_error is False
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "index",
+        "etag": None,
+        "size_bytes": 3,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 # --- patch_page_replace -------------------------------------------------
@@ -1416,7 +1508,13 @@ async def test_patch_page_replace_returns_etag_on_200() -> None:
         )
 
     assert result.is_error is False
-    assert _text(result) == '"v2"'
+    assert result.structured_content == {
+        "name": "index",
+        "etag": '"v2"',
+        "size_bytes": 8,  # ``hello SB`` = 8 UTF-8 bytes
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
     # Read first, then write — locks the read-modify-write ordering
     # (same shape as ``append_to_page`` and ``patch_page_lines``).
     assert calls == [
@@ -1916,15 +2014,12 @@ async def test_patch_page_replace_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_patch_page_replace_returns_null_when_etag_header_missing() -> None:
-    """A successful write with no ``ETag`` header → ``None``.
+async def test_patch_page_replace_ack_envelope_when_etag_header_missing() -> None:
+    """A successful write with no ``ETag`` / ``X-*`` headers → ack envelope with Nones.
 
-    Mirror of the same shape on the other ``str | None`` returns
-    (``write_page``, ``delete_page``, ``append_to_page``,
-    ``patch_page_lines``): the wire payload is
-    ``{\"result\": null}`` and any future refactor that returned
-    ``\"\"`` would be a confusing type drift for callers chaining
-    edits.
+    Mirror of :func:`test_write_page_ack_envelope_is_none_when_meta_stripped`
+    on the patch-replace path. ``size_bytes`` is the just-written
+    replaced body (``hello SB`` = 8 UTF-8 bytes).
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1944,7 +2039,13 @@ async def test_patch_page_replace_returns_null_when_etag_header_missing() -> Non
         )
 
     assert result.is_error is False
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "index",
+        "etag": None,
+        "size_bytes": 8,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 # --- list_pages --------------------------------------------------------
@@ -2054,7 +2155,13 @@ async def test_move_page_returns_new_etag_on_200() -> None:
         )
 
     assert result.is_error is False
-    assert _text(result) == '"new-etag"'
+    assert result.structured_content == {
+        "name": "new",  # destination, not source — per T23
+        "etag": '"new-etag"',
+        "size_bytes": 9,  # ``the body\n`` = 9 UTF-8 bytes
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
     # Order: GET source → PUT destination (with If-None-Match) →
     # DELETE source. The write happens before the delete so a
     # partial-failure leaves the body at the new name.
@@ -2074,14 +2181,21 @@ async def test_move_page_same_name_is_no_op() -> None:
     Avoids the read-write-delete cycle (and the spurious 412 that
     the dance would invite — we'd just write a fresh body to the
     same path, making the etag from the read stale for the delete
-    that follows). The body is discarded; we return ``None``
-    because ``read_page`` doesn't surface an etag.
+    that follows). T23: the same-name no-op now returns the page's
+    full acknowledgement envelope (etags, size, timestamps) since
+    the underlying ``read_page`` already populates it — no
+    extra round trip, just a one-line unwrap on the existing
+    read response.
     """
     calls: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, request.url.path))
-        return httpx.Response(200, text="body")
+        return httpx.Response(
+            200,
+            text="body",
+            headers={"ETag": '"self-etag"', "X-Content-Length": "4"},
+        )
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -2092,6 +2206,16 @@ async def test_move_page_same_name_is_no_op() -> None:
     assert result.is_error is False
     # Only the existence check ran.
     assert calls == [("GET", "/.fs/self")]
+    # The same-name no-op returns the page's read-side ack — the
+    # caller gets the size / etag / timestamps without an extra
+    # round trip.
+    assert result.structured_content == {
+        "name": "self",
+        "etag": '"self-etag"',
+        "size_bytes": 4,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -2355,12 +2479,14 @@ async def test_move_page_read_5xx_returns_tool_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_page_returns_null_when_new_etag_header_missing() -> None:
-    """Destination write 200 with no ETag header → ``None``.
+async def test_move_page_ack_envelope_when_new_etag_header_missing() -> None:
+    """Destination write 200 with no ETag / ``X-*`` headers → ack envelope with Nones.
 
     Mirror of the same shape on the other write tools. The wire
-    payload is ``{"result": null}`` so a future refactor that
-    returned ``""`` would be a confusing type drift.
+    payload is the destination's T23 ack envelope (``name=new``
+    because the destination is what we wrote and the caller wants
+    to know about). ``size_bytes`` is still populated from the
+    request body (``body`` = 4 UTF-8 bytes).
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
@@ -2376,7 +2502,13 @@ async def test_move_page_returns_null_when_new_etag_header_missing() -> None:
         )
 
     assert result.is_error is False
-    assert result.structured_content == {"result": None}
+    assert result.structured_content == {
+        "name": "new",  # destination
+        "etag": None,
+        "size_bytes": 4,
+        "last_modified_ms": None,
+        "created_ms": None,
+    }
 
 
 @pytest.mark.asyncio
