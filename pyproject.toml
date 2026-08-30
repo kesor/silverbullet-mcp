@@ -29,11 +29,23 @@ test = [
   "respx>=0.21",
 ]
 
+# Build-system-only deps that the editable devShell needs. uv2nix's
+# `mkEditablePyprojectOverlay` triggers `pip install -e .`, and hatchling's
+# editable install path uses `editables` to wire the source tree. Keeping
+# it in a group (not `[project.optional-dependencies]`) means it never
+# leaks into the runtime venv (`nix build .#default`).
+[dependency-groups]
+dev = [
+  "editables>=0.5",
+]
+
 [project.scripts]
 mcp-silverbullet = "mcp_silverbullet.main:run"
 
 [build-system]
-requires = ["hatchling"]
+# hatchling's editable-install path uses `editables` at build time; nixpkgs'
+# hatchling doesn't ship it transitively, so we list it explicitly.
+requires = ["hatchling", "editables>=0.5"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
