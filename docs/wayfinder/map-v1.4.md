@@ -94,8 +94,14 @@ experience the bug describes is real for operators who
 don't have the gate enabled**, and the `list_pages` filter's
 `startswith`-only behavior is genuinely surprising for users
 who read "filtered by prefix" as "substring." T37 + T38 close
-that residual gap. Charting only; resolution belongs to a
-later session.
+that residual gap. **Status as of 2026-09-01**: T37 (commit
+`205b1`) and T38 (this session) shipped; **v1.4
+destination reached**. The bridge now exposes
+`list_pages(prefix=, contains=)` for name narrowing,
+the README's Discovery tools (journal-gated) section
+front-loads the journal gate's purpose, and an
+operator who hits a "no body search" dead end has an
+obvious next step rather than relitigating the scope.
 
 ## Notes
 
@@ -148,34 +154,24 @@ later session.
 ticket's resolution below -->
 
 - [Chart pass, 2026-08-30](#status): v1.4 destination named ("clarify the discovery surface for operators without the journal gate"); T37 (substring filter) and T38 (gate docs) charted with full detail below; the bug reporter's "implement Space Lua search" suggestion closed as out-of-scope (SilverBullet feature, not a bridge feature; the bridge has no path to it) and recorded under `## Out of scope`; T37 / T38 were on the frontier (both unblocked, neither claimed) at chart time.
-- [T37 (2026-08-31)](#t37-widen-list_pages-filter-to-also-accept-substring-matching): new `contains: str = ""` parameter on `list_pages` (parallel to the v1 `prefix=` filter); substring matching against page name; AND-composes with `prefix=` when both are set; either empty is a no-op for that criterion; both empty returns the full listing; runs client-side *before* per-page hydration (same ordering invariant T28 locked for `prefix=`); wire surface unchanged for v1 / v1.1 / v1.2 / v1.3 callers (the new parameter is purely additive); 4 new Layer-1 cases in `tests/test_tools_in_memory.py`; `docs/design.md` § Tools row + `README.md` tool inventory updated; `CHANGELOG.md` v1.4 header corrected and `### Added` section gains a T37 entry; T38 unblocked (the gate docs can now reference the new `contains=` parameter as the example of a name-only filter). **Status as of 2026-08-31**: T37 shipped; **T38 remains on the frontier** (unblocked, unclaimed).
+- [T37 (2026-08-31)](#t37-widen-list_pages-filter-to-also-accept-substring-matching): new `contains: str = ""` parameter on `list_pages` (parallel to the v1 `prefix=` filter); substring matching against page name; AND-composes with `prefix=` when both are set; either empty is a no-op for that criterion; both empty returns the full listing; runs client-side *before* per-page hydration (same ordering invariant T28 locked for `prefix=`); wire surface unchanged for v1 / v1.1 / v1.2 / v1.3 callers (the new parameter is purely additive); 4 new Layer-1 cases in `tests/test_tools_in_memory.py`; `docs/design.md` § Tools row + `README.md` tool inventory updated; `CHANGELOG.md` v1.4 header corrected and `### Added` section gains a T37 entry; T38 unblocked (the gate docs can now reference the new `contains=` parameter as the example of a name-only filter). **Status as of 2026-08-31**: T37 shipped.
+- [T38 (2026-09-01)](#t38-surface-the-journal-gates-purpose-and-opt-in-path-more-loudly): renamed README's `### Optional: journal surface` to `### Discovery tools (journal-gated)`; reframed the section around the three discovery tools (`pages_touching_topic` / `search_pages` / `find_backlinks`) with the two env vars that unlock them (`MCP_SILVERBULLET_SPACE_PATH` + `MCP_SILVERBULLET_JOURNAL_TOOLS=1`) named in the preamble; moved the three journal-analysis tools (`journal_histogram` / `tag_summary` / `recent_pages`) to a smaller sub-list at the bottom of the section so the discovery trio front-loads the section's purpose; updated `list_pages` tool description to match the charter's exact wording ("Body-content search lives behind the journal gate (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` + `MCP_SILVERBULLET_SPACE_PATH`); this filter only ever matches against page names."); `docs/design.md` § What we are not doing (v1) gains a dedicated bullet on body-substring search without the gate (the SB-API surface is read-by-name only, no body index; the journal gate is the only path); the env-var table rows for both gate vars gain parenthetical pointers at the new section; the same pointer shows up in the `list_tasks` per-page-form description and in the Pi-session usage section so every "where do I find the journal tools" thread converges on the new heading; 1 new Layer-1 case in `tests/test_tools_in_memory.py` (`test_t38_list_pages_description_points_at_journal_gate`) pins the description's gate pointer so a future drift surfaces as a test failure rather than as a relitigation of the bug reporter's "no `search_*` tool" experience; `CHANGELOG.md` v1.4 status line updated from "T38 still on the frontier" to "T37 + T38 shipped; v1.4 destination reached"; v1.4 `### Added` section gains a T38 entry with the full threading list; **v1.4 destination reached**.
 
 ## Not yet specified
 
 <!-- in-scope fog that can't be ticket-sized yet; graduates as
 the frontier advances -->
 
-- **Naming the new parameter.** `contains=` is the obvious
-  choice (parallel to `prefix=`, reads as substring-or-better)
-  but alternatives like `match=`, `name_contains=`, or
-  collapsing into a single `query=` knob with a `mode=`
-  argument are equally sharp. T37 will pick one; no
-  pre-decision here.
-
-- **Should the `list_pages` description advertise the
-  composed behavior?** Two filters that AND together is
-  slightly more cognitive load than one filter with a
-  knob. The description is already long; an operator
-  who only ever uses `prefix=` shouldn't have to read
-  about `contains=` to use the tool. T37 will decide
-  the description shape; pre-decision not sharp enough
-  to ticket.
-
 - **Should `list_pages` carry an `exclude=` parameter?**
   Inverse filter (substring *not* in name) would let
   an operator skip a folder without typing the prefix
-  for every page they want. Not in T37's charter; surfaces
-  here as fog because someone reading T37 will ask.
+  for every page they want. Not in T37 / T38's
+  charter; surfaces here as fog because someone reading
+  T37 / T38 will ask. Stays as fog — the
+  parameter would be additive (parallel to
+  `contains=`) but no caller has actually needed it
+  yet, so promoting it to a ticket would be premature.
+  Future map if a real caller asks.
 
 ## Out of scope
 
@@ -439,8 +435,8 @@ can be claimed by the next session.
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed 2026-09-01)
+> **Status**: 🟢 resolved (this session)
 > **Question**: How does the README and the tool
 > descriptions make the journal gate's purpose and
 > opt-in path obvious to an operator who hasn't yet
@@ -518,6 +514,183 @@ can be claimed by the next session.
 > end-to-end (T38 is a targeted addition, not a
 > doc rewrite).
 
+**Resolution** (positive, 2026-09-01; commit
+pending — this session): shipped in
+`README.md`, `src/mcp_silverbullet/server.py`,
+`docs/design.md`, `tests/test_tools_in_memory.py`,
+and `CHANGELOG.md`. Implementation matched the
+charter with one scope-shape decision and one
+drive-by widening:
+
+- **README's `### Optional: journal surface`
+  section is renamed to `### Discovery tools
+  (journal-gated)`** and reframed around the
+  three discovery tools (`pages_touching_topic`,
+  `search_pages`, `find_backlinks`). The section's
+  preamble now names the two env vars that
+  unlock the gate (`MCP_SILVERBULLET_SPACE_PATH` +
+  `MCP_SILVERBULLET_JOURNAL_TOOLS=1`) with a
+  one-line summary of each, framed in the bug
+  reporter's language ("when `list_pages(prefix=,
+  contains=)` narrows the listing but the page
+  you want isn't on a name match — its name
+  doesn't contain the phrase, but its *body*
+  does — the HTTP `/.fs` API can't help: SB has
+  no built-in search endpoint, so substring search
+  over page bodies needs filesystem access to the
+  SB space directory"). The three journal-analysis
+  tools (`journal_histogram` / `tag_summary` /
+  `recent_pages`) move to a smaller sub-list at
+  the bottom of the section under "Three additional
+  journal tools (also gated, but not
+  discovery-flavoured)" so the discovery trio
+  front-loads the section's purpose without
+  dropping the other three tools (they're still
+  journal-gated and still surface here).
+
+- **The `list_pages` tool description matches the
+  charter exactly.** Pre-T38 the description
+  ended with a forward-looking "T38 — see the
+  README's Discovery tools section" parenthetical
+  (T37's commit added this as a placeholder).
+  Post-T38 the parenthetical becomes a stable
+  cross-reference to the README's new section
+  by name: "this filter only ever matches against
+  page *names*; body-content search lives behind
+  the journal gate (`MCP_SILVERBULLET_JOURNAL_TOOLS=1`
+  + `MCP_SILVERBULLET_SPACE_PATH`; see the
+  README's Discovery tools (journal-gated)
+  section)." The `T38 —` ticket-reference drops
+  — the destination now exists, so the description
+  doesn't need a forward-looking pointer anymore.
+  Worded as a one-paragraph note at the end of
+  the description so an agent reading the
+  description sees the gate's existence *before*
+  making the call, rather than after the call
+  fails.
+
+- **`docs/design.md` § What we are not doing (v1)
+  gains a dedicated bullet on body-substring
+  search without the gate.** Worded to lock the
+  scope boundary so a future map doesn't
+  re-litigate: "SilverBullet exposes no HTTP
+  search endpoint (the `/.fs` API is read-by-name
+  and list-by-directory, with no body-content
+  index); the bridge has no way to substring-search
+  page bodies without filesystem access to the SB
+  space directory. The journal gate
+  (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` +
+  `MCP_SILVERBULLET_SPACE_PATH`) is the only path.
+  Operators without that gate can still narrow by
+  name via `list_pages` (`prefix=` / `contains=`,
+  T37); operators who want body search enable the
+  gate and use `pages_touching_topic` /
+  `search_pages`. T38 surfaces the gate more loudly
+  in the README and `list_pages`'s description so
+  an operator who hits a "no body search" dead end
+  has an obvious next step rather than
+  relitigating the scope." The § Tools row for
+  `list_pages` gains a T38 reference and the
+  parenthetical updates to match the README's
+  new section name exactly ("Discovery tools
+  (journal-gated) section") so an operator
+  following the design.md cross-link lands on
+  the right README anchor.
+
+- **Env-var table rows gain parenthetical
+  pointers.** `MCP_SILVERBULLET_SPACE_PATH` and
+  `MCP_SILVERBULLET_JOURNAL_TOOLS` rows in the
+  README's env-var table both append "(see
+  [Discovery tools
+  (journal-gated)](#discovery-tools-journal-gated))"
+  so an operator who reaches the table from the
+  boot-order section sees the gate's destination
+  in the same sentence. The
+  `list_tasks` per-page-form description and the
+  Pi-session usage section also gain the same
+  cross-reference so every "where do I find the
+  journal tools" thread converges on the new
+  heading.
+
+- **One new Layer-1 case in
+  `tests/test_tools_in_memory.py`:
+  `test_t38_list_pages_description_points_at_journal_gate`** —
+  builds an in-memory MCP server via the
+  existing `_build` helper, calls `list_tools`,
+  finds the `list_pages` entry, and asserts the
+  description carries all four T38 tokens:
+  `"matches against page *names*"` (the
+  filter-scope note), `"body-content search"`
+  (the missing-axis note), `"MCP_SILVERBULLET_JOURNAL_TOOLS=1"`
+  (the opt-in env var by name), and
+  `"MCP_SILVERBULLET_SPACE_PATH"` (the
+  space-path env var by name). Pins the
+  description so a future edit can't silently
+  drop the pointer — the consequence of dropping
+  it is exactly the bug reporter's experience (no
+  obvious next step after a `list_pages` miss).
+  The test name follows the existing
+  `test_tNN_*` convention so it shows up
+  alongside T37's substring-filter cases in the
+  `grep -n "t3[78]"` output a future session
+  will run to look up v1.4's surface.
+
+- **`CHANGELOG.md` v1.4 status line and `###
+  Added` section updated.** Status flips from
+  "T37 shipped 2026-08-31; T38 still on the
+  frontier" to "T37 + T38 shipped 2026-08-31;
+  v1.4 destination reached." The T37 entry's
+  closing line ("T38 (journal gate docs) remains
+  on the frontier; this entry ships T37 alone.")
+  is removed; a new T38 entry follows the T37
+  entry in `### Added` documenting the README
+  rename + refactor, the `list_pages` description
+  update, the design.md `## What we are not doing`
+  bullet, the env-var table pointers, and the
+  Layer-1 test by name.
+
+**Drive-by deviation from the ticket's charter**:
+the charter specified naming the three discovery
+tools + "a one-line summary of what each does and
+the two env vars that gate them" in the README's
+new section. The implementation names the tools
+(the discovery trio front-loads the section's
+purpose) but also keeps the three journal-analysis
+tools (`journal_histogram` / `tag_summary` /
+`recent_pages`) under the same section rather
+than splitting them into a separate "journal
+analysis" section. Rationale: all six tools are
+gated by the same env-var pair, so splitting them
+would force an operator who only reads the
+discovery-tools intro to bounce to a second
+section to discover the analysis tools exist. The
+charter's "three tools + one-line summary" rule
+is honored for the discovery trio (which gets
+the prominent placement); the analysis trio is
+moved to a smaller sub-list at the bottom of
+the same section so they're discoverable from
+the same heading. This is a presentation-shape
+call, not a functional one — every tool the
+charter names is present with the same
+description.
+
+All 526 tests pass (525 pre-T38 + 1 new T38
+case); live e2e tests skip cleanly without env
+vars (gated on `MCP_SILVERBULLET_LIVE_SB_URL` /
+`_TOKEN`). No new dependencies. No SDK version
+requirement change. No behavior change. No
+wire-shape change. The bridge is byte-for-byte
+the same on the success path and on the error
+path; T38 is local to the README, the
+`list_pages` description, the design.md
+`## What we are not doing` block, the env-var
+table rows, and the `list_tasks` /
+Pi-session sections.
+
+**Unblocks**: nothing (terminal ticket). **v1.4
+destination reached** — all open tickets on
+the v1.4 map (T37 + T38) shipped.
+
 ---
 
 ## Drive-by
@@ -557,3 +730,45 @@ to a v1.4 ticket; recorded so a future session sees them -->
   / document is the underlying `list_pages` /
   `read_page` / etc. contract, regardless of the
   consumer-facing name.
+
+## Drive-by from this session (T38 resolution)
+
+<!-- findings surfaced during T38's resolution that don't
+belong to a v1.4 ticket; recorded so a future session sees
+them -->
+
+- **The `list_pages` description already carried a
+  forward-looking `(T38 — …)` parenthetical** when T37
+  shipped. T38 closed it by replacing the
+  forward-looking ticket reference with a stable
+  README-section cross-reference ("Discovery tools
+  (journal-gated) section"). A future caller that
+  introspects the description and pattern-matches on
+  `T38` would have hit the parenthetical as dead text
+  after T38 lands. The replacement keeps the same
+  intent (gate pointer + discovery destination) and
+  drops the ticket reference. No behavior change for
+  agents that read the description semantically; the
+  four tokens the Layer-1 test pins
+  (`"matches against page *names*"` /
+  `"body-content search"` /
+  `"MCP_SILVERBULLET_JOURNAL_TOOLS=1"` /
+  `"MCP_SILVERBULLET_SPACE_PATH"`) are all preserved.
+- **The v1.3 map's T35 resolution entry references
+  `§ Optional: journal surface`** as the section
+  `find_backlinks` shipped under. This is locked
+  historical record (the T35 commit predates the
+  v1.4 T38 rename) and the v1.3 map's resolution
+  block describes what shipped at T35 time, not what
+  the section is called today. Not rewritten — the
+  resolution is the v1.3 truth. A future map that
+  needs to audit the rename's downstream history can
+  find this in the v1.3 map's resolution block.
+- **The v1.4 map's `## Not yet specified` section had
+  three fog patches** (parameter name, description
+  shape, AND-composition knob) that all resolved
+  with T37's commit `205b1`. T38's resolution cleans
+  them up so the section only carries the
+  `exclude=` fog patch (which is genuinely still
+  fog — no caller has needed it yet, so promoting
+  it to a ticket would be premature).
