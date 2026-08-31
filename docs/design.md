@@ -314,6 +314,24 @@ Resource template:
   JSON into `contents[0].text`; callers parse the JSON and read
   `body` / `etag` / `size_bytes` / `last_modified_ms` as needed.
 
+**v1.5 added name normalization (T39)** for every
+`name`-taking tool: a caller passing `"Foo"` resolves
+to `"Foo.md"` before the SB round trip, with a
+conditional `name_resolution` envelope field on the
+success response (`{"name_resolution": {"requested":
+"Foo", "resolved": "Foo.md", "suffix_added": ".md"}}`)
+so the agent learns the convention for its next call.
+The helper is `_normalize_page_name(name)` in
+`src/mcp_silverbullet/server.py` — pure, idempotent,
+surface-level invisible when the caller already passes
+a canonical name (no `name_resolution` field added).
+Names with an existing extension (`Foo.txt`,
+`Foo.tar.gz`, `.gitignore`) pass through unchanged;
+nested paths (`Areas/Foo`) get the `.md` appended only
+to the leaf segment. Threading is documented per-tool
+in the `src/mcp_silverbullet/server.py` handler
+docstrings.
+
 ### `X-Source: external`
 
 Every `write_page` PUT carries this header so SilverBullet can

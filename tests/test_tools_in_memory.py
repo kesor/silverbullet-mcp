@@ -162,7 +162,7 @@ async def test_read_page_returns_ack_envelope_on_200() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/.fs/index"
+        assert request.url.path == "/.fs/index.md"
         return httpx.Response(
             200,
             text="# hello",
@@ -175,7 +175,7 @@ async def test_read_page_returns_ack_envelope_on_200() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "index"})
+        result = await client.call_tool("read_page", {"name": "index.md"})
 
     assert result.is_error is False
     # ``size_bytes`` comes from SB's ``X-Content-Length`` response
@@ -207,7 +207,7 @@ async def test_read_page_ack_envelope_is_none_when_meta_stripped() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "index"})
+        result = await client.call_tool("read_page", {"name": "index.md"})
 
     assert result.is_error is False
     assert result.structured_content == {
@@ -225,7 +225,7 @@ async def test_read_page_404_returns_tool_error_with_design_doc_wording() -> Non
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "missing"})
+        result = await client.call_tool("read_page", {"name": "missing.md"})
 
     assert result.is_error is True
     # The SDK prefixes the ToolError message with "Error executing
@@ -233,7 +233,7 @@ async def test_read_page_404_returns_tool_error_with_design_doc_wording() -> Non
     # is what our handler raises, and the SDK adds the prefix on the
     # wire. Both shapes are stable; assert on the full wire text so a
     # future SDK change to the prefix is caught loudly.
-    assert _text(result) == "Error executing tool read_page: page not found: missing"
+    assert _text(result) == "Error executing tool read_page: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -243,10 +243,491 @@ async def test_read_page_5xx_returns_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "anything"})
+        result = await client.call_tool("read_page", {"name": "anything.md"})
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool read_page: silverbullet error: 503"
+
+
+# --- T39 name normalization --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_t39_read_page_normalizes_bare_name_to_md() -> None:
+    """``read_page("Foo")`` resolves to ``Foo.md`` on the SB side.
+
+    T39's name-normalization helper threads into every
+    ``name``-taking tool: a caller that passes ``"Foo"`` (no
+    extension) sees the bridge add ``.md`` before the SB round
+    trip, so the agent that asks for ``Foo`` gets the body of
+    ``Foo.md`` rather than a 404. The response also carries a
+    ``name_resolution`` field so the agent can learn the
+    convention for its next call.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The bridge should hit ``/.fs/Foo.md``, not ``/.fs/Foo``
+        # — that's the whole point of T39.
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            text="# body of Foo",
+            headers={"X-Content-Length": "14"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["body"] == "# body of Foo"
+    # The ``name_resolution`` envelope teaches the agent the
+    # convention: ``Foo`` → ``Foo.md``, ``.md`` appended.
+    assert sc["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_read_page_canonical_name_is_idempotent() -> None:
+    """``read_page("Foo.md")`` is a no-op for the normalization helper.
+
+    The helper is idempotent: a caller that already passes the
+    canonical form (``Foo.md``) sees the same SB request and the
+    same response envelope (no ``name_resolution`` field — the
+    input was already canonical, so there's nothing to teach).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            text="# body of Foo",
+            headers={"X-Content-Length": "14"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo.md"})
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["body"] == "# body of Foo"
+    assert "name_resolution" not in sc
+
+
+@pytest.mark.asyncio
+async def test_t39_read_page_preserves_non_md_extension() -> None:
+    """A non-md extension (``Foo.txt``) passes through unchanged.
+
+    T39's helper only appends ``.md`` to bare names (no ``.`` in
+    the basename). A caller passing ``Foo.txt`` is signalling
+    "this is a non-markdown file" — the helper respects that and
+    doesn't append ``.md`` (which would produce ``Foo.txt.md``,
+    clearly wrong).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.txt"
+        return httpx.Response(
+            200,
+            text="plain text body",
+            headers={"X-Content-Length": "16"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo.txt"})
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["body"] == "plain text body"
+    assert "name_resolution" not in sc
+
+
+@pytest.mark.asyncio
+async def test_t39_read_page_strips_whitespace() -> None:
+    """Stray whitespace around the name is stripped before normalization.
+
+    The helper strips leading/trailing whitespace *first*, then
+    applies the ``.md`` rule. A caller passing ``"  Foo  "``
+    resolves to ``Foo.md`` (whitespace stripped, then ``.md``
+    appended to the bare basename).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            text="body",
+            headers={"X-Content-Length": "4"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "  Foo  "})
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["body"] == "body"
+    assert sc["name_resolution"] == {
+        "requested": "  Foo  ",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_read_page_normalizes_nested_path() -> None:
+    """``read_page("Areas/Foo")`` resolves to ``Areas/Foo.md``.
+
+    The helper's extension check is on the *basename* (the
+    segment after the last ``/``), so a nested path with a bare
+    leaf gets the ``.md`` appended only to the leaf.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Areas/Foo.md"
+        return httpx.Response(
+            200,
+            text="body",
+            headers={"X-Content-Length": "4"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Areas/Foo"})
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["body"] == "body"
+    assert sc["name_resolution"] == {
+        "requested": "Areas/Foo",
+        "resolved": "Areas/Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_page_exists_normalizes_bare_name() -> None:
+    """``page_exists("Foo")`` returns ``True`` when ``Foo.md`` exists.
+
+    ``page_exists`` returns ``bool`` so there is no envelope to
+    attach a ``name_resolution`` field to. The agent learns the
+    convention by reading the call (``page_exists("Foo")``
+    succeeded → the page is at ``Foo.md``).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(200, text="body")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("page_exists", {"name": "Foo"})
+
+    assert result.is_error is False
+    assert result.structured_content == {"result": True}
+
+
+@pytest.mark.asyncio
+async def test_t39_write_page_creates_md_file_for_bare_name() -> None:
+    """``write_page("Foo", "hello")`` creates ``Foo.md``, not ``Foo``.
+
+    The write tool's response echoes the canonical name the
+    bridge actually used, plus the ``name_resolution`` field so
+    the agent can confirm the convention. A caller passing
+    ``"Foo"`` sees the response carry ``name="Foo.md"``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"v1"',
+                "X-Created": "1700000000000",
+                "X-Last-Modified": "1700000000000",
+                "X-Content-Length": "5",
+            },
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "Foo", "content": "hello"}
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    # ``name`` echoes the canonical name the bridge used.
+    assert sc["name"] == "Foo.md"
+    # ``name_resolution`` teaches the agent the convention.
+    assert sc["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_write_page_preserves_non_md_extension() -> None:
+    """``write_page("Foo.txt", "hello")`` creates ``Foo.txt``.
+
+    The extension-detection rule: ``Foo.txt`` already has a ``.``,
+    so the helper doesn't append ``.md``. The agent sees
+    ``name="Foo.txt"`` in the response (canonical form, unchanged
+    from the input).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.txt"
+        return httpx.Response(
+            200,
+            headers={
+                "ETag": '"v1"',
+                "X-Created": "1700000000000",
+                "X-Last-Modified": "1700000000000",
+                "X-Content-Length": "5",
+            },
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "Foo.txt", "content": "hello"}
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["name"] == "Foo.txt"
+    assert "name_resolution" not in sc
+
+
+@pytest.mark.asyncio
+async def test_t39_move_page_normalizes_both_names() -> None:
+    """``move_page("Foo", "Bar")`` resolves to ``Foo.md`` → ``Bar.md``.
+
+    Both source and destination normalize independently. The
+    source's resolution surfaces on the response envelope; the
+    destination's resolution is implicit via the echoed
+    ``name`` field (which is the destination's canonical name).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/.fs/Foo.md"
+            return httpx.Response(200, text="body of Foo")
+        if request.method == "PUT":
+            assert request.url.path == "/.fs/Bar.md"
+            return httpx.Response(
+                200,
+                headers={
+                    "ETag": '"v2"',
+                    "X-Created": "1700000000000",
+                    "X-Last-Modified": "1700000000000",
+                    "X-Content-Length": "9",
+                },
+            )
+        if request.method == "DELETE":
+            assert request.url.path == "/.fs/Foo.md"
+            return httpx.Response(200, headers={"ETag": '"v2"'})
+        raise AssertionError(f"unexpected method {request.method}")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "Foo", "new_name": "Bar"}
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    # Destination name is the canonical form.
+    assert sc["name"] == "Bar.md"
+    # Source name resolution surfaces explicitly.
+    assert sc["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_move_page_same_name_normalizes_both() -> None:
+    """``move_page("Foo", "Foo")`` is a no-op once both sides normalize.
+
+    The same-name short-circuit compares the *resolved* names
+    (not the caller's raw inputs), so ``move_page("Foo", "Foo")``
+    and ``move_page("Foo.md", "Foo")`` both become no-ops once
+    both sides normalize to ``Foo.md``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Only the read is issued (no-op short-circuit).
+        assert request.method == "GET"
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            text="body of Foo",
+            headers={"X-Content-Length": "11"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page", {"name": "Foo", "new_name": "Foo.md"}
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["name"] == "Foo.md"
+    # Source's name_resolution: ``Foo`` → ``Foo.md`` (because
+    # that's what the helper did before the same-name comparison).
+    assert sc["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_list_tasks_normalizes_page_name() -> None:
+    """``list_tasks(page="Areas/Foo")`` reads ``Areas/Foo.md``.
+
+    Per-page form: the page name goes through the normalization
+    helper before the SB round trip. Each entry's ``name``
+    field carries the canonical name so the agent learns the
+    convention by reading the rows.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Areas/Foo.md"
+        return httpx.Response(
+            200,
+            text="- [ ] todo with [[Pages/Hobbies]] ref\n",
+            headers={"X-Content-Length": "38"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_tasks", {"page": "Areas/Foo"}
+        )
+
+    assert result.is_error is False
+    rows = result.structured_content["result"]
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Areas/Foo.md"
+
+
+@pytest.mark.asyncio
+async def test_t39_check_task_normalizes_page_name() -> None:
+    """``check_task(page="Foo", ref="Ref")`` writes to ``Foo.md``.
+
+    The page argument normalizes; the ref argument (a wikilink
+    target) does NOT normalize — it's a wikilink target, not a
+    page name. The response carries the canonical ``name``
+    field and the ``name_resolution`` envelope.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/.fs/Foo.md"
+            return httpx.Response(
+                200,
+                text="header\n- [ ] task [[Ref]] ref\n",
+                headers={"X-Content-Length": "26"},
+            )
+        if request.method == "PUT":
+            assert request.url.path == "/.fs/Foo.md"
+            return httpx.Response(
+                200,
+                headers={
+                    "ETag": '"v2"',
+                    "X-Created": "1700000000000",
+                    "X-Last-Modified": "1700000000000",
+                    "X-Content-Length": "26",
+                },
+            )
+        raise AssertionError(f"unexpected method {request.method}")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task", {"page": "Foo", "ref": "Ref"}
+        )
+
+    assert result.is_error is False
+    sc = result.structured_content or {}
+    assert sc["name"] == "Foo.md"
+    assert sc["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_resource_template_normalizes_name() -> None:
+    """The ``silverbullet://page/{name}`` resource normalizes too.
+
+    The resource template's path parameter is also normalized:
+    reading ``silverbullet://page/Foo`` resolves to
+    ``Foo.md`` on the SB side, with the same ``name_resolution``
+    feedback on the response envelope.
+    """
+    import json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.fs/Foo.md"
+        return httpx.Response(
+            200,
+            text="# page body",
+            headers={"X-Content-Length": "11"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.read_resource("silverbullet://page/Foo")
+
+    assert len(result.contents) == 1
+    content = result.contents[0]
+    assert getattr(content, "mime_type", None) == "application/json"
+    payload = json.loads(content.text)
+    assert payload["body"] == "# page body"
+    assert payload["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t39_diff_pages_normalizes_both_names() -> None:
+    """``diff_pages("Foo", other_name="Bar")`` resolves both sides.
+
+    Each per-page envelope carries its own ``name_resolution``
+    field (the first envelope's for ``Foo`` → ``Foo.md``; the
+    second envelope's for ``Bar`` → ``Bar.md``).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.fs/Foo.md":
+            return httpx.Response(200, text="alpha\n")
+        if request.url.path == "/.fs/Bar.md":
+            return httpx.Response(200, text="alpha\n")
+        return httpx.Response(404, text="page not found")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "diff_pages", {"name": "Foo", "other_name": "Bar"}
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content or {}
+    assert payload["name"]["name_resolution"] == {
+        "requested": "Foo",
+        "resolved": "Foo.md",
+        "suffix_added": ".md",
+    }
+    assert payload["other"]["name_resolution"] == {
+        "requested": "Bar",
+        "resolved": "Bar.md",
+        "suffix_added": ".md",
+    }
 
 
 # --- page_exists -------------------------------------------------------
@@ -264,12 +745,12 @@ async def test_page_exists_returns_true_on_200() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/.fs/index"
+        assert request.url.path == "/.fs/index.md"
         return httpx.Response(200, text="# body")
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "index"})
+        result = await client.call_tool("page_exists", {"name": "index.md"})
 
     assert result.is_error is False
     # ``page_exists`` returns a Python ``bool``; the SDK wraps
@@ -296,7 +777,7 @@ async def test_page_exists_returns_false_on_404() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "missing"})
+        result = await client.call_tool("page_exists", {"name": "missing.md"})
 
     assert result.is_error is False
     assert result.structured_content == {"result": False}
@@ -318,7 +799,7 @@ async def test_page_exists_5xx_returns_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "anything"})
+        result = await client.call_tool("page_exists", {"name": "anything.md"})
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool page_exists: silverbullet error: 503"
@@ -340,7 +821,7 @@ async def test_page_exists_timeout_returns_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "anything"})
+        result = await client.call_tool("page_exists", {"name": "anything.md"})
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool page_exists: silverbullet request timed out"
@@ -364,7 +845,7 @@ async def test_page_exists_412_returns_precondition_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "index"})
+        result = await client.call_tool("page_exists", {"name": "index.md"})
 
     assert result.is_error is True
     assert (
@@ -392,7 +873,7 @@ async def test_page_exists_does_not_materialize_body() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "index"})
+        result = await client.call_tool("page_exists", {"name": "index.md"})
 
     assert result.is_error is False
     # ``bool`` is the wire shape. Nothing else.
@@ -430,7 +911,7 @@ async def test_write_page_returns_ack_envelope_on_200() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "# new body"},
+            {"name": "index.md", "content": "# new body"},
         )
 
     assert result.is_error is False
@@ -441,7 +922,7 @@ async def test_write_page_returns_ack_envelope_on_200() -> None:
     # way single-value returns are — a dict return IS the
     # structured payload).
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": '"abc123"',
         "size_bytes": 10,
         "last_modified_ms": 1700000000123,
@@ -466,12 +947,12 @@ async def test_write_page_ack_envelope_is_none_when_meta_stripped() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "# new body"},
+            {"name": "index.md", "content": "# new body"},
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": None,
         "size_bytes": 10,
         "last_modified_ms": None,
@@ -508,7 +989,7 @@ async def test_write_page_forwards_if_match() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is False
@@ -523,11 +1004,11 @@ async def test_write_page_404_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "write_page", {"name": "missing", "content": "body"}
+            "write_page", {"name": "missing.md", "content": "body"}
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool write_page: page not found: missing"
+    assert _text(result) == "Error executing tool write_page: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -539,7 +1020,7 @@ async def test_write_page_412_returns_tool_error_with_design_doc_wording() -> No
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": "*"},
+            {"name": "index.md", "content": "body", "if_match": "*"},
         )
 
     assert result.is_error is True
@@ -554,7 +1035,7 @@ async def test_write_page_413_returns_tool_error_with_4_mib_wording() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "write_page", {"name": "index", "content": "x" * 1024}
+            "write_page", {"name": "index.md", "content": "x" * 1024}
         )
 
     assert result.is_error is True
@@ -569,7 +1050,7 @@ async def test_write_page_5xx_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "write_page", {"name": "index", "content": "body"}
+            "write_page", {"name": "index.md", "content": "body"}
         )
 
     assert result.is_error is True
@@ -592,16 +1073,16 @@ async def test_delete_page_returns_ack_envelope_on_200() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
-        assert request.url.path == "/.fs/index"
+        assert request.url.path == "/.fs/index.md"
         return httpx.Response(200, headers={"ETag": '"abc123"'})
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("delete_page", {"name": "index"})
+        result = await client.call_tool("delete_page", {"name": "index.md"})
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": '"abc123"',
         "size_bytes": None,
         "last_modified_ms": None,
@@ -623,11 +1104,11 @@ async def test_delete_page_ack_envelope_when_etag_header_missing() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("delete_page", {"name": "index"})
+        result = await client.call_tool("delete_page", {"name": "index.md"})
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": None,
         "size_bytes": None,
         "last_modified_ms": None,
@@ -653,7 +1134,7 @@ async def test_delete_page_forwards_if_match_star() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "delete_page",
-            {"name": "index", "if_match": "*"},
+            {"name": "index.md", "if_match": "*"},
         )
 
     assert result.is_error is False
@@ -667,10 +1148,10 @@ async def test_delete_page_404_returns_tool_error_with_design_doc_wording() -> N
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("delete_page", {"name": "missing"})
+        result = await client.call_tool("delete_page", {"name": "missing.md"})
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool delete_page: page not found: missing"
+    assert _text(result) == "Error executing tool delete_page: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -689,7 +1170,7 @@ async def test_delete_page_412_with_if_match_star_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "delete_page", {"name": "missing", "if_match": "*"}
+            "delete_page", {"name": "missing.md", "if_match": "*"}
         )
 
     assert result.is_error is True
@@ -705,7 +1186,7 @@ async def test_delete_page_412_with_stale_if_match_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "delete_page",
-            {"name": "index", "if_match": '"stale"'},
+            {"name": "index.md", "if_match": '"stale"'},
         )
 
     assert result.is_error is True
@@ -719,7 +1200,7 @@ async def test_delete_page_5xx_returns_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("delete_page", {"name": "anything"})
+        result = await client.call_tool("delete_page", {"name": "anything.md"})
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool delete_page: silverbullet error: 502"
@@ -761,12 +1242,12 @@ async def test_append_to_page_returns_ack_envelope_on_200() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world"},
+            {"name": "index.md", "text": "world"},
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": '"v2"',
         "size_bytes": 11,  # ``hello\nworld`` = 11 UTF-8 bytes
         "last_modified_ms": 1700000000123,
@@ -774,8 +1255,8 @@ async def test_append_to_page_returns_ack_envelope_on_200() -> None:
     }
     # Read first, then write — locks the read-modify-write ordering.
     assert calls == [
-        ("GET", "/.fs/index"),
-        ("PUT", "/.fs/index"),
+        ("GET", "/.fs/index.md"),
+        ("PUT", "/.fs/index.md"),
     ]
 
 
@@ -798,7 +1279,7 @@ async def test_append_to_page_separator_inserted_when_body_lacks_newline() -> No
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "hello"},
+            {"name": "index.md", "text": "hello"},
         )
 
     assert seen_body == [b"goodbye\nhello"]
@@ -823,7 +1304,7 @@ async def test_append_to_page_no_extra_separator_when_body_ends_in_newline() -> 
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world"},
+            {"name": "index.md", "text": "world"},
         )
 
     assert seen_body == [b"hello\nworld"]
@@ -849,7 +1330,7 @@ async def test_append_to_page_no_extra_separator_for_multiple_trailing_newlines(
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world"},
+            {"name": "index.md", "text": "world"},
         )
 
     assert seen_body == [b"hello\n\nworld"]
@@ -874,7 +1355,7 @@ async def test_append_to_page_works_on_empty_body() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "hello"},
+            {"name": "index.md", "text": "hello"},
         )
 
     assert result.is_error is False
@@ -902,7 +1383,7 @@ async def test_append_to_page_text_with_leading_newline_does_not_double_separato
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "\nworld"},
+            {"name": "index.md", "text": "\nworld"},
         )
 
     assert seen_body == [b"hello\n\nworld"]
@@ -925,7 +1406,7 @@ async def test_append_to_page_empty_text_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": ""},
+            {"name": "index.md", "text": ""},
         )
 
     assert result.is_error is True
@@ -962,7 +1443,7 @@ async def test_append_to_page_forwards_if_match_to_write() -> None:
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "if_match": '"v1"'},
+            {"name": "index.md", "text": "world", "if_match": '"v1"'},
         )
 
     # Initial sequence is read-then-write; the T31b verification
@@ -999,7 +1480,7 @@ async def test_append_to_page_forwards_if_match_star() -> None:
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "if_match": "*"},
+            {"name": "index.md", "text": "world", "if_match": "*"},
         )
 
     assert seen_if_match == ["*"]
@@ -1015,11 +1496,11 @@ async def test_append_to_page_404_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "append_to_page", {"name": "missing", "text": "world"}
+            "append_to_page", {"name": "missing.md", "text": "world"}
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool append_to_page: page not found: missing"
+    assert _text(result) == "Error executing tool append_to_page: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1522,7 @@ async def test_append_to_page_412_returns_tool_error_with_design_doc_wording() -
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "if_match": '"stale"'},
+            {"name": "index.md", "text": "world", "if_match": '"stale"'},
         )
 
     assert result.is_error is True
@@ -1060,7 +1541,7 @@ async def test_append_to_page_413_returns_tool_error_with_4_mib_wording() -> Non
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "append_to_page", {"name": "index", "text": "world"}
+            "append_to_page", {"name": "index.md", "text": "world"}
         )
 
     assert result.is_error is True
@@ -1083,7 +1564,7 @@ async def test_append_to_page_5xx_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "append_to_page", {"name": "index", "text": "world"}
+            "append_to_page", {"name": "index.md", "text": "world"}
         )
 
     assert result.is_error is True
@@ -1107,12 +1588,12 @@ async def test_append_to_page_ack_envelope_when_etag_header_missing() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "append_to_page", {"name": "index", "text": "world"}
+            "append_to_page", {"name": "index.md", "text": "world"}
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": None,
         "size_bytes": 11,
         "last_modified_ms": None,
@@ -1162,7 +1643,7 @@ async def test_append_to_page_dry_run_returns_envelope_without_writing() -> None
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "dry_run": True},
+            {"name": "index.md", "text": "world", "dry_run": True},
         )
 
     assert result.is_error is False
@@ -1210,7 +1691,7 @@ async def test_append_to_page_dry_run_inserts_separator_when_body_lacks_newline(
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "hello", "dry_run": True},
+            {"name": "index.md", "text": "hello", "dry_run": True},
         )
 
     assert writes == []  # no PUT on dry-run
@@ -1243,7 +1724,7 @@ async def test_append_to_page_dry_run_matching_if_match_succeeds() -> None:
         result = await client.call_tool(
             "append_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "text": "world",
                 "if_match": '"v1"',
                 "dry_run": True,
@@ -1281,7 +1762,7 @@ async def test_append_to_page_dry_run_stale_if_match_raises_412_tool_error() -> 
         result = await client.call_tool(
             "append_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "text": "world",
                 "if_match": '"stale"',
                 "dry_run": True,
@@ -1324,7 +1805,7 @@ async def test_append_to_page_dry_run_star_if_match_404s_on_missing_page() -> No
         result = await client.call_tool(
             "append_to_page",
             {
-                "name": "missing",
+                "name": "missing.md",
                 "text": "world",
                 "if_match": "*",
                 "dry_run": True,
@@ -1333,7 +1814,7 @@ async def test_append_to_page_dry_run_star_if_match_404s_on_missing_page() -> No
 
     assert result.is_error is True
     assert _text(result) == (
-        "Error executing tool append_to_page: page not found: missing"
+        "Error executing tool append_to_page: page not found: missing.md"
     )
     assert writes == []
 
@@ -1360,7 +1841,7 @@ async def test_append_to_page_dry_run_empty_text_still_errors() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "", "dry_run": True},
+            {"name": "index.md", "text": "", "dry_run": True},
         )
 
     assert result.is_error is True
@@ -1396,7 +1877,7 @@ async def test_patch_page_lines_dry_run_returns_envelope_without_writing() -> No
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 3,
                 "new_content": "B\nC",
@@ -1444,7 +1925,7 @@ async def test_patch_page_lines_dry_run_preserves_trailing_newline() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 2,
                 "new_content": "X",
@@ -1479,7 +1960,7 @@ async def test_patch_page_lines_dry_run_stale_if_match_raises_412_tool_error() -
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "A",
@@ -1521,7 +2002,7 @@ async def test_patch_page_lines_dry_run_out_of_bounds_still_errors() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 5,
                 "end_line": 6,
                 "new_content": "X",
@@ -1558,7 +2039,7 @@ async def test_patch_page_replace_dry_run_returns_envelope_without_writing() -> 
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
                 "dry_run": True,
@@ -1601,7 +2082,7 @@ async def test_patch_page_replace_dry_run_replace_all_does_not_write() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "X",
                 "new_string": "Y",
                 "replace_all": True,
@@ -1632,7 +2113,7 @@ async def test_patch_page_replace_dry_run_stale_if_match_raises_412_tool_error()
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
                 "if_match": '"stale"',
@@ -1670,7 +2151,7 @@ async def test_patch_page_replace_dry_run_find_not_found_still_errors() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "absent",
                 "new_string": "X",
                 "dry_run": True,
@@ -1709,7 +2190,7 @@ async def test_patch_page_replace_dry_run_multiple_matches_default_errors() -> N
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "abc",
                 "new_string": "X",
                 "dry_run": True,
@@ -1747,7 +2228,7 @@ async def test_patch_page_replace_dry_run_no_change_diff_is_empty() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "world",
                 "dry_run": True,
@@ -1787,7 +2268,7 @@ async def test_patch_page_lines_returns_etag_on_200() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 3,
                 "new_content": "B\nC",
@@ -1796,7 +2277,7 @@ async def test_patch_page_lines_returns_etag_on_200() -> None:
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": '"v2"',
         "size_bytes": 7,  # ``a\nB\nC\nd`` = 7 UTF-8 bytes
         "last_modified_ms": None,
@@ -1823,7 +2304,7 @@ async def test_patch_page_lines_replaces_first_n_lines() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 2,
                 "new_content": "A\nB",
@@ -1849,7 +2330,7 @@ async def test_patch_page_lines_replaces_last_n_lines() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 3,
                 "end_line": 4,
                 "new_content": "C\nD",
@@ -1878,7 +2359,7 @@ async def test_patch_page_lines_replaces_entire_body() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 3,
                 "new_content": "x",
@@ -1909,7 +2390,7 @@ async def test_patch_page_lines_empty_new_content_deletes_range() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 3,
                 "new_content": "",
@@ -1941,7 +2422,7 @@ async def test_patch_page_lines_preserves_trailing_newline() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 2,
                 "new_content": "X",
@@ -1972,7 +2453,7 @@ async def test_patch_page_lines_no_trailing_newline_added_if_body_lacks_one() ->
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 2,
                 "new_content": "X",
@@ -2006,7 +2487,7 @@ async def test_patch_page_lines_new_content_with_trailing_newline_does_not_doubl
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 2,
                 "new_content": "X\n",
@@ -2035,7 +2516,7 @@ async def test_patch_page_lines_start_line_zero_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 0,
                 "end_line": 1,
                 "new_content": "X",
@@ -2061,7 +2542,7 @@ async def test_patch_page_lines_negative_start_line_returns_tool_error() -> None
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": -1,
                 "end_line": 1,
                 "new_content": "X",
@@ -2092,7 +2573,7 @@ async def test_patch_page_lines_end_line_less_than_start_line_returns_tool_error
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 3,
                 "end_line": 2,
                 "new_content": "X",
@@ -2123,7 +2604,7 @@ async def test_patch_page_lines_end_line_past_last_line_returns_tool_error() -> 
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 99,
                 "new_content": "X",
@@ -2157,7 +2638,7 @@ async def test_patch_page_lines_patches_into_an_empty_page() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "x",
@@ -2188,7 +2669,7 @@ async def test_patch_page_lines_replaces_only_line_in_single_line_page() -> None
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "X",
@@ -2203,7 +2684,7 @@ async def test_patch_page_lines_handles_universal_newlines_in_body() -> None:
     """The split is on ``\\n`` only, not ``splitlines``.
 
     A body containing ``\\r\\n`` line endings (which SB doesn't emit
-    but a stray editor could have left behind) gets one CR character
+    but a.md stray editor could have left behind) gets one CR character
     at the end of each line — the patch treats the CR as part of the
     line content. The behavior is locked down so a future refactor
     that calls ``splitlines()`` (and silently strips ``\\r``) gets
@@ -2222,7 +2703,7 @@ async def test_patch_page_lines_handles_universal_newlines_in_body() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 2,
                 "end_line": 2,
                 "new_content": "B",
@@ -2260,7 +2741,7 @@ async def test_patch_page_lines_forwards_if_match_to_write() -> None:
         await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "A",
@@ -2291,7 +2772,7 @@ async def test_patch_page_lines_stale_if_match_returns_412_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "A",
@@ -2315,7 +2796,7 @@ async def test_patch_page_lines_404_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "missing",
+                "name": "missing.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "X",
@@ -2323,7 +2804,7 @@ async def test_patch_page_lines_404_returns_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool patch_page_lines: page not found: missing"
+    assert _text(result) == "Error executing tool patch_page_lines: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -2340,7 +2821,7 @@ async def test_patch_page_lines_413_returns_tool_error_with_4_mib_wording() -> N
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 2,
                 "new_content": "x" * 1024,
@@ -2369,7 +2850,7 @@ async def test_patch_page_lines_5xx_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "A",
@@ -2399,7 +2880,7 @@ async def test_patch_page_lines_ack_envelope_when_etag_header_missing() -> None:
         result = await client.call_tool(
             "patch_page_lines",
             {
-                "name": "index",
+                "name": "index.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": "A",
@@ -2408,7 +2889,7 @@ async def test_patch_page_lines_ack_envelope_when_etag_header_missing() -> None:
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": None,
         "size_bytes": 3,
         "last_modified_ms": None,
@@ -2442,12 +2923,12 @@ async def test_patch_page_replace_returns_etag_on_200() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "patch_page_replace",
-            {"name": "index", "find": "world", "new_string": "SB"},
+            {"name": "index.md", "find": "world", "new_string": "SB"},
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": '"v2"',
         "size_bytes": 8,  # ``hello SB`` = 8 UTF-8 bytes
         "last_modified_ms": None,
@@ -2456,8 +2937,8 @@ async def test_patch_page_replace_returns_etag_on_200() -> None:
     # Read first, then write — locks the read-modify-write ordering
     # (same shape as ``append_to_page`` and ``patch_page_lines``).
     assert calls == [
-        ("GET", "/.fs/index"),
-        ("PUT", "/.fs/index"),
+        ("GET", "/.fs/index.md"),
+        ("PUT", "/.fs/index.md"),
     ]
 
 
@@ -2484,7 +2965,7 @@ async def test_patch_page_replace_default_replace_all_replaces_single_match() ->
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "patch_page_replace",
-            {"name": "index", "find": "world", "new_string": "SB"},
+            {"name": "index.md", "find": "world", "new_string": "SB"},
         )
 
     assert seen_writes == [b"hello SB"]
@@ -2509,7 +2990,7 @@ async def test_patch_page_replace_multiple_matches_with_default_errors() -> None
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "patch_page_replace",
-            {"name": "index", "find": "foo", "new_string": "FOO"},
+            {"name": "index.md", "find": "foo", "new_string": "FOO"},
         )
 
     assert result.is_error is True
@@ -2537,7 +3018,7 @@ async def test_patch_page_replace_multiple_matches_explicit_replace_all_false_er
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "foo",
                 "new_string": "FOO",
                 "replace_all": False,
@@ -2567,7 +3048,7 @@ async def test_patch_page_replace_replace_all_true_replaces_every_match() -> Non
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "foo",
                 "new_string": "FOO",
                 "replace_all": True,
@@ -2598,7 +3079,7 @@ async def test_patch_page_replace_find_not_found_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "missing",
                 "new_string": "X",
                 "replace_all": True,  # even with all-match opt-in
@@ -2632,7 +3113,7 @@ async def test_patch_page_replace_empty_find_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "patch_page_replace",
-            {"name": "index", "find": "", "new_string": "X"},
+            {"name": "index.md", "find": "", "new_string": "X"},
         )
 
     assert result.is_error is True
@@ -2662,7 +3143,7 @@ async def test_patch_page_replace_find_with_no_textual_overlap_returns_tool_erro
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "xyz",
                 "new_string": "FOO",
                 "replace_all": True,
@@ -2698,7 +3179,7 @@ async def test_patch_page_replace_treats_find_as_literal_not_regex() -> None:
         await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "\\d",
                 "new_string": "X",
                 "replace_all": True,
@@ -2732,7 +3213,7 @@ async def test_patch_page_replace_empty_new_string_deletes_occurrences() -> None
         await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "cd",
                 "new_string": "",
             },
@@ -2765,7 +3246,7 @@ async def test_patch_page_replace_find_spanning_newlines_works() -> None:
         await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "1\nline 2",
                 "new_string": "X",
             },
@@ -2798,7 +3279,7 @@ async def test_patch_page_replace_forwards_if_match_to_write() -> None:
         await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
                 "if_match": '"v1"',
@@ -2836,7 +3317,7 @@ async def test_patch_page_replace_forwards_if_match_star() -> None:
         await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
                 "if_match": "*",
@@ -2860,7 +3341,7 @@ async def test_patch_page_replace_stale_if_match_returns_412_tool_error() -> Non
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
                 "if_match": '"stale"',
@@ -2886,7 +3367,7 @@ async def test_patch_page_replace_404_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "missing",
+                "name": "missing.md",
                 "find": "anything",
                 "new_string": "X",
             },
@@ -2894,7 +3375,7 @@ async def test_patch_page_replace_404_returns_tool_error() -> None:
 
     assert result.is_error is True
     assert _text(result) == (
-        "Error executing tool patch_page_replace: page not found: missing"
+        "Error executing tool patch_page_replace: page not found: missing.md"
     )
 
 
@@ -2912,7 +3393,7 @@ async def test_patch_page_replace_413_returns_tool_error_with_4_mib_wording() ->
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "X",
             },
@@ -2943,7 +3424,7 @@ async def test_patch_page_replace_5xx_returns_tool_error() -> None:
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
             },
@@ -2974,7 +3455,7 @@ async def test_patch_page_replace_ack_envelope_when_etag_header_missing() -> Non
         result = await client.call_tool(
             "patch_page_replace",
             {
-                "name": "index",
+                "name": "index.md",
                 "find": "world",
                 "new_string": "SB",
             },
@@ -2982,7 +3463,7 @@ async def test_patch_page_replace_ack_envelope_when_etag_header_missing() -> Non
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "index",
+        "name": "index.md",
         "etag": None,
         "size_bytes": 8,
         "last_modified_ms": None,
@@ -3015,8 +3496,8 @@ async def test_list_pages_returns_file_metas_on_200() -> None:
     ``MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1``.
     """
     payload = [
-        {"name": "index", "etag": '"a"', "size": 12},
-        {"name": "page-2", "etag": None, "size": 7},
+        {"name": "index.md", "etag": '"a"', "size": 12},
+        {"name": "page-2.md", "etag": None, "size": 7},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3038,14 +3519,14 @@ async def test_list_pages_returns_file_metas_on_200() -> None:
     assert result.structured_content == {
         "result": [
             {
-                "name": "index",
+                "name": "index.md",
                 "etag": '"a"',
                 "size_bytes": 12,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "page-2",
+                "name": "page-2.md",
                 "etag": None,
                 "size_bytes": 7,
                 "last_modified_ms": None,
@@ -3058,9 +3539,9 @@ async def test_list_pages_returns_file_metas_on_200() -> None:
 @pytest.mark.asyncio
 async def test_list_pages_filters_by_prefix() -> None:
     payload = [
-        {"name": "index", "etag": None, "size": 1},
-        {"name": "journal/2026-01-01", "etag": None, "size": 2},
-        {"name": "journal/2026-01-02", "etag": None, "size": 3},
+        {"name": "index.md", "etag": None, "size": 1},
+        {"name": "journal/2026-01-01.md", "etag": None, "size": 2},
+        {"name": "journal/2026-01-02.md", "etag": None, "size": 3},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3081,14 +3562,14 @@ async def test_list_pages_filters_by_prefix() -> None:
     assert result.structured_content == {
         "result": [
             {
-                "name": "journal/2026-01-01",
+                "name": "journal/2026-01-01.md",
                 "etag": None,
                 "size_bytes": 2,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "journal/2026-01-02",
+                "name": "journal/2026-01-02.md",
                 "etag": None,
                 "size_bytes": 3,
                 "last_modified_ms": None,
@@ -3129,8 +3610,8 @@ async def test_list_pages_hydration_off_by_default_keeps_etag_none() -> None:
     silently is caught loudly.
     """
     payload = [
-        {"name": "index", "size": 1},
-        {"name": "page-2", "size": 2},
+        {"name": "index.md", "size": 1},
+        {"name": "page-2.md", "size": 2},
     ]
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -3162,14 +3643,14 @@ async def test_list_pages_hydration_off_by_default_keeps_etag_none() -> None:
     assert result.structured_content == {
         "result": [
             {
-                "name": "index",
+                "name": "index.md",
                 "etag": None,
                 "size_bytes": 1,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "page-2",
+                "name": "page-2.md",
                 "etag": None,
                 "size_bytes": 2,
                 "last_modified_ms": None,
@@ -3201,16 +3682,16 @@ async def test_list_pages_hydrates_etags_when_opted_in() -> None:
     test catches that loudly.
     """
     list_payload = [
-        {"name": "index", "size": 1, "created": 1700000000000},
-        {"name": "page-2", "size": 2, "created": 1700000001000},
+        {"name": "index.md", "size": 1, "created": 1700000000000},
+        {"name": "page-2.md", "size": 2, "created": 1700000001000},
     ]
 
     # Per-page ETag values keyed by page name. The hydration
     # walker issues one GET per page and surfaces each row's
     # ``ETag`` as the etag field.
     per_page_etags = {
-        "index": '"hydrated-a"',
-        "page-2": '"hydrated-b"',
+        "index.md": '"hydrated-a"',
+        "page-2.md": '"hydrated-b"',
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3250,21 +3731,21 @@ async def test_list_pages_hydrates_etags_when_opted_in() -> None:
     # implementation.
     paths = [path for _, path in seen]
     assert paths[0] == "/.fs"
-    assert sorted(paths[1:]) == ["/.fs/index", "/.fs/page-2"]
+    assert sorted(paths[1:]) == ["/.fs/index.md", "/.fs/page-2.md"]
     # Each row's etag is the hydrated value; the size /
     # timestamps come from the list payload (not the per-page
     # GET — hydration is etag-only).
     assert result.structured_content == {
         "result": [
             {
-                "name": "index",
+                "name": "index.md",
                 "etag": '"hydrated-a"',
                 "size_bytes": 1,
                 "last_modified_ms": 1700000009999,
                 "created_ms": 1700000000000,
             },
             {
-                "name": "page-2",
+                "name": "page-2.md",
                 "etag": '"hydrated-b"',
                 "size_bytes": 2,
                 "last_modified_ms": 1700000009999,
@@ -3287,9 +3768,9 @@ async def test_list_pages_hydration_skips_rows_with_list_payload_etag() -> None:
     """
     list_payload = [
         # Row 1: etag already present — hydration skips it.
-        {"name": "index", "etag": '"from-list"', "size": 1},
+        {"name": "index.md", "etag": '"from-list"', "size": 1},
         # Row 2: etag is null — hydration fires.
-        {"name": "page-2", "etag": None, "size": 2},
+        {"name": "page-2.md", "etag": None, "size": 2},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3298,7 +3779,7 @@ async def test_list_pages_hydration_skips_rows_with_list_payload_etag() -> None:
                 200, content=__import__("json").dumps(list_payload).encode()
             )
         # Only ``page-2`` should reach here.
-        assert request.url.path == "/.fs/page-2"
+        assert request.url.path == "/.fs/page-2.md"
         return httpx.Response(
             200,
             text="body",
@@ -3313,14 +3794,14 @@ async def test_list_pages_hydration_skips_rows_with_list_payload_etag() -> None:
     assert result.structured_content == {
         "result": [
             {
-                "name": "index",
+                "name": "index.md",
                 "etag": '"from-list"',
                 "size_bytes": 1,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "page-2",
+                "name": "page-2.md",
                 "etag": '"hydrated-page-2"',
                 "size_bytes": 2,
                 "last_modified_ms": None,
@@ -3341,9 +3822,9 @@ async def test_list_pages_hydration_survives_per_page_404() -> None:
     whole call. The other rows' etags are still hydrated.
     """
     list_payload = [
-        {"name": "index", "size": 1},
-        {"name": "deleted", "size": 2},  # 404 on hydrate
-        {"name": "page-3", "size": 3},
+        {"name": "index.md", "size": 1},
+        {"name": "deleted.md", "size": 2},  # 404 on hydrate
+        {"name": "page-3.md", "size": 3},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3351,7 +3832,7 @@ async def test_list_pages_hydration_survives_per_page_404() -> None:
             return httpx.Response(
                 200, content=__import__("json").dumps(list_payload).encode()
             )
-        if request.url.path == "/.fs/deleted":
+        if request.url.path == "/.fs/deleted.md":
             # Page was deleted between the list and hydrate.
             return httpx.Response(404, text="page not found")
         # The other two pages hydrate cleanly.
@@ -3368,22 +3849,22 @@ async def test_list_pages_hydration_survives_per_page_404() -> None:
     assert result.structured_content == {
         "result": [
             {
-                "name": "index",
-                "etag": '"index-etag"',
+                "name": "index.md",
+                "etag": '"index.md-etag"',
                 "size_bytes": 1,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "deleted",
+                "name": "deleted.md",
                 "etag": None,
                 "size_bytes": 2,
                 "last_modified_ms": None,
                 "created_ms": None,
             },
             {
-                "name": "page-3",
-                "etag": '"page-3-etag"',
+                "name": "page-3.md",
+                "etag": '"page-3.md-etag"',
                 "size_bytes": 3,
                 "last_modified_ms": None,
                 "created_ms": None,
@@ -3402,8 +3883,8 @@ async def test_list_pages_hydration_survives_per_page_5xx() -> None:
     later if it wants the missing etag.
     """
     list_payload = [
-        {"name": "index", "size": 1},
-        {"name": "flaky", "size": 2},  # 503 on hydrate
+        {"name": "index.md", "size": 1},
+        {"name": "flaky.md", "size": 2},  # 503 on hydrate
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3411,7 +3892,7 @@ async def test_list_pages_hydration_survives_per_page_5xx() -> None:
             return httpx.Response(
                 200, content=__import__("json").dumps(list_payload).encode()
             )
-        if request.url.path == "/.fs/flaky":
+        if request.url.path == "/.fs/flaky.md":
             return httpx.Response(503, text="upstream gone")
         return httpx.Response(
             200, text="body", headers={"ETag": '"index-etag"'}
@@ -3425,7 +3906,7 @@ async def test_list_pages_hydration_survives_per_page_5xx() -> None:
     rows = result.structured_content["result"]
     assert rows[0]["etag"] == '"index-etag"'
     assert rows[1]["etag"] is None
-    assert rows[1]["name"] == "flaky"
+    assert rows[1]["name"] == "flaky.md"
 
 
 @pytest.mark.asyncio
@@ -3440,8 +3921,8 @@ async def test_list_pages_hydration_survives_per_page_timeout() -> None:
     load.
     """
     list_payload = [
-        {"name": "index", "size": 1},
-        {"name": "slow", "size": 2},
+        {"name": "index.md", "size": 1},
+        {"name": "slow.md", "size": 2},
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3449,7 +3930,7 @@ async def test_list_pages_hydration_survives_per_page_timeout() -> None:
             return httpx.Response(
                 200, content=__import__("json").dumps(list_payload).encode()
             )
-        if request.url.path == "/.fs/slow":
+        if request.url.path == "/.fs/slow.md":
             raise httpx.ReadTimeout("simulated")
         return httpx.Response(
             200, text="body", headers={"ETag": '"index-etag"'}
@@ -3463,7 +3944,7 @@ async def test_list_pages_hydration_survives_per_page_timeout() -> None:
     rows = result.structured_content["result"]
     assert rows[0]["etag"] == '"index-etag"'
     assert rows[1]["etag"] is None
-    assert rows[1]["name"] == "slow"
+    assert rows[1]["name"] == "slow.md"
 
 
 @pytest.mark.asyncio
@@ -3480,9 +3961,9 @@ async def test_list_pages_hydration_runs_after_prefix_filter() -> None:
     ordering: filter first, hydrate second.
     """
     list_payload = [
-        {"name": "index", "size": 1},
-        {"name": "journal/2026-01-01", "size": 2},
-        {"name": "journal/2026-01-02", "size": 3},
+        {"name": "index.md", "size": 1},
+        {"name": "journal/2026-01-01.md", "size": 2},
+        {"name": "journal/2026-01-02.md", "size": 3},
     ]
 
     seen_paths: list[str] = []
@@ -3508,12 +3989,12 @@ async def test_list_pages_hydration_runs_after_prefix_filter() -> None:
     # No GET for ``/.fs/index`` — hydration skipped it because
     # the prefix filter discarded it. Only the two ``journal/``
     # rows reached the hydration walker.
-    assert "/.fs/index" not in seen_paths
-    assert "/.fs/journal/2026-01-01" in seen_paths
-    assert "/.fs/journal/2026-01-02" in seen_paths
+    assert "/.fs/index.md" not in seen_paths
+    assert "/.fs/journal/2026-01-01.md" in seen_paths
+    assert "/.fs/journal/2026-01-02.md" in seen_paths
     # The result is just the filtered rows.
     names = [r["name"] for r in result.structured_content["result"]]
-    assert names == ["journal/2026-01-01", "journal/2026-01-02"]
+    assert names == ["journal/2026-01-01.md", "journal/2026-01-02.md"]
 
 
 # --- move_page --------------------------------------------------------
@@ -3534,28 +4015,28 @@ async def test_move_page_returns_new_etag_on_200() -> None:
         body = request.content if request.method != "GET" else b""
         calls.append((request.method, request.url.path, body))
         if request.method == "GET":
-            assert request.url.path == "/.fs/old"
+            assert request.url.path == "/.fs/old.md"
             return httpx.Response(200, text="the body\n")
         if request.method == "PUT":
-            assert request.url.path == "/.fs/new"
+            assert request.url.path == "/.fs/new.md"
             # If-None-Match: * on the destination write — move is
             # rename, never silently overwrite.
             assert request.headers.get("If-None-Match") == "*"
             assert request.content == b"the body\n"
             return httpx.Response(200, headers={"ETag": '"new-etag"'})
         # DELETE
-        assert request.url.path == "/.fs/old"
+        assert request.url.path == "/.fs/old.md"
         return httpx.Response(200, headers={"ETag": '"old-etag"'})
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "new",  # destination, not source — per T23
+        "name": "new.md",  # destination, not source — per T23
         "etag": '"new-etag"',
         "size_bytes": 9,  # ``the body\n`` = 9 UTF-8 bytes
         "last_modified_ms": None,
@@ -3565,9 +4046,9 @@ async def test_move_page_returns_new_etag_on_200() -> None:
     # DELETE source. The write happens before the delete so a
     # partial-failure leaves the body at the new name.
     assert [(m, p) for m, p, _ in calls] == [
-        ("GET", "/.fs/old"),
-        ("PUT", "/.fs/new"),
-        ("DELETE", "/.fs/old"),
+        ("GET", "/.fs/old.md"),
+        ("PUT", "/.fs/new.md"),
+        ("DELETE", "/.fs/old.md"),
     ]
     # The body written to the destination matches what was read.
     assert calls[1][2] == b"the body\n"
@@ -3599,17 +4080,17 @@ async def test_move_page_same_name_is_no_op() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "self", "new_name": "self"}
+            "move_page", {"name": "self.md", "new_name": "self.md"}
         )
 
     assert result.is_error is False
     # Only the existence check ran.
-    assert calls == [("GET", "/.fs/self")]
+    assert calls == [("GET", "/.fs/self.md")]
     # The same-name no-op returns the page's read-side ack — the
     # caller gets the size / etag / timestamps without an extra
     # round trip.
     assert result.structured_content == {
-        "name": "self",
+        "name": "self.md",
         "etag": '"self-etag"',
         "size_bytes": 4,
         "last_modified_ms": None,
@@ -3630,11 +4111,11 @@ async def test_move_page_same_name_missing_returns_404_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "ghost", "new_name": "ghost"}
+            "move_page", {"name": "ghost.md", "new_name": "ghost.md"}
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool move_page: page not found: ghost"
+    assert _text(result) == "Error executing tool move_page: page not found: ghost.md"
 
 
 @pytest.mark.asyncio
@@ -3663,7 +4144,7 @@ async def test_move_page_forwards_if_match_to_delete() -> None:
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
             "move_page",
-            {"name": "old", "new_name": "new", "if_match": '"v1"'},
+            {"name": "old.md", "new_name": "new.md", "if_match": '"v1"'},
         )
 
     # Initial sequence: GET (no precondition), PUT (If-None-Match,
@@ -3684,11 +4165,11 @@ async def test_move_page_404_on_read_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "missing", "new_name": "new"}
+            "move_page", {"name": "missing.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool move_page: page not found: missing"
+    assert _text(result) == "Error executing tool move_page: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -3711,13 +4192,13 @@ async def test_move_page_destination_exists_returns_destination_collision_error(
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool move_page: destination page already exists: new; refusing to overwrite"
+        == "Error executing tool move_page: destination page already exists: new.md; refusing to overwrite"
     )
 
 
@@ -3742,13 +4223,13 @@ async def test_move_page_delete_412_returns_atomicity_caveat_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool move_page: moved body to new but failed to delete old: precondition failed; check if_match/if_none_match; both now exist"
+        == "Error executing tool move_page: moved body to new.md but failed to delete old.md: precondition failed; check if_match/if_none_match; both now exist"
     )
 
 
@@ -3759,7 +4240,7 @@ async def test_move_page_delete_404_surfaces_atomicity_message_not_generic_404()
     The body is at ``new_name`` already — that's what the caller
     wanted. The source going missing during cleanup is a feature
     (someone else deleted it for us), not a bug. The generic
-    "page not found: old" wording would be misleading.
+    "page not found: old.md" wording would be misleading.
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
@@ -3771,13 +4252,13 @@ async def test_move_page_delete_404_surfaces_atomicity_message_not_generic_404()
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool move_page: moved body to new but old was already deleted before the cleanup step"
+        == "Error executing tool move_page: moved body to new.md but old.md was already deleted before the cleanup step"
     )
 
 
@@ -3799,13 +4280,13 @@ async def test_move_page_delete_5xx_returns_atomicity_caveat_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool move_page: moved body to new but failed to delete old: silverbullet error: 502; both now exist"
+        == "Error executing tool move_page: moved body to new.md but failed to delete old.md: silverbullet error: 502; both now exist"
     )
 
 
@@ -3826,13 +4307,13 @@ async def test_move_page_delete_timeout_returns_atomicity_caveat_error() -> None
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool move_page: moved body to new but failed to delete old: silverbullet request timed out; both now exist"
+        == "Error executing tool move_page: moved body to new.md but failed to delete old.md: silverbullet request timed out; both now exist"
     )
 
 
@@ -3855,7 +4336,7 @@ async def test_move_page_destination_write_413_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
@@ -3875,7 +4356,7 @@ async def test_move_page_read_5xx_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
@@ -3902,12 +4383,12 @@ async def test_move_page_ack_envelope_when_new_etag_header_missing() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is False
     assert result.structured_content == {
-        "name": "new",  # destination
+        "name": "new.md",  # destination
         "etag": None,
         "size_bytes": 4,
         "last_modified_ms": None,
@@ -3938,7 +4419,7 @@ async def test_move_page_does_not_delete_on_destination_collision() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "old", "new_name": "new"}
+            "move_page", {"name": "old.md", "new_name": "new.md"}
         )
 
     assert result.is_error is True
@@ -3968,7 +4449,7 @@ async def test_resource_template_returns_ack_envelope() -> None:
     import json
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/.fs/index"
+        assert request.url.path == "/.fs/index.md"
         return httpx.Response(
             200,
             text="# page body",
@@ -3981,7 +4462,7 @@ async def test_resource_template_returns_ack_envelope() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.read_resource("silverbullet://page/index")
+        result = await client.read_resource("silverbullet://page/index.md")
 
     assert len(result.contents) == 1
     content = result.contents[0]
@@ -4011,7 +4492,7 @@ async def test_resource_template_404_raises_resource_not_found_error() -> None:
 
     # The SDK maps ``ResourceNotFoundError`` to ``-32602 invalid
     # params`` per SEP-2164; the message text is what Grok surfaces.
-    assert "page not found: missing" in str(exc_info.value)
+    assert "page not found: missing.md" in str(exc_info.value)
 
 
 # --- timeout -----------------------------------------------------------
@@ -4024,7 +4505,7 @@ async def test_read_page_timeout_returns_tool_error() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "anything"})
+        result = await client.call_tool("read_page", {"name": "anything.md"})
 
     assert result.is_error is True
     assert _text(result) == "Error executing tool read_page: silverbullet request timed out"
@@ -4059,8 +4540,8 @@ async def test_diff_pages_page_vs_page_returns_unified_diff() -> None:
     which page the right side came from).
     """
     pages = {
-        "first": "alpha\nbeta\ngamma\n",
-        "second": "alpha\nBETA\ngamma\n",
+        "first.md": "alpha\nbeta\ngamma\n",
+        "second.md": "alpha\nBETA\ngamma\n",
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -4081,7 +4562,7 @@ async def test_diff_pages_page_vs_page_returns_unified_diff() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "first", "other_name": "second"},
+            {"name": "first.md", "other_name": "second.md"},
         )
 
     assert result.is_error is False
@@ -4090,16 +4571,16 @@ async def test_diff_pages_page_vs_page_returns_unified_diff() -> None:
     # (the second envelope's ``name`` is what the agent reads to
     # know which page the diff's right side came from).
     assert payload["name"] == {
-        "name": "first",
+        "name": "first.md",
         "body": "alpha\nbeta\ngamma\n",
-        "etag": '"first-etag"',
+        "etag": '"first.md-etag"',
         "size_bytes": 17,
         "last_modified_ms": None,
     }
     assert payload["other"] == {
-        "name": "second",
+        "name": "second.md",
         "body": "alpha\nBETA\ngamma\n",
-        "etag": '"second-etag"',
+        "etag": '"second.md-etag"',
         "size_bytes": 17,
         "last_modified_ms": None,
     }
@@ -4108,8 +4589,8 @@ async def test_diff_pages_page_vs_page_returns_unified_diff() -> None:
     # ``difflib`` upgrade that tweaks the header format doesn't
     # break this test.
     diff = payload["diff"]
-    assert "--- first\n" in diff
-    assert "+++ second\n" in diff
+    assert "--- first.md\n" in diff
+    assert "+++ second.md\n" in diff
     assert "-beta\n" in diff
     assert "+BETA\n" in diff
     assert " alpha\n" in diff  # unchanged context line
@@ -4130,7 +4611,7 @@ async def test_diff_pages_page_vs_literal_string() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/.fs/only"
+        assert request.url.path == "/.fs/only.md"
         return httpx.Response(
             200,
             text="hello\nworld\n",
@@ -4141,7 +4622,7 @@ async def test_diff_pages_page_vs_literal_string() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "only", "other_body": "hello\nWORLD\n"},
+            {"name": "only.md", "other_body": "hello\nWORLD\n"},
         )
 
     assert result.is_error is False
@@ -4151,7 +4632,7 @@ async def test_diff_pages_page_vs_literal_string() -> None:
     # is no second page envelope to surface.
     assert payload["other"] is None
     diff = payload["diff"]
-    assert "--- only\n" in diff
+    assert "--- only.md\n" in diff
     assert "+++ <literal>\n" in diff
     assert "-world\n" in diff
     assert "+WORLD\n" in diff
@@ -4175,7 +4656,7 @@ async def test_diff_pages_identical_bodies_yields_empty_diff() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "a", "other_name": "b"},
+            {"name": "a.md", "other_name": "b"},
         )
 
     assert result.is_error is False
@@ -4206,7 +4687,7 @@ async def test_diff_pages_neither_other_name_nor_other_body_errors() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("diff_pages", {"name": "any"})
+        result = await client.call_tool("diff_pages", {"name": "any.md"})
 
     assert result.is_error is True
     assert (
@@ -4240,8 +4721,8 @@ async def test_diff_pages_both_other_name_and_other_body_errors() -> None:
         result = await client.call_tool(
             "diff_pages",
             {
-                "name": "any",
-                "other_name": "second",
+                "name": "any.md",
+                "other_name": "second.md",
                 "other_body": "literal",
             },
         )
@@ -4270,7 +4751,7 @@ async def test_diff_pages_first_page_missing_returns_404_with_name_in_wording() 
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, request.url.path))
-        if request.url.path == "/.fs/missing-first":
+        if request.url.path == "/.fs/missing-first.md":
             return httpx.Response(404, text="page not found")
         return httpx.Response(200, text="present")
 
@@ -4278,17 +4759,17 @@ async def test_diff_pages_first_page_missing_returns_404_with_name_in_wording() 
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "missing-first", "other_name": "present"},
+            {"name": "missing-first.md", "other_name": "present"},
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool diff_pages: page not found: missing-first"
+        == "Error executing tool diff_pages: page not found: missing-first.md"
     )
     # Only one GET was issued — the first-page 404 short-circuits
     # before the second read.
-    assert calls == [("GET", "/.fs/missing-first")]
+    assert calls == [("GET", "/.fs/missing-first.md")]
 
 
 @pytest.mark.asyncio
@@ -4305,7 +4786,7 @@ async def test_diff_pages_second_page_missing_returns_404_with_other_name_in_wor
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, request.url.path))
-        if request.url.path == "/.fs/missing-other":
+        if request.url.path == "/.fs/missing-other.md":
             return httpx.Response(404, text="page not found")
         return httpx.Response(200, text="present", headers={"ETag": '"p"'})
 
@@ -4313,20 +4794,20 @@ async def test_diff_pages_second_page_missing_returns_404_with_other_name_in_wor
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "present", "other_name": "missing-other"},
+            {"name": "present.md", "other_name": "missing-other"},
         )
 
     assert result.is_error is True
     assert (
         _text(result)
-        == "Error executing tool diff_pages: page not found: missing-other"
+        == "Error executing tool diff_pages: page not found: missing-other.md"
     )
     # Both GETs were issued — the first read succeeded (so the
     # handler proceeded to the second), then the second read
     # 404'd.
     assert calls == [
-        ("GET", "/.fs/present"),
-        ("GET", "/.fs/missing-other"),
+        ("GET", "/.fs/present.md"),
+        ("GET", "/.fs/missing-other.md"),
     ]
 
 
@@ -4350,7 +4831,7 @@ async def test_diff_pages_5xx_on_first_read_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "any", "other_name": "second"},
+            {"name": "any.md", "other_name": "second.md"},
         )
 
     assert result.is_error is True
@@ -4358,7 +4839,7 @@ async def test_diff_pages_5xx_on_first_read_returns_tool_error() -> None:
         _text(result)
         == "Error executing tool diff_pages: silverbullet error: 500"
     )
-    assert calls == [("GET", "/.fs/any")]
+    assert calls == [("GET", "/.fs/any.md")]
 
 
 @pytest.mark.asyncio
@@ -4377,7 +4858,7 @@ async def test_diff_pages_timeout_on_first_read_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "any", "other_body": "literal"},
+            {"name": "any.md", "other_body": "literal"},
         )
 
     assert result.is_error is True
@@ -4408,7 +4889,7 @@ async def test_diff_pages_does_not_issue_writes() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "a", "other_name": "b"},
+            {"name": "a.md", "other_name": "b"},
         )
 
     assert result.is_error is False
@@ -4479,10 +4960,10 @@ async def test_list_tasks_carries_name_ref_line_state_text() -> None:
 
     sc = result.structured_content
     assert sc["result"] == [
-        {"name": "Areas/Kanban", "ref": "Pages/Hobbies", "line": 2, "state": " ", "text": "todo with [[Pages/Hobbies]] ref"},
-        {"name": "Areas/Kanban", "ref": None, "line": 3, "state": "x", "text": "done item"},
-        {"name": "Areas/Kanban", "ref": None, "line": 4, "state": "X", "text": "cancelled item"},
-        {"name": "Areas/Kanban", "ref": None, "line": 5, "state": " ", "text": "no-ref bullet"},
+        {"name": "Areas/Kanban.md", "ref": "Pages/Hobbies", "line": 2, "state": " ", "text": "todo with [[Pages/Hobbies]] ref"},
+        {"name": "Areas/Kanban.md", "ref": None, "line": 3, "state": "x", "text": "done item"},
+        {"name": "Areas/Kanban.md", "ref": None, "line": 4, "state": "X", "text": "cancelled item"},
+        {"name": "Areas/Kanban.md", "ref": None, "line": 5, "state": " ", "text": "no-ref bullet"},
     ]
 
 
@@ -4657,7 +5138,7 @@ async def test_list_tasks_404_returns_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool list_tasks: page not found: missing"
+    assert _text(result) == "Error executing tool list_tasks: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -4807,7 +5288,7 @@ async def test_check_task_flips_todo_to_done_with_default_state() -> None:
     # the read's (same carry-forward as ``append_to_page``).
     sc = result.structured_content
     assert sc is not None
-    assert sc["name"] == "p"
+    assert sc["name"] == "p.md"
     assert sc["etag"] == '"write-etag"'
     assert sc["last_modified_ms"] == 1700000000000
 
@@ -5036,7 +5517,7 @@ async def test_check_task_404_returns_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool check_task: page not found: missing"
+    assert _text(result) == "Error executing tool check_task: page not found: missing.md"
 
 
 @pytest.mark.asyncio
@@ -5293,7 +5774,7 @@ async def test_t31b_write_page_detects_concurrent_edit_via_silent_overwrite() ->
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is True
@@ -5325,12 +5806,12 @@ async def test_t31b_write_page_verification_passes_when_etag_unchanged() -> None
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is False
     payload = result.structured_content or {}
-    assert payload.get("name") == "index"
+    assert payload.get("name") == "index.md"
     assert payload.get("etag") == '"v1"'
 
 
@@ -5358,7 +5839,7 @@ async def test_t31b_write_page_skips_verification_when_if_match_is_none() -> Non
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body"},
+            {"name": "index.md", "content": "body"},
         )
 
     assert result.is_error is False
@@ -5385,7 +5866,7 @@ async def test_t31b_write_page_skips_verification_when_if_match_is_star() -> Non
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": "*"},
+            {"name": "index.md", "content": "body", "if_match": "*"},
         )
 
     assert result.is_error is False
@@ -5416,7 +5897,7 @@ async def test_t31b_append_to_page_detects_concurrent_edit_via_silent_overwrite(
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "if_match": '"v1"'},
+            {"name": "index.md", "text": "world", "if_match": '"v1"'},
         )
 
     assert result.is_error is True
@@ -5463,7 +5944,7 @@ async def test_t31b_append_to_page_auto_threads_read_etag_when_if_match_is_none(
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world"},
+            {"name": "index.md", "text": "world"},
         )
 
     assert result.is_error is True
@@ -5489,7 +5970,7 @@ async def test_t31b_dry_run_skips_verification() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "append_to_page",
-            {"name": "index", "text": "world", "if_match": '"v1"', "dry_run": True},
+            {"name": "index.md", "text": "world", "if_match": '"v1"', "dry_run": True},
         )
 
     assert result.is_error is False
@@ -5521,7 +6002,7 @@ async def test_t31b_verification_skips_on_re_read_404() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is False
@@ -5548,7 +6029,7 @@ async def test_t31b_verification_skips_on_re_read_5xx() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is False
@@ -5575,7 +6056,7 @@ async def test_t31b_412_wins_over_verification_on_sbs_that_honor_if_match() -> N
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "write_page",
-            {"name": "index", "content": "body", "if_match": '"v1"'},
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
         )
 
     assert result.is_error is True
@@ -5602,7 +6083,7 @@ async def test_t31b_delete_page_post_delete_verification_skips() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "delete_page", {"name": "index", "if_match": '"v1"'}
+            "delete_page", {"name": "index.md", "if_match": '"v1"'}
         )
 
     assert result.is_error is False# --- T32: create_page --------------------------------------------------
@@ -5632,12 +6113,12 @@ async def test_create_page_returns_ack_envelope_on_200() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "create_page", {"name": "new-page", "content": "body"}
+            "create_page", {"name": "new-page.md", "content": "body"}
         )
 
     assert result.is_error is False
     payload = result.structured_content or {}
-    assert payload["name"] == "new-page"
+    assert payload["name"] == "new-page.md"
     assert payload["etag"] == '"abc123"'
     assert payload["size_bytes"] == 4
     assert payload["last_modified_ms"] == 1700000000123
@@ -5664,7 +6145,7 @@ async def test_create_page_sends_if_match_star_to_sb() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         await client.call_tool(
-            "create_page", {"name": "new", "content": "body"}
+            "create_page", {"name": "new.md", "content": "body"}
         )
 
     assert captured_if_match == ["*"]
@@ -5690,7 +6171,7 @@ async def test_create_page_already_exists_translates_412_to_tool_error() -> None
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "create_page", {"name": "existing", "content": "body"}
+            "create_page", {"name": "existing.md", "content": "body"}
         )
 
     assert result.is_error is True
@@ -5772,7 +6253,7 @@ async def test_create_page_404_does_not_silently_succeed() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "create_page", {"name": "anything", "content": "body"}
+            "create_page", {"name": "anything.md", "content": "body"}
         )
 
     assert result.is_error is True
@@ -5798,7 +6279,7 @@ async def test_create_page_5xx_returns_tool_error() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "create_page", {"name": "anything", "content": "body"}
+            "create_page", {"name": "anything.md", "content": "body"}
         )
 
     assert result.is_error is True
@@ -5859,12 +6340,12 @@ async def test_prepend_to_page_happy_path_no_frontmatter() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": "HEADER\n"},
+            {"name": "index.md", "content": "HEADER\n"},
         )
 
     assert result.is_error is False
     payload = result.structured_content or {}
-    assert payload["name"] == "index"
+    assert payload["name"] == "index.md"
 
 
 @pytest.mark.asyncio
@@ -5894,7 +6375,7 @@ async def test_prepend_to_page_default_after_frontmatter_inserts_below_block() -
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": new_content},
+            {"name": "index.md", "content": new_content},
         )
 
     assert result.is_error is False
@@ -5909,7 +6390,7 @@ async def test_prepend_to_page_position_top_inserts_above_frontmatter() -> None:
 
     The override path: the caller explicitly wants to push
     the frontmatter down (rare; almost always a bug in
-    practice, but a legitimate intent the tool exposes).
+    practice, but a.md legitimate intent the tool exposes).
     The new content lands at the absolute top of the file,
     above the opening ``---`` fence.
     """
@@ -5931,7 +6412,7 @@ async def test_prepend_to_page_position_top_inserts_above_frontmatter() -> None:
         result = await client.call_tool(
             "prepend_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "content": new_content,
                 "position": "top",
             },
@@ -5966,7 +6447,7 @@ async def test_prepend_to_page_position_top_without_frontmatter() -> None:
         result = await client.call_tool(
             "prepend_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "content": "HEADER\n",
                 "position": "top",
             },
@@ -6003,7 +6484,7 @@ async def test_prepend_to_page_malformed_frontmatter_treated_as_no_frontmatter()
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": new_content},
+            {"name": "index.md", "content": new_content},
         )
 
     assert result.is_error is False
@@ -6028,7 +6509,7 @@ async def test_prepend_to_page_empty_content_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": ""},
+            {"name": "index.md", "content": ""},
         )
 
     assert result.is_error is True
@@ -6054,7 +6535,7 @@ async def test_prepend_to_page_unknown_position_returns_tool_error() -> None:
         result = await client.call_tool(
             "prepend_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "content": "body",
                 "position": "topmost",
             },
@@ -6088,7 +6569,7 @@ async def test_prepend_to_page_dry_run_returns_preview_without_writing() -> None
         result = await client.call_tool(
             "prepend_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "content": "HEADER\n",
                 "dry_run": True,
             },
@@ -6134,7 +6615,7 @@ async def test_prepend_to_page_dry_run_does_not_invoke_t31b_verification() -> No
         result = await client.call_tool(
             "prepend_to_page",
             {
-                "name": "index",
+                "name": "index.md",
                 "content": "HEADER\n",
                 "if_match": '"v1"',
                 "dry_run": True,
@@ -6179,7 +6660,7 @@ async def test_prepend_to_page_auto_threads_read_etag_when_if_match_is_none() ->
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": "HEADER\n"},
+            {"name": "index.md", "content": "HEADER\n"},
         )
 
     assert result.is_error is True
@@ -6196,7 +6677,7 @@ async def test_prepend_to_page_404_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "missing", "content": "body"},
+            {"name": "missing.md", "content": "body"},
         )
 
     assert result.is_error is True
@@ -6214,7 +6695,7 @@ async def test_prepend_to_page_412_returns_tool_error() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "prepend_to_page",
-            {"name": "index", "content": "body", "if_match": '"v0"'},
+            {"name": "index.md", "content": "body", "if_match": '"v0"'},
         )
 
     assert result.is_error is True
@@ -6341,14 +6822,14 @@ def _ok_handler() -> "callable":
 @pytest.mark.parametrize(
     "tool_name,args",
     [
-        ("write_page", {"name": "x", "content": OVER_CAP_BODY}),
-        ("create_page", {"name": "x", "content": OVER_CAP_BODY}),
-        ("append_to_page", {"name": "x", "text": OVER_CAP_BODY}),
-        ("prepend_to_page", {"name": "x", "content": OVER_CAP_BODY}),
+        ("write_page", {"name": "x.md", "content": OVER_CAP_BODY}),
+        ("create_page", {"name": "x.md", "content": OVER_CAP_BODY}),
+        ("append_to_page", {"name": "x.md", "text": OVER_CAP_BODY}),
+        ("prepend_to_page", {"name": "x.md", "content": OVER_CAP_BODY}),
         (
             "patch_page_lines",
             {
-                "name": "x",
+                "name": "x.md",
                 "start_line": 1,
                 "end_line": 1,
                 "new_content": OVER_CAP_BODY,
@@ -6356,7 +6837,7 @@ def _ok_handler() -> "callable":
         ),
         (
             "patch_page_replace",
-            {"name": "x", "find": "x", "new_string": OVER_CAP_BODY},
+            {"name": "x.md", "find": "x", "new_string": OVER_CAP_BODY},
         ),
     ],
 )
@@ -6402,7 +6883,7 @@ async def test_t36_body_cap_accepts_exact_cap_boundary() -> None:
     server = _build(_ok_handler())
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "write_page", {"name": "x", "content": CAP_BODY}
+            "write_page", {"name": "x.md", "content": CAP_BODY}
         )
 
     assert result.is_error is False
@@ -6427,7 +6908,7 @@ async def test_t36_body_cap_fires_before_sb_round_trip() -> None:
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "write_page", {"name": "x", "content": OVER_CAP_BODY}
+            "write_page", {"name": "x.md", "content": OVER_CAP_BODY}
         )
 
     assert result.is_error is True
@@ -6455,7 +6936,7 @@ async def test_t36_body_cap_does_not_apply_to_read_page() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("read_page", {"name": "x"})
+        result = await client.call_tool("read_page", {"name": "x.md"})
 
     assert result.is_error is False
 
@@ -6502,7 +6983,7 @@ async def test_t36_body_cap_does_not_apply_to_page_exists() -> None:
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
-        result = await client.call_tool("page_exists", {"name": "x"})
+        result = await client.call_tool("page_exists", {"name": "x.md"})
 
     assert result.is_error is False
 
@@ -6524,7 +7005,7 @@ async def test_t36_body_cap_does_not_apply_to_diff_pages() -> None:
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
             "diff_pages",
-            {"name": "x", "other_body": "other"},
+            {"name": "x.md", "other_body": "other"},
         )
 
     assert result.is_error is False
@@ -6555,7 +7036,7 @@ async def test_t36_body_cap_fires_on_move_page_when_source_body_is_oversized() -
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
         result = await client.call_tool(
-            "move_page", {"name": "src", "new_name": "dst"}
+            "move_page", {"name": "src.md", "new_name": "dst.md"}
         )
 
     assert result.is_error is True
@@ -6608,7 +7089,7 @@ async def test_t36_body_cap_dry_run_still_fires() -> None:
         result = await client.call_tool(
             "append_to_page",
             {
-                "name": "x",
+                "name": "x.md",
                 "text": OVER_CAP_BODY,
                 "dry_run": True,
             },

@@ -8,7 +8,7 @@ Versions correspond to the build-map (wayfinder) charts under
 `docs/wayfinder/`. The map for an in-flight version lists the open
 tickets; this file records what's already shipped.
 
-## [Unreleased] — v1.4 (JWT inbound auth)
+## [v1.4] — JWT inbound auth
 
 Build map: [`docs/wayfinder/map-v1.4.md`](docs/wayfinder/map-v1.4.md).
 **Status: T37 + T38 shipped; v1.4 destination reached** — the
@@ -81,6 +81,74 @@ per-user SB credentials to thread off of.
     over ``select_verifier`` that handles the
     ``None``-vs-empty-string distinction
     ``load_settings`` produces.
+
+## [Unreleased] — v1.5 (agent-experience hardening)
+
+Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
+**Status: T39 shipped 2026-08-31; v1.5 destination partial** —
+the `.md`-suffix split closes via T39's name-normalization
+helper (threaded into every `name`-taking tool), with a
+`name_resolution` envelope field that teaches the agent the
+convention for its next call. T40 / T41 / T42 remain on the
+frontier (same charter: empty-input validation, doc
+clarifications, 412 contention hint respectively).
+
+T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
+that explicitly pass `name="Foo"` (bare) expecting a 500-shaped
+error: the bridge now resolves to `Foo.md` and returns 200 with
+the body of `Foo.md`. Any caller that was already retrying with
+`.md` after a 500 sees no behavior change. The
+`name_resolution` envelope makes the convention explicit so the
+agent learns the convention rather than continuing to retype.
+
+### Added
+
+- **T39 name normalization** — new
+  `_normalize_page_name(name)` helper in
+  `src/mcp_silverbullet/server.py`. Pure,
+  idempotent, surface-level invisible: strips
+  leading/trailing whitespace, appends `.md` to
+  names whose basename has no `.` (so `Foo` →
+  `Foo.md`, `Areas/Foo` → `Areas/Foo.md`,
+  `Foo.txt` stays `Foo.txt`, `Foo.tar.gz` stays
+  `Foo.tar.gz`, `.gitignore` stays `.gitignore`).
+  Threaded into every `name`-taking tool handler
+  at the top, before the SB round trip and
+  before `_check_body_size`: `read_page`,
+  `page_exists`, `write_page`, `create_page`,
+  `delete_page`, `append_to_page`,
+  `prepend_to_page`, `patch_page_lines`,
+  `patch_page_replace`, `move_page` (both
+  `name` and `new_name`), `diff_pages` (both
+  `name` and `other_name`), `check_task`
+  (`page` only — `ref` is a wikilink target,
+  handled by the existing
+  `_normalize_link_target` canonicalization),
+  `list_tasks` (per-page form's `page`), the
+  `silverbullet://page/{name}` resource
+  template, and the `_hydrate_list_etags`
+  walker (so list rows with bare names hydrate
+  successfully against the canonical file).
+
+- **T39 `name_resolution` envelope field** —
+  new `_name_resolution_payload(requested,
+  resolved)` helper that returns a dict like
+  `{"name_resolution": {"requested": "Foo",
+  "resolved": "Foo.md", "suffix_added":
+  ".md"}}` when the caller's input was
+  normalized, and an empty dict when it was
+  already canonical. Attached to the success
+  envelope of every tool that touches a `name`
+  (writes, reads, diffs, the resource
+  template); the field is **conditional** —
+  omitted when the caller's input was already
+  canonical, so existing wire-shape assertions
+  on the success envelope continue to pass
+  byte-for-byte. The field teaches the agent
+  the convention: a caller that passes `"Foo"`
+  and gets back `name_resolution.suffix_added:
+  ".md"` learns to pass `Foo.md` on its next
+  call.
 
 ## [v1.3] — agent-grade discovery + edit hygiene
 

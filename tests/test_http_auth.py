@@ -259,7 +259,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
     here we just need a 200 with a body).
     """
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/.fs/index"
+        assert request.url.path == "/.fs/index.md"
         return httpx.Response(200, text="# hello over the wire")
 
     app = _wire_app(handler)
@@ -311,7 +311,7 @@ async def test_full_initialize_then_read_page_roundtrip_over_http() -> None:
                     ]
 
                     call_result = await session.call_tool(
-                        "read_page", {"name": "index"}
+                        "read_page", {"name": "index.md"}
                     )
                     assert call_result.is_error is False
                     # T24: ``read_page`` returns the ack envelope,

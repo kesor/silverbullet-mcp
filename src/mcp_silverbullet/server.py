@@ -291,6 +291,104 @@ def _check_body_size(body: str) -> None:
         )
 
 
+def _normalize_page_name(name: str) -> str:
+    """Resolve a caller-supplied page name to SB's canonical form.
+
+    T39: SB stores pages as ``*.md`` on disk and the ``/.fs`` HTTP
+    API keys by the exact name the caller passes. So an agent that
+    calls ``read_page("Foo")`` would 500 (because ``/.fs/Foo``
+    doesn't exist), where ``read_page("Foo.md")`` returns the
+    body. The split is invisible to humans (SB's editor hides the
+    suffix) and a recurring trip-hazard for agents.
+
+    The helper applies two rules:
+
+    - **Strip whitespace** around the name. A caller passing
+      ``"  Foo  "`` sees the same page as ``"Foo"``; the strip
+      matches the defensive stance :func:`mcp_silverbullet.journal
+      ._normalize_link_target` takes on wikilink targets.
+    - **Append ``.md``** when the *basename* has no ``.`` at
+      all. ``Foo`` → ``Foo.md``; ``Projects/Foo`` →
+      ``Projects/Foo.md``. Names with at least one ``.`` in
+      the basename pass through unchanged (``Foo.txt`` stays
+      ``Foo.txt``; ``Foo.tar.gz`` stays ``Foo.tar.gz``;
+      ``.gitignore`` stays ``.gitignore``). SB doesn't store
+      multi-extension files, so the rule is mostly defensive
+      against future extensions — the only case the agent
+      routinely sees is ``*.md``, which the helper handles
+      correctly as a no-op (already has a ``.``).
+
+    The helper is **idempotent** (calling it twice yields the
+    same value — the second call's input already has a ``.``,
+    so the append branch is a no-op), **pure** (no log output,
+    no metrics, no observable side effect), and
+    **non-validating**: an empty input is *not* rejected here.
+    T40's empty-input guard runs *before* this helper at every
+    call site, so a caller passing ``name=""`` still sees
+    ``ToolError("name must not be empty")`` rather than the
+    normalized form ``".md"`` silently succeeding. The helper
+    itself returns ``""`` for empty input — defense-in-depth
+    for the rare path that bypasses T40 (no such path exists
+    today; documented for the future).
+
+    Threading: every tool handler that accepts a ``name``
+    parameter (``read_page``, ``page_exists``, ``write_page``,
+    ``create_page``, ``delete_page``, ``append_to_page``,
+    ``prepend_to_page``, ``patch_page_lines``,
+    ``patch_page_replace``, ``move_page``'s ``name`` and
+    ``new_name``, ``diff_pages``'s ``name`` and ``other_name``,
+    ``check_task``'s ``page``, ``list_tasks``'s ``page``, and
+    the ``silverbullet://page/{name}`` resource template)
+    calls this helper at the top of the handler, before any
+    SB round trip and before :func:`_check_body_size`. The
+    ``check_task`` ``ref`` argument is *not* normalized — it's
+    a wikilink target, not a page name, and the existing
+    :func:`mcp_silverbullet.journal._normalize_link_target`
+    handles wikilink canonicalization (in the *strip* direction,
+    not the *add* direction).
+    """
+    stripped = name.strip()
+    if "." in stripped.rsplit("/", 1)[-1]:
+        return stripped
+    return stripped + ".md"
+
+
+def _name_resolution_payload(
+    requested: str, resolved: str
+) -> dict[str, object]:
+    """Build the T39 feedback-loop envelope when the caller's name was normalized.
+
+    The helper returns an empty dict when ``requested == resolved``
+    (the caller's input was already canonical; no extra field
+    surfaces, and existing wire-shape assertions on the success
+    envelope continue to pass byte-for-byte). When the names
+    differ, the helper returns
+    ``{"name_resolution": {"requested": …, "resolved": …, "suffix_added": …}}``
+    so the agent sees *exactly* what the bridge changed and can
+    learn the convention for its next call.
+
+    ``suffix_added`` is ``".md"`` when the bridge appended the
+    canonical markdown extension; ``None`` when the helper only
+    stripped whitespace (a caller passing ``"  Foo.md  "`` sees
+    the whitespace-stripped name but ``suffix_added`` is
+    ``None`` — the bridge didn't add a suffix). The split lets
+    an agent distinguish "I forgot the extension" (the common
+    case T39 was chartered for) from "I had stray whitespace"
+    (less common, but still surfaces in the envelope).
+    """
+    if requested == resolved:
+        return {}
+    stripped_requested = requested.strip()
+    suffix_added = ".md" if resolved == stripped_requested + ".md" else None
+    return {
+        "name_resolution": {
+            "requested": requested,
+            "resolved": resolved,
+            "suffix_added": suffix_added,
+        }
+    }
+
+
 async def _verify_concurrency_token(
     sb_client: SBClient,
     name: str,
@@ -769,7 +867,9 @@ async def _hydrate_list_etags(
             # the gap closes.
             out.append(meta)
             continue
-        hydrated = await sb_client.read_page_meta_safe(meta.name)
+        hydrated = await sb_client.read_page_meta_safe(
+            _normalize_page_name(meta.name)
+        )
         if hydrated is None:
             # Single-page failure (404 / 412 / 5xx / timeout):
             # keep the row's original meta (with ``etag=None``).
@@ -1048,9 +1148,18 @@ def register_tools(
         ),
     )
     async def read_page(name: str) -> dict[str, object]:
-        async with _translate_sb_errors(name):
-            page = await sb_client.read_page(name)
-        return _read_meta_to_payload(page)
+        # T39: normalize the name (strip whitespace, append ``.md``
+        # to bare names) before the SB round trip so an agent that
+        # passes ``"Foo"`` resolves to ``Foo.md`` and gets the body
+        # it expected. The ``name_resolution`` payload surfaces
+        # back to the agent so it can learn the convention for its
+        # next call.
+        resolved_name = _normalize_page_name(name)
+        async with _translate_sb_errors(resolved_name):
+            page = await sb_client.read_page(resolved_name)
+        payload = _read_meta_to_payload(page)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Page exists",
@@ -1073,6 +1182,14 @@ def register_tools(
         ),
     )
     async def page_exists(name: str) -> bool:
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # tool's return type is ``bool`` so there is no envelope
+        # to attach a ``name_resolution`` field to; the agent
+        # learns the convention by reading the description (the
+        # suffix-convention note lives in T41's
+        # ``MCPServer.instructions`` addition).
+        resolved_name = _normalize_page_name(name)
         # ``exists_page`` swallows ``PageNotFound`` internally and
         # returns ``False``; we don't go through
         # :func:`_translate_sb_errors` because that helper turns
@@ -1086,7 +1203,7 @@ def register_tools(
         # behaves oddly we still want a sensible ``ToolError``
         # rather than an unhandled exception.)
         try:
-            return await sb_client.exists_page(name)
+            return await sb_client.exists_page(resolved_name)
         except PreconditionFailed as exc:
             raise ToolError(
                 "precondition failed; check if_match/if_none_match"
@@ -1117,14 +1234,20 @@ def register_tools(
         content: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # tells the agent what the bridge changed so it can
+        # learn the convention for its next call.
+        resolved_name = _normalize_page_name(name)
         # T36: cap the body size before the SB round trip so an
         # oversized write surfaces a clear ``body too large``
         # ``ToolError`` with the remediation hint rather than a
         # deferred failure at SB.
         _check_body_size(content)
-        async with _translate_sb_errors(name):
+        async with _translate_sb_errors(resolved_name):
             meta = await sb_client.write_page(
-                name, content, if_match=if_match
+                resolved_name, content, if_match=if_match
             )
         # T31b: post-write concurrency-token verification. Runs
         # only on 200 writes where ``if_match`` was a concrete
@@ -1136,11 +1259,13 @@ def register_tools(
         # concurrency errors.
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=if_match,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Create page",
@@ -1177,19 +1302,34 @@ def register_tools(
         name: str,
         content: str,
     ) -> dict[str, object]:
-        # T36: cap the body size before the SB round trip so an
-        # oversized create surfaces a clear ``body too large``
-        # ``ToolError`` with the remediation hint rather than a
-        # deferred failure at SB.
-        _check_body_size(content)
         # Cheap upfront guard: an empty name is almost
         # certainly a caller bug (the caller forgot to fill
         # in the page name); surface it loudly before the
         # round trip. Mirrors the upfront guards on the
         # other tools (`text must not be empty`,
         # `find must not be empty`, `ref must not be empty`).
+        # T40's charter lifts this guard to the other
+        # write tools via a shared helper; for now the
+        # inline guard stays where it is.
+        # **T40 ordering note**: this empty-input guard
+        # fires *before* T39's name normalization, so a
+        # caller passing ``name=""`` still sees the loud
+        # ``ToolError("name must not be empty")`` rather
+        # than the normalized form ``".md"`` silently
+        # succeeding.
         if not name or not name.strip():
             raise ToolError("name must not be empty")
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip.
+        # The ``name_resolution`` field on the response
+        # envelope tells the agent what the bridge changed
+        # so it can learn the convention for its next call.
+        resolved_name = _normalize_page_name(name)
+        # T36: cap the body size before the SB round trip so an
+        # oversized create surfaces a clear ``body too large``
+        # ``ToolError`` with the remediation hint rather than a
+        # deferred failure at SB.
+        _check_body_size(content)
         # ``create_page`` always uses ``if_match="*"`` to
         # require existence (refuse to overwrite). The
         # ``if_match="*"`` path opts out of T31b's post-
@@ -1210,10 +1350,10 @@ def register_tools(
         # cleanly to SBs that *do* honor ``If-Match``;
         # the silent-overwrite case is a documented
         # limitation, not a hidden bug.
-        async with _translate_sb_errors(name):
+        async with _translate_sb_errors(resolved_name):
             try:
                 meta = await sb_client.write_page(
-                    name, content, if_match="*"
+                    resolved_name, content, if_match="*"
                 )
             except PreconditionFailed as exc:
                 # SB honored ``If-Match`` — page definitely
@@ -1231,10 +1371,12 @@ def register_tools(
                 # specific to ``create_page``'s
                 # refuse-to-overwrite contract.
                 raise ToolError(
-                    f"page already exists: {name}; "
+                    f"page already exists: {resolved_name}; "
                     f"use write_page to overwrite"
                 ) from exc
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Delete page",
@@ -1256,8 +1398,16 @@ def register_tools(
         name: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
-        async with _translate_sb_errors(name):
-            meta = await sb_client.delete_page(name, if_match=if_match)
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # tells the agent what the bridge changed so it can
+        # learn the convention for its next call.
+        resolved_name = _normalize_page_name(name)
+        async with _translate_sb_errors(resolved_name):
+            meta = await sb_client.delete_page(
+                resolved_name, if_match=if_match
+            )
         # T31b: post-delete verification. Per the T31b ticket
         # docstring, ``delete_page`` gets a *lighter*
         # verification: the helper re-reads the source, hits 404
@@ -1268,11 +1418,13 @@ def register_tools(
         # concurrency check possible after a delete.
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=if_match,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Append to page",
@@ -1312,8 +1464,6 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
-        # T36: cap the body size before the SB round trip.
-        _check_body_size(text)
         # An empty append is almost certainly a caller bug (the
         # caller meant to write something and forgot to fill it in);
         # surface it loudly upfront so the read-modify-write round
@@ -1322,8 +1472,17 @@ def register_tools(
         # ``append_to_page(name, "")`` would only ever mean that.
         if not text:
             raise ToolError("text must not be empty")
-        async with _translate_sb_errors(name):
-            page = await sb_client.read_page(name)
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # (live or dry-run) tells the agent what the bridge
+        # changed so it can learn the convention for its next
+        # call.
+        resolved_name = _normalize_page_name(name)
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(text)
+        async with _translate_sb_errors(resolved_name):
+            page = await sb_client.read_page(resolved_name)
             body = page.body or ""
             new_body = (
                 body + "\n" + text
@@ -1340,7 +1499,11 @@ def register_tools(
                 # the live path would surface when SB returned 412,
                 # so the agent sees one shape across both paths.
                 _validate_if_match_on_read(page.etag, if_match)
-                return _dry_run_payload(body, new_body)
+                payload = _dry_run_payload(body, new_body)
+                payload.update(
+                    _name_resolution_payload(name, resolved_name)
+                )
+                return payload
             # T31b: thread the read's etag into ``if_match`` when
             # the caller passed ``None``, so a concurrent edit
             # between read and write fails 412 on SBs that honor
@@ -1353,16 +1516,18 @@ def register_tools(
                 if_match if if_match is not None else page.etag
             )
             meta = await sb_client.write_page(
-                name, new_body, if_match=write_if_match
+                resolved_name, new_body, if_match=write_if_match
             )
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=write_if_match,
             dry_run=dry_run,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Prepend to page",
@@ -1425,8 +1590,6 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
-        # T36: cap the body size before the SB round trip.
-        _check_body_size(content)
         # Cheap, no-read input validation first. An empty
         # content is almost certainly a caller bug (the
         # caller meant to prepend something and forgot to
@@ -1446,8 +1609,17 @@ def register_tools(
                 "position must be one of: "
                 "after_frontmatter, top"
             )
-        async with _translate_sb_errors(name):
-            page = await sb_client.read_page(name)
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip.
+        # The ``name_resolution`` field on the response
+        # envelope (live or dry-run) tells the agent what
+        # the bridge changed so it can learn the convention
+        # for its next call.
+        resolved_name = _normalize_page_name(name)
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(content)
+        async with _translate_sb_errors(resolved_name):
+            page = await sb_client.read_page(resolved_name)
             body = page.body or ""
             # Compute the splice per ``position``. The
             # ``_split_frontmatter_block`` helper returns
@@ -1479,7 +1651,11 @@ def register_tools(
                 # Same shape as the other read-modify-write
                 # tools' dry-run paths.
                 _validate_if_match_on_read(page.etag, if_match)
-                return _dry_run_payload(body, new_body)
+                payload = _dry_run_payload(body, new_body)
+                payload.update(
+                    _name_resolution_payload(name, resolved_name)
+                )
+                return payload
             # T31b: thread the read's etag into ``if_match``
             # when the caller passed ``None``, so a
             # concurrent edit between read and write fails
@@ -1492,16 +1668,18 @@ def register_tools(
                 if_match if if_match is not None else page.etag
             )
             meta = await sb_client.write_page(
-                name, new_body, if_match=write_if_match
+                resolved_name, new_body, if_match=write_if_match
             )
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=write_if_match,
             dry_run=dry_run,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Patch page (lines)",
@@ -1550,8 +1728,6 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
-        # T36: cap the body size before the SB round trip.
-        _check_body_size(new_content)
         # Cheap, no-read input validation first: a non-positive
         # start_line or an inverted range can't be helped by reading
         # the page (line_count is undefined until then), so the
@@ -1572,8 +1748,17 @@ def register_tools(
             raise ToolError(
                 f"end_line ({end_line}) must be >= start_line ({start_line})"
             )
-        async with _translate_sb_errors(name):
-            page = await sb_client.read_page(name)
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # (live or dry-run) tells the agent what the bridge
+        # changed so it can learn the convention for its next
+        # call.
+        resolved_name = _normalize_page_name(name)
+        # T36: cap the body size before the SB round trip.
+        _check_body_size(new_content)
+        async with _translate_sb_errors(resolved_name):
+            page = await sb_client.read_page(resolved_name)
             body = page.body or ""
             lines, had_trailing_newline = _split_body_lines(body)
             line_count = len(lines)
@@ -1599,7 +1784,11 @@ def register_tools(
                 # newline re-attached), so the diff an agent sees
                 # is exactly the body that would have been written.
                 _validate_if_match_on_read(page.etag, if_match)
-                return _dry_run_payload(body, new_body)
+                payload = _dry_run_payload(body, new_body)
+                payload.update(
+                    _name_resolution_payload(name, resolved_name)
+                )
+                return payload
             # T31b: same auto-thread pattern as
             # :func:`append_to_page`. The caller's explicit
             # ``if_match`` wins when present; the read's etag
@@ -1611,16 +1800,18 @@ def register_tools(
                 if_match if if_match is not None else page.etag
             )
             meta = await sb_client.write_page(
-                name, new_body, if_match=write_if_match
+                resolved_name, new_body, if_match=write_if_match
             )
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=write_if_match,
             dry_run=dry_run,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Patch page (replace)",
@@ -1670,11 +1861,6 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
-        # T36: cap the body size before the SB round trip. The cap
-        # applies to ``new_string`` (the caller's replacement text),
-        # not the post-shaping body, matching the T36 charter's
-        # "you tried to write 600 KB" framing.
-        _check_body_size(new_string)
         # Cheap, no-read input validation first. ``find == ""`` would
         # match between every character (``"abc".replace("", "X")``
         # is ``"XaXbXcX"``) — almost certainly a caller bug, not
@@ -1684,8 +1870,20 @@ def register_tools(
         # :func:`append_to_page`'s ``text must not be empty``.
         if not find:
             raise ToolError("find must not be empty")
-        async with _translate_sb_errors(name):
-            page = await sb_client.read_page(name)
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # (live or dry-run) tells the agent what the bridge
+        # changed so it can learn the convention for its next
+        # call.
+        resolved_name = _normalize_page_name(name)
+        # T36: cap the body size before the SB round trip. The cap
+        # applies to ``new_string`` (the caller's replacement text),
+        # not the post-shaping body, matching the T36 charter's
+        # "you tried to write 600 KB" framing.
+        _check_body_size(new_string)
+        async with _translate_sb_errors(resolved_name):
+            page = await sb_client.read_page(resolved_name)
             body = page.body or ""
             occurrences = body.count(find)
             if occurrences == 0:
@@ -1711,7 +1909,11 @@ def register_tools(
                 # the patch would have changed something — the
                 # dry-run envelope surfaces the result.
                 _validate_if_match_on_read(page.etag, if_match)
-                return _dry_run_payload(body, new_body)
+                payload = _dry_run_payload(body, new_body)
+                payload.update(
+                    _name_resolution_payload(name, resolved_name)
+                )
+                return payload
             # T31b: same auto-thread pattern as the other
             # read-modify-write tools — caller-supplied
             # ``if_match`` wins, read's etag threads through when
@@ -1722,16 +1924,18 @@ def register_tools(
                 if_match if if_match is not None else page.etag
             )
             meta = await sb_client.write_page(
-                name, new_body, if_match=write_if_match
+                resolved_name, new_body, if_match=write_if_match
             )
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=meta,
             expected_etag=write_if_match,
             dry_run=dry_run,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="Move page",
@@ -1783,6 +1987,15 @@ def register_tools(
         new_name: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T39: normalize both the source and destination names
+        # (strip whitespace, append ``.md`` to bare names) before
+        # the SB round trips. The source's ``name_resolution``
+        # field on the response envelope tells the agent what
+        # the bridge changed; the destination's normalization is
+        # implicit via ``payload["name"]`` (which echoes
+        # ``resolved_new_name`` on the success path).
+        resolved_name = _normalize_page_name(name)
+        resolved_new_name = _normalize_page_name(new_name)
         # Same-name short-circuit: ``name == new_name`` is a no-op
         # that returns the page's current acknowledgement without a
         # write/delete round-trip. The caller is asking us to rename
@@ -1790,8 +2003,11 @@ def register_tools(
         # dance would risk spurious 412s on the source delete (we'd
         # have just written a fresh body to ``new_name`` — which is
         # also ``name`` — so the etag from the read would be stale).
-        if name == new_name:
-            async with _translate_sb_errors(name):
+        # Compare the *resolved* names: ``move_page("Foo", "Foo")``
+        # and ``move_page("Foo.md", "Foo")`` are both no-ops once
+        # both sides normalize to ``Foo.md``.
+        if resolved_name == resolved_new_name:
+            async with _translate_sb_errors(resolved_name):
                 # Same-name is a no-op, but a missing page would
                 # otherwise silently succeed. ``read_page`` is the
                 # cheapest existence check (no etag round-trip;
@@ -1808,9 +2024,13 @@ def register_tools(
                 # to verify the etag should chain
                 # ``write_page(name, body, if_match=<etag>)``
                 # themselves.
-                page = await sb_client.read_page(name)
-                return _write_meta_to_payload(page)
-        async with _translate_sb_errors(name):
+                page = await sb_client.read_page(resolved_name)
+                payload = _write_meta_to_payload(page)
+                payload.update(
+                    _name_resolution_payload(name, resolved_name)
+                )
+                return payload
+        async with _translate_sb_errors(resolved_name):
             # 1. Read the source body. No precondition — the source's
             # ``If-Match`` guard lives on the delete (step 3) and is
             # supplied by the *caller's* outer ``if_match`` argument,
@@ -1820,7 +2040,7 @@ def register_tools(
             # ``read_page → move_page(name, new_name, if_match=<etag>)``.
             # A 404 here surfaces the standard
             # ``page not found: {name}`` wording.
-            page = await sb_client.read_page(name)
+            page = await sb_client.read_page(resolved_name)
             body = page.body or ""
             # T36: cap the about-to-be-written body (the source's
             # body, which becomes the destination's body on
@@ -1843,7 +2063,7 @@ def register_tools(
             # this write).
             try:
                 new_meta = await sb_client.write_page(
-                    new_name, body, if_none_match=True
+                    resolved_new_name, body, if_none_match=True
                 )
             except PreconditionFailed as exc:
                 # Destination already exists — surface a clearer
@@ -1852,7 +2072,8 @@ def register_tools(
                 # caller-side decision (pick a different new_name
                 # or merge manually).
                 raise ToolError(
-                    f"destination page already exists: {new_name}; "
+                    f"destination page already exists: "
+                    f"{resolved_new_name}; "
                     f"refusing to overwrite"
                 ) from exc
         # 3. Delete the source. This call sits outside the first
@@ -1865,12 +2086,14 @@ def register_tools(
         # wording to recover (``read_page(new_name) → write_page(
         # name, …) → delete_page(new_name)``).
         try:
-            await sb_client.delete_page(name, if_match=if_match)
+            await sb_client.delete_page(
+                resolved_name, if_match=if_match
+            )
         except PreconditionFailed as exc:
             raise ToolError(
-                f"moved body to {new_name} but failed to delete "
-                f"{name}: precondition failed; check if_match/if_none_match; "
-                f"both now exist"
+                f"moved body to {resolved_new_name} but failed to "
+                f"delete {resolved_name}: precondition failed; "
+                f"check if_match/if_none_match; both now exist"
             ) from exc
         except PageNotFound as exc:
             # Edge case: ``name`` was deleted between step 1's read
@@ -1879,18 +2102,20 @@ def register_tools(
             # gone is a feature, not a bug. Surface a clear message
             # rather than the generic 404 wording.
             raise ToolError(
-                f"moved body to {new_name} but {name} was already "
-                f"deleted before the cleanup step"
+                f"moved body to {resolved_new_name} but "
+                f"{resolved_name} was already deleted before the "
+                f"cleanup step"
             ) from exc
         except ServerError as exc:
             raise ToolError(
-                f"moved body to {new_name} but failed to delete "
-                f"{name}: {exc}; both now exist"
+                f"moved body to {resolved_new_name} but failed to "
+                f"delete {resolved_name}: {exc}; both now exist"
             ) from exc
         except httpx.TimeoutException as exc:
             raise ToolError(
-                f"moved body to {new_name} but failed to delete "
-                f"{name}: silverbullet request timed out; both now exist"
+                f"moved body to {resolved_new_name} but failed to "
+                f"delete {resolved_name}: silverbullet request "
+                f"timed out; both now exist"
             ) from exc
         # T31b: post-delete concurrency verification. Per the
         # T31b ticket docstring, ``move_page`` gets a *lighter*
@@ -1916,15 +2141,20 @@ def register_tools(
         # are the realistic concurrency story.
         await _verify_concurrency_token(
             sb_client,
-            name,
+            resolved_name,
             post_write_meta=new_meta,
             expected_etag=if_match,
         )
         # Successful move: return the destination's acknowledgement.
-        # ``new_meta`` already has ``name=new_name`` (write_page
-        # threads the name through), so the payload's ``name`` field
-        # is the destination, not the source.
-        return _write_meta_to_payload(new_meta)
+        # ``new_meta`` already has ``name=resolved_new_name``
+        # (write_page threads the name through), so the payload's
+        # ``name`` field is the destination, not the source. The
+        # ``name_resolution`` field on the envelope surfaces the
+        # source's normalization; the destination's normalization
+        # is implicit via the echoed ``name`` field.
+        payload = _write_meta_to_payload(new_meta)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
     @mcp.tool(
         title="List pages",
@@ -2029,23 +2259,36 @@ def register_tools(
             raise ToolError(
                 "pass exactly one of other_name or other_body"
             )
+        # T39: normalize both names (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trips. Each
+        # side's ``name_resolution`` field on the response
+        # envelope tells the agent what the bridge changed; the
+        # canonical names are also echoed on each per-page
+        # envelope's ``name`` field (``first``/``second``).
+        resolved_name = _normalize_page_name(name)
+        resolved_other_name = (
+            _normalize_page_name(other_name)
+            if other_name_given else None
+        )
         # Read the source page inside ``_translate_sb_errors``
         # so 404 / 412 / 5xx / timeout surface as the design doc's
         # ToolError wording (matching the read tool). The second
         # read (when ``other_name`` is given) sits in its own
-        # ``_translate_sb_errors`` block keyed on ``other_name``,
-        # so a 404 there surfaces as ``page not found: {other_name}``
-        # — the agent can tell which side is missing without
-        # inspecting the call. Sequential reads, not concurrent:
+        # ``_translate_sb_errors`` block keyed on
+        # ``resolved_other_name``, so a 404 there surfaces as
+        # ``page not found: {resolved_other_name}`` — the agent
+        # can tell which side is missing without inspecting the
+        # call. Sequential reads, not concurrent:
         # ``difflib.unified_diff`` needs both bodies in hand, and
         # the cost is the same either way for two round trips —
         # ``asyncio.gather`` would only save wall-clock at the cost
         # of two sockets against loopback SB.
-        async with _translate_sb_errors(name):
-            first = await sb_client.read_page(name)
+        async with _translate_sb_errors(resolved_name):
+            first = await sb_client.read_page(resolved_name)
         if other_name_given:
-            async with _translate_sb_errors(other_name):
-                second = await sb_client.read_page(other_name)
+            assert resolved_other_name is not None
+            async with _translate_sb_errors(resolved_other_name):
+                second = await sb_client.read_page(resolved_other_name)
             other_body = second.body or ""
         # ``difflib.unified_diff`` input order is (original, patched);
         # we diff ``first`` against ``other`` with ``first`` as the
@@ -2065,15 +2308,32 @@ def register_tools(
             for line in difflib.unified_diff(
                 first_body.split("\n"),
                 other_body.split("\n"),
-                fromfile=name,
-                tofile=other_name if other_name_given else "<literal>",
+                fromfile=resolved_name,
+                tofile=(
+                    resolved_other_name
+                    if other_name_given else "<literal>"
+                ),
                 lineterm="",
             )
         )
+        first_envelope = _diff_page_envelope(first)
+        first_envelope.update(
+            _name_resolution_payload(name, resolved_name)
+        )
+        other_envelope = (
+            _diff_page_envelope(second)
+            if other_name_given else None
+        )
+        if other_envelope is not None and resolved_other_name is not None:
+            other_envelope.update(
+                _name_resolution_payload(
+                    other_name, resolved_other_name
+                )
+            )
         return {
             "diff": diff,
-            "name": _diff_page_envelope(first),
-            "other": _diff_page_envelope(second) if other_name_given else None,
+            "name": first_envelope,
+            "other": other_envelope,
         }
 
     @mcp.tool(
@@ -2118,15 +2378,22 @@ def register_tools(
         page: str | None = None, prefix: str = ""
     ) -> list[dict[str, object]]:
         if page is not None:
+            # T39: normalize the page name (strip whitespace,
+            # append ``.md`` to bare names) before the SB round
+            # trip. The list return shape carries ``name`` on
+            # each entry (the page each bullet lives on, which is
+            # the same as the page the caller asked for); the
+            # agent learns the convention by reading the rows.
+            resolved_page = _normalize_page_name(page)
             # Per-page form: always available because it routes
             # through ``sb_client.read_page``, which doesn't need
             # direct FS access. The same 404 / 5xx / 412 / 413
             # / timeout wording as the read tool surfaces via
             # :func:`_translate_sb_errors`.
-            async with _translate_sb_errors(page):
-                result = await sb_client.read_page(page)
+            async with _translate_sb_errors(resolved_page):
+                result = await sb_client.read_page(resolved_page)
             body = result.body or ""
-            entries = _parse_tasks(page, body)
+            entries = _parse_tasks(resolved_page, body)
             return [
                 {
                     "name": entry.name,
@@ -2234,8 +2501,18 @@ def register_tools(
         if not ref:
             raise ToolError("ref must not be empty")
         target_marker = _validate_check_task_state(state)
-        async with _translate_sb_errors(page):
-            result_page = await sb_client.read_page(page)
+        # T39: normalize the page name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # (live or dry-run) tells the agent what the bridge
+        # changed so it can learn the convention for its next
+        # call. The ``ref`` argument is a wikilink target, not a
+        # page name — leave it alone; the existing
+        # :func:`mcp_silverbullet.journal._normalize_link_target`
+        # canonicalization handles wikilink lookup.
+        resolved_page = _normalize_page_name(page)
+        async with _translate_sb_errors(resolved_page):
+            result_page = await sb_client.read_page(resolved_page)
         # T36: cap the about-to-be-written body before the PUT.
         # The cap applies to the post-shaping body (the page
         # with the bullet flipped), which is what the PUT will
@@ -2257,7 +2534,7 @@ def register_tools(
         match = _find_task_bullet(body, ref)
         if match is None:
             raise ToolError(
-                f"no task with ref {ref} on page {page}; "
+                f"no task with ref {ref} on page {resolved_page}; "
                 f"the task may not have a wikilink ref or may "
                 f"live on a different page"
             )
@@ -2267,12 +2544,12 @@ def register_tools(
         # the count in the error wording rather than having
         # to debug a \"succeeded for the wrong bullet\"
         # outcome.
-        all_tasks = _parse_tasks(page, body)
+        all_tasks = _parse_tasks(resolved_page, body)
         match_count = sum(1 for t in all_tasks if t.ref == ref)
         if match_count > 1:
             raise ToolError(
                 f"ref {ref} matches multiple tasks on page "
-                f"{page}; narrow the ref or use "
+                f"{resolved_page}; narrow the ref or use "
                 f"patch_page_lines directly"
             )
         # Single match confirmed. ``_apply_checkbox_flip`
@@ -2291,7 +2568,7 @@ def register_tools(
             # clearer error beats a ``None``-attribute
             # surprise).
             raise ToolError(
-                f"no task with ref {ref} on page {page}; "
+                f"no task with ref {ref} on page {resolved_page}; "
                 f"the task may not have a wikilink ref or may "
                 f"live on a different page"
             )
@@ -2309,7 +2586,11 @@ def register_tools(
             # *here* because no PUT happens. Same shape as the
             # other patch tools' dry-run paths.
             _validate_if_match_on_read(result_page.etag, if_match)
-            return _dry_run_payload(body, new_body)
+            payload = _dry_run_payload(body, new_body)
+            payload.update(
+                _name_resolution_payload(page, resolved_page)
+            )
+            return payload
         # Live path: thread the read's etag into the write so a
         # concurrent edit fails 412 rather than silently
         # clobbering. The read carries no precondition (matches
@@ -2329,9 +2610,9 @@ def register_tools(
         write_if_match = (
             if_match if if_match is not None else result_page.etag
         )
-        async with _translate_sb_errors(page):
+        async with _translate_sb_errors(resolved_page):
             meta = await sb_client.write_page(
-                page, new_body, if_match=write_if_match
+                resolved_page, new_body, if_match=write_if_match
             )
         # T31b: same post-write concurrency-token verification
         # as the other read-modify-write tools. ``write_if_match``
@@ -2344,12 +2625,14 @@ def register_tools(
         # ``concurrent edit detected`` ``ToolError``.
         await _verify_concurrency_token(
             sb_client,
-            page,
+            resolved_page,
             post_write_meta=meta,
             expected_etag=write_if_match,
             dry_run=dry_run,
         )
-        return _write_meta_to_payload(meta)
+        payload = _write_meta_to_payload(meta)
+        payload.update(_name_resolution_payload(page, resolved_page))
+        return payload
 
     @mcp.resource(
         "silverbullet://page/{name}",
@@ -2372,8 +2655,15 @@ def register_tools(
         mime_type="application/json",
     )
     async def silverbullet_page(name: str) -> dict[str, object]:
+        # T39: normalize the name (strip whitespace, append
+        # ``.md`` to bare names) before the SB round trip. The
+        # ``name_resolution`` field on the response envelope
+        # tells the agent what the bridge changed so it can
+        # learn the convention for its next call. Same shape as
+        # the read tool's ``name_resolution`` envelope.
+        resolved_name = _normalize_page_name(name)
         try:
-            page = await sb_client.read_page(name)
+            page = await sb_client.read_page(resolved_name)
         except PageNotFound as exc:
             # 404 is a ResourceNotFoundError per the SDK's two-shape
             # split: ``-32602 invalid params`` for "doesn't exist"
@@ -2382,12 +2672,21 @@ def register_tools(
             # set ``is_error=True`` on a successful call, but
             # ``resources/read`` errors come back as JSON-RPC errors
             # and Grok's connector treats both shapes identically.
-            raise ResourceNotFoundError(f"page not found: {name}") from exc
+            # The error surfaces the *resolved* name (the canonical
+            # form the bridge tried) so the agent sees the same
+            # name it passed in (if the input was already
+            # canonical) or the normalized form (if T39 added a
+            # suffix) — consistent with the success-path envelope.
+            raise ResourceNotFoundError(
+                f"page not found: {resolved_name}"
+            ) from exc
         except ServerError as exc:
             raise ResourceError(str(exc)) from exc
         except httpx.TimeoutException as exc:
             raise ResourceError("silverbullet request timed out") from exc
-        return _read_meta_to_payload(page)
+        payload = _read_meta_to_payload(page)
+        payload.update(_name_resolution_payload(name, resolved_name))
+        return payload
 
 
 __all__ = [
