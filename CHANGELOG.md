@@ -85,19 +85,24 @@ per-user SB credentials to thread off of.
 ## [Unreleased] — v1.5 (agent-experience hardening)
 
 Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
-**Status: T39 + T40 shipped 2026-08-31; v1.5 destination
-partial** — the `.md`-suffix split closes via T39's
-name-normalization helper (threaded into every `name`-taking
-tool), with a `name_resolution` envelope field that teaches
-the agent the convention for its next call. T40 lifts the
-upfront empty-input guard (already shipped on
-`create_page` / `append_to_page` / `prepend_to_page` /
-`patch_page_replace` / `check_task`) into two shared helpers
-and threads them into the four tools that didn't have it
-yet (`write_page` / `delete_page` / `move_page`'s source and
-destination / `patch_page_lines`). T41 / T42 remain on the
-frontier (same charter: doc clarifications, 412 contention
-hint respectively).
+**Status: T39 + T40 + T44 shipped 2026-08-31; v1.5
+destination partial** — the `.md`-suffix split closes via
+T39's name-normalization helper (threaded into every
+`name`-taking tool), with a `name_resolution` envelope
+field that teaches the agent the convention for its next
+call. T40 lifts the upfront empty-input guard (already
+shipped on `create_page` / `append_to_page` /
+`prepend_to_page` / `patch_page_replace` / `check_task`)
+into two shared helpers and threads them into the four
+tools that didn't have it yet (`write_page` /
+`delete_page` / `move_page`'s source and destination /
+`patch_page_lines`). T44 fixes T31b's false-positive
+"concurrent edit detected" on every successful write by
+dropping the mtime component from the synthesized etag
+(see Changed below for the wire-shape migration note).
+T41 / T42 / T43 remain on the frontier (same charter: doc
+clarifications, 412 contention hint, CF 5xx wrapper JSON
+parsing respectively).
 
 T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
 that explicitly pass `name="Foo"` (bare) expecting a 500-shaped
@@ -221,6 +226,45 @@ agent learns the convention rather than continuing to retype.
   `server.py` and `docs/design.md` § Tools
   table rows updated to mention the new
   guards.
+
+### Changed
+
+- **T44 synthesized-etag format change** — the
+  `synthesize_etag` fallback (used when SB strips
+  `ETag` from the response, as it does on this dev
+  box) used to return `"{last_modified_ms}-{size_bytes}"`
+  and now returns `"{size_bytes}"`. The mtime
+  component was dropped because the bridge stamps
+  `X-Last-Modified` with `now_ms` on every PUT
+  request (`_WRITE_HEADERS`), which made the dashed
+  form drift on every write even when the body was
+  unchanged; the drift made T31b's post-write
+  verification raise `ToolError("concurrent edit
+  detected: …")` on every successful write where
+  the write actually succeeded (the bridge was
+  lying about 412). The size-only primitive is
+  what the concurrency check actually needs:
+  same body → same size → same etag → no drift;
+  different body → different size → different
+  etag → drift. **Wire-shape change** (backwards-
+  incompatible for v1.3 / v1.4 callers): any caller
+  holding a synthesized etag across calls should
+  re-read once after this fix lands to pick up the
+  new canonical form. Real `ETag` headers (from SB
+  builds that emit them) are unaffected. Three
+  `tests/test_sb_client.py` cases updated to assert
+  the new form; two `tests/test_tools_in_memory.py`
+  T31b tests already passed against the new form
+  without modification (their existing mocks
+  happened to match). One new Layer-1 test
+  (`test_t31b_write_page_verification_passes_when_synthesized_etag_unchanged`)
+  locks the realistic-shape happy path that the
+  pre-T44 false-positive broke. `tests/test_e2e_live_sb.py`
+  updated to construct the new form on its
+  fallback branches and assert the new wire shape
+  on the live-SB drift test. Real `ETag` headers
+  (the v1.3 contract path on SBs that emit them)
+  are untouched.
 
 ## [v1.3] — agent-grade discovery + edit hygiene
 

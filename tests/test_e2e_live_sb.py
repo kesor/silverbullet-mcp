@@ -757,7 +757,16 @@ async def test_if_match_stale_etag_returns_412() -> None:
                                 "closes negatively on the missing "
                                 "ETag finding alone."
                             )
-                        etag_a = f'"{last_modified_a}-{size_a}"'
+                        # T44: the synthesized form is now
+                        # ``"{size_bytes}"`` alone — the
+                        # ``X-Last-Modified`` component was dropped
+                        # because the bridge stamps it with ``now_ms``
+                        # on every PUT, which made the dashed form
+                        # drift on every write and caused T31b's
+                        # post-write verification to raise a
+                        # false-positive "concurrent edit detected"
+                        # on every successful write.
+                        etag_a = f'"{size_a}"'
 
                     # Step 2: read twice (the ticket's "read twice"
                     # framing — most SBs return the same etag both
@@ -946,13 +955,27 @@ async def test_if_match_synthetic_etag_drifts_on_body_change() -> None:
                     )
                     assert size_a is not None
                     # The synthesized form on this SB build is
-                    # ``"<ms>-<bytes>"`` (both headers populated
-                    # by SB on every PUT). Lock the exact form so
-                    # a future regression that changes the
-                    # synthetic shape (e.g. dropping the dashes)
-                    # fails loudly.
+                    # ``"<bytes>"`` (T44 — pre-T44 the form was
+                    # ``"<ms>-<bytes>"``; the mtime component was
+                    # dropped because the bridge stamps
+                    # ``X-Last-Modified`` with ``now_ms`` on every
+                    # PUT, which made the dashed form drift on
+                    # every write and caused T31b's
+                    # post-write verification to raise a
+                    # false-positive "concurrent edit detected"
+                    # on every successful write). Lock the exact
+                    # shape so a future regression that changes
+                    # the synthetic form (e.g. re-adding the
+                    # mtime component) fails loudly.
                     assert etag_a.startswith('"') and etag_a.endswith('"')
-                    assert "-" in etag_a
+                    # Strip quotes and assert the body is a
+                    # numeric byte count — the only thing the
+                    # synthesized form tracks post-T44.
+                    assert etag_a.strip('"').isdigit(), (
+                        f"T31a / T44: synthesized etag should be "
+                        f"a quoted numeric byte count; got "
+                        f"{etag_a!r}"
+                    )
 
                     # Step 2: re-read the same body. The
                     # synthesized etag should match the post-write
@@ -1088,22 +1111,31 @@ async def test_concurrent_edit_detected_via_post_write_verification() -> None:
                     size_a = created_payload.get("size_bytes")
                     if etag_a is None:
                         # Same fallback as T31: synthesize a
-                        # ``"<ms>-<bytes>"`` value from the
-                        # ``X-Last-Modified`` + ``size_bytes``
-                        # the envelope *did* surface. T31a's
-                        # helper now does this automatically
-                        # on the bridge side, so this branch
-                        # is unreachable in normal operation —
-                        # kept as a defensive guard so a future
-                        # regression that strips T31a's
-                        # fallback doesn't crash this test.
+                        # ``"{bytes}"`` value from ``size_bytes``
+                        # the envelope *did* surface. T31a / T44
+                        # now does this automatically on the
+                        # bridge side, so this branch is
+                        # unreachable in normal operation — kept
+                        # as a defensive guard so a future
+                        # regression that strips T31a's fallback
+                        # doesn't crash this test. (Pre-T44 the
+                        # synthesized form was
+                        # ``"<ms>-<bytes>"``; T44 dropped the
+                        # mtime component because the bridge
+                        # stamps ``X-Last-Modified`` with
+                        # ``now_ms`` on every PUT, which made
+                        # the dashed form drift on every write
+                        # and caused T31b's verification to
+                        # raise a false-positive "concurrent
+                        # edit detected" on every successful
+                        # write.)
                         if last_modified_a is None or size_a is None:
                             raise AssertionError(
                                 "T31b: cannot construct a synthetic "
                                 "fallback etag; envelope missing both "
                                 "etag and X-Last-Modified/size_bytes"
                             )
-                        etag_a = f'"{last_modified_a}-{size_a}"'
+                        etag_a = f'"{size_a}"'
 
                     # Step 2: write body_b (mutate out-of-band
                     # so ``etag_a`` is stale). No ``if_match``

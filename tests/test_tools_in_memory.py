@@ -5816,6 +5816,107 @@ async def test_t31b_write_page_verification_passes_when_etag_unchanged() -> None
 
 
 @pytest.mark.asyncio
+async def test_t31b_write_page_verification_passes_when_synthesized_etag_unchanged() -> None:
+    """Happy path on the synthesized-etag fallback path: same body on read and re-read → success.
+
+    The realistic-shape mock the prior test's contrived ETag
+    mock hides: SB returns no ``ETag`` header on this dev box
+    (the v1.3 T31 fact), so both the PUT response and the
+    verification GET fall through to the synthesized
+    ``"{ms}-{bytes}"`` path. The bridge stamps
+    ``X-Last-Modified`` with ``now_ms`` on every PUT request
+    (``sb_client.py:411``), so the pre-write read's mtime
+    and the post-write re-read's mtime differ — but the body
+    is unchanged. A synthesized etag that includes the mtime
+    drifts across the read-modify-write dance and the T31b
+    helper raises "concurrent edit detected" on every
+    successful write. T44 drops the mtime component so the
+    synthesized etag is stable across re-reads of the same
+    body.
+
+    This is the user's defect (2026-08-31): the bridge
+    raises ``ToolError("concurrent edit detected: …")`` on
+    every successful write where the underlying write
+    actually succeeded. The Grok Automations script handled
+    it transparently; the bridge should not lie about 412 in
+    the first place.
+    """
+    # Two distinct ``X-Last-Modified`` values, both in the
+    # 1.7e12 epoch-ms range. The body size (4 bytes for
+    # ``"body"``) stays the same across both reads.
+    pre_mtime = "1700000000000"
+    post_mtime = "1700000001000"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # First read: the caller's pre-write read. SB echoes
+        # the ``pre_mtime`` it stored.
+        if request.method == "GET" and handler.first_read_done is False:
+            handler.first_read_done = True
+            return httpx.Response(
+                200,
+                text="body",
+                headers={
+                    "X-Last-Modified": pre_mtime,
+                    "X-Content-Length": "4",
+                },
+            )
+        # PUT: SB echoes the bridge's request header
+        # (``X-Last-Modified`` = ``post_mtime``, the
+        # bridge's ``now_ms`` stamp).
+        if request.method == "PUT":
+            return httpx.Response(
+                200,
+                headers={
+                    "X-Last-Modified": post_mtime,
+                    "X-Content-Length": "4",
+                },
+            )
+        # Verification GET: SB echoes ``post_mtime`` again.
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Last-Modified": post_mtime,
+                "X-Content-Length": "4",
+            },
+        )
+
+    handler.first_read_done = False  # type: ignore[attr-defined]
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        # The agent's read-modify-write dance: read the page,
+        # then write the same body with the read's etag as
+        # ``if_match``. T31b's helper will re-read after the
+        # write; with the size-only synthesized etag, the
+        # post-write re-read's etag matches the pre-read's
+        # etag (both ``'"4"'``) and the helper no-ops.
+        read = await client.call_tool("read_page", {"name": "index.md"})
+        assert read.is_error is False
+        read_etag = (read.structured_content or {}).get("etag")
+        assert read_etag is not None
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index.md", "content": "body", "if_match": read_etag},
+        )
+
+    assert result.is_error is False, (
+        f"T31b (T44): synthesized-etag post-write re-read "
+        f"drifted on an unchanged body; the bridge raised "
+        f"{_text(result)!r} instead of returning the T23 "
+        f"ack envelope. The user's defect: the bridge "
+        f"raises 'concurrent edit detected' on every "
+        f"successful write when SB strips the ETag header."
+    )
+    payload = result.structured_content or {}
+    assert payload.get("name") == "index.md"
+    # The synthesized etag is now ``"{size_bytes}"`` — no
+    # mtime component, so it's stable across reads of the
+    # same body.
+    assert payload.get("etag") == '"4"'
+
+
+@pytest.mark.asyncio
 async def test_t31b_write_page_skips_verification_when_if_match_is_none() -> None:
     """``if_match=None`` opts out of the verification (no precondition to verify).
 

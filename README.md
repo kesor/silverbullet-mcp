@@ -95,7 +95,8 @@ Every write tool accepts `if_match` (`"*"` to require existence,
 `<etag>` to require an exact body match, `None` for unconditional).
 On this build, SilverBullet does **not** honor `If-Match` and does
 **not** return `ETag` on PUT — the bridge synthesizes a fallback etag
-from `X-Last-Modified` + `X-Content-Length` and runs a post-write
+from `X-Content-Length` (T44; pre-T44 the form was
+`"{last_modified_ms}-{size_bytes}"`) and runs a post-write
 re-read to compare. If a stale etag slips through, the bridge raises
 `ToolError("concurrent edit detected: …; read it again and re-issue
 the write with the current etag")`. The fix is always the same: read

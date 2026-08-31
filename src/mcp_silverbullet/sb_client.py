@@ -638,29 +638,37 @@ def _etag_from_response(response: httpx.Response) -> str | None:
     threads ``None`` — no precondition at all. The fix (T31a):
     synthesize a stable etag from the headers SB *does* return.
 
-    The synthesized form is ``"{last_modified_ms}-{size_bytes}"`` —
-    both fields are populated by SB on every PUT response on this
-    build (T31's resolution recorded the fact), and the form
-    matches SB's real ETag header shape (a string with surrounding
-    quotes, e.g. ``"<...>"``). Stability: two writes with the
-    same body produce the same synthesized etag (same mtime
-    window, same byte count); two writes with different bodies or
-    different mtimes produce different synthesized etags. That's
-    the entire concurrency primitive the agent needs — detect
-    that *something* changed between read and write, not what
-    specifically changed.
+    The synthesized form is ``"{size_bytes}"`` (T44) — a single
+    quoted integer string derived from ``X-Content-Length``.
+    Stability: two reads of the same body produce the same
+    synthesized etag (same byte count); two reads of different
+    bodies produce different synthesized etags. That's the entire
+    concurrency primitive the agent needs — detect that *what*
+    changed between read and write, not *when*. T44 dropped the
+    prior ``"{last_modified_ms}-{size_bytes}"`` shape because the
+    bridge stamps ``X-Last-Modified`` with ``now_ms`` on every
+    PUT request (``_WRITE_HEADERS``), so the post-write re-read's
+    mtime drifts from the pre-write read's mtime even when no
+    concurrent edit happened — the mtime component was tracking
+    *when* a write happened, not *what* it wrote, and the *when*
+    drift was the source of T31b's false-positive "concurrent
+    edit detected" on every successful write.
 
     Fallback chain when ``ETag`` is missing:
 
-    - ``X-Last-Modified`` + ``X-Content-Length`` both present →
-      ``"{ms}-{bytes}"`` (the normal case on this SB build).
-    - ``X-Last-Modified`` present but ``X-Content-Length``
-      missing / malformed → ``"{ms}"`` alone (still changes when
-      the page is rewritten, but won't distinguish two writes in
-      the same epoch-ms window with different bodies).
-    - ``X-Last-Modified`` missing → ``None`` (no fallback
-      available; the agent loses the concurrency primitive, same
-      as on a fully-stripped response pre-T31a).
+    - ``X-Content-Length`` present → ``"{bytes}"`` (the normal
+      case on this SB build; both headers are populated by SB
+      on every PUT response per T31's resolution).
+    - ``X-Content-Length`` missing / malformed → ``None`` (no
+      fallback available; the agent loses the concurrency
+      primitive, same as on a fully-stripped response pre-T31a).
+      Pre-T44 the helper would have surfaced ``"{ms}"`` from the
+      timestamp header, but a timestamp-only value is *less*
+      useful than a size-only value (it can't distinguish two
+      writes in the same epoch-ms window with different bodies
+      *and* it's what was tracking the *when* drift that caused
+      the T31b false-positive). Returning ``None`` here is the
+      honest answer: the bridge has no useful primitive to offer.
 
     The fallback never round-trips to SB — it's a local
     derivation from headers already on the response. The agent
@@ -668,7 +676,14 @@ def _etag_from_response(response: httpx.Response) -> str | None:
     is real or synthesized (no separate flag surfaced; a future
     caller that wants the distinction can compare the etag
     against an explicit ``"synthetic:"`` prefix if it ever
-    matters, but no ticket in v1.3 asks for that).
+    matters, but no ticket in v1.3 / v1.5 asks for that).
+
+    Wire-shape change (T44): the synthesized form went from
+    ``"{ms}-{bytes}"`` to ``"{bytes}"``. Callers that persist
+    a v1.3 / v1.4 synthesized etag across calls will see a
+    mismatch after the T44 fix lands and should re-read once to
+    pick up the new canonical form. Real ETag headers (from SB
+    builds that emit them) are unaffected.
     """
     raw = response.headers.get("ETag")
     if raw:
@@ -686,37 +701,46 @@ def synthesize_etag(
     last_modified_ms: int | None, size_bytes: int | None
 ) -> str | None:
     """Build the synthetic-etag fallback string from a PUT response's
-    ``X-Last-Modified`` + ``X-Content-Length`` pair.
+    ``X-Content-Length`` (and ``X-Last-Modified``, retained for
+    call-site compatibility but unused).
 
     Exposed at module scope so :mod:`server` can construct the same
     value when comparing two reads against each other (the T31b
     post-write verification path compares ``read_post.etag`` against
     ``expected_etag``; if both are synthesized, the comparison uses
     the same function on both sides and they match by construction
-    when the body and mtime haven't drifted).
+    when the body hasn't drifted).
 
-    The wire shape is ``"{last_modified_ms}-{size_bytes}"`` when
-    both fields are present, ``"{last_modified_ms}"`` alone when
-    only the timestamp is populated, and ``None`` when neither is
-    available. The quotes around the synthesized value mirror SB's
-    own ETag header (``"<...>"``); they're not load-bearing for
-    SB-on-this-build (which ignores ``If-Match`` outright per
-    T31's resolution) but they keep the value shape
-    indistinguishable from a real ETag, which matters on any
-    future SB build that *does* honor the header.
+    The wire shape is ``"{size_bytes}"`` when ``X-Content-Length``
+    is present and ``None`` otherwise. The quotes around the
+    synthesized value mirror SB's own ETag header (``"<...>"``);
+    they're not load-bearing for SB-on-this-build (which ignores
+    ``If-Match`` outright per T31's resolution) but they keep
+    the value shape indistinguishable from a real ETag, which
+    matters on any future SB build that *does* honor the header.
 
-    ``size_bytes`` alone (no timestamp) returns ``None``: a
-    body-length-derived etag would be unstable across reads of the
-    same body (an SB that doesn't emit ``X-Last-Modified`` can't
-    tell the agent *when* a write happened, so the agent can't
-    tell a stale read from a fresh one). Better to surface no
-    value than a value that's silently wrong.
+    Why size alone is the right primitive (T44): the concurrency
+    primitive needs to differ between two *different* bodies —
+    a body-length-derived value satisfies that (same body → same
+    size → same etag; different body → different size → different
+    etag). The pre-T44 ``"{ms}-{bytes}"`` shape tracked *when* a
+    write happened on top of *what* it wrote; the *when*
+    component drifted on every PUT (the bridge stamps
+    ``X-Last-Modified`` with ``now_ms`` per ``_WRITE_HEADERS``),
+    so two reads of the same body produced different synthesized
+    etags and T31b's verification helper raised "concurrent
+    edit detected" on every successful write. The mtime was
+    the wrong axis for the concurrency primitive: it changes
+    on every write regardless of whether the body changed.
+
+    ``size_bytes`` is the only required argument. The
+    ``last_modified_ms`` parameter is kept (so call sites don't
+    need to change) but is unused — pre-T44 it was load-bearing
+    in the dashed form; T44 drops it.
     """
-    if last_modified_ms is None:
-        return None
     if size_bytes is None:
-        return f'"{last_modified_ms}"'
-    return f'"{last_modified_ms}-{size_bytes}"'
+        return None
+    return f'"{size_bytes}"'
 
 
 def _page_meta_from_list_item(item: dict[str, object]) -> PageMeta:
