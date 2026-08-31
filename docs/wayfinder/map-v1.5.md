@@ -142,6 +142,14 @@ all unblocked, all on the frontier. None claimed this
 session — the user asked for a chart-only pass, not a
 resolution.
 
+**Status as of 2026-08-31**: T39 + T40 shipped
+(commits `39f7c` and `50f03`). Remaining on the
+frontier: T41 (doc clarifications — unblocked since
+T39 shipped), T42 (412 contention hint), T43
+(CF 5xx `cf_hint` envelope — charted this session),
+T44 (fix T31b's false-positive — charted this
+session).
+
 ## Notes
 
 - **Domain**: same as the prior maps (protocol bridge).
@@ -229,7 +237,7 @@ ticket's resolution below -->
 
 - [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them).
 - [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
-- [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
+- [T40 (2026-08-31)](#t40-lift-upfront-empty-input-validation-across-the-remaining-write-tools-b9): two shared helpers in `server.py` — `_validate_nonempty_name(name)` (`ToolError("name must not be empty")`) + `_validate_nonempty_value(value, *, label)` (`ToolError("<label> must not be empty")`); threaded into 7 call sites across 4 previously-unguarded tools (`write_page` name + content, `delete_page`, `move_page` source + destination, `patch_page_lines`) + 5 already-guarded tools lifted into the helper for wording consistency (`create_page`, `append_to_page`, `prepend_to_page`, `patch_page_replace`'s `find`, `check_task`'s `ref`); guards fire *before* T39's name normalization so empty `name` raises loudly rather than normalizing to `".md"` silently; **drive-by deviation from the ticket's charter**: `patch_page_replace`'s `new_string=""` is the documented "delete every match" path, NOT a caller bug, so it's deliberately NOT guarded (a dedicated test pins the surface against accidental future guarding); 17 new Layer-1 cases in `tests/test_tools_in_memory.py`; 245 in-memory + 496 total tests pass.
 
 ## Not yet specified
 
@@ -588,8 +596,8 @@ shipped); T42 unchanged (independent).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: pi (claimed 2026-08-31, working same session)
-> **Status**: 🔵 in progress — claimed this session, shipping before EOD
+> **Assignee**: pi (claimed 2026-08-31, resolved same day)
+> **Status**: ✅ resolved (commit `50f03`)
 > **Question**: How does every write tool gain the
 > same upfront empty-input guard that
 > `create_page` / `append_to_page` /
@@ -680,6 +688,96 @@ shipped); T42 unchanged (independent).
 > normalization fires on the validated input).
 > Can claim either order. **Unblocks**: nothing —
 > terminal ticket.
+>
+> **Resolution** (positive, 2026-08-31; commit
+> `50f03`): shipped in `src/mcp_silverbullet/server.py`
+> and `tests/test_tools_in_memory.py`. Two shared
+> module-scope helpers at module scope:
+>
+> - `_validate_nonempty_name(name)` — raises
+>   `ToolError("name must not be empty")` when the
+>   caller's `name` is empty or whitespace-only.
+>   Fixed wording (matches the existing inline
+>   guard on `create_page`).
+> - `_validate_nonempty_value(value, *, label)` —
+>   parameterized sibling for body-shaped inputs
+>   (`content` / `text` / `find` / `ref`). Raises
+>   `ToolError("<label> must not be empty")` with
+>   the parameter name inlined.
+>
+> Threaded into the four tools that had no
+> upfront empty-input check: `write_page`
+> (`name` + `content`), `delete_page` (`name`),
+> `move_page` (`name` + `new_name` — both args
+> share the same helper, same wording),
+> `patch_page_lines` (`name`). The five
+> already-guarded tools (`create_page` /
+> `append_to_page` / `prepend_to_page` /
+> `patch_page_replace` / `check_task`) had their
+> inline guards replaced with the shared helpers
+> so the wording matches across every tool —
+> existing tests continue to pass byte-for-byte.
+>
+> **Drive-by deviation from the ticket's
+> charter**: the ticket proposed guarding
+> `patch_page_replace`'s `new_string` too, but
+> `new_string=""` is the documented "delete every
+> match" path (`"abcdefg".replace("cd", "")` is
+> `"abefg"`) — a legitimate edit, not a caller
+> bug. The ticket's actual scope is the four
+> tools with no guard at all; `patch_page_replace`
+> already had the `find` guard (the half that
+> prevents a runaway match-everywhere). The
+> `new_string=""` non-guard is now a
+> `## Drive-by from this session` item rather
+> than an open ticket, and a dedicated test
+> (`test_t40_patch_page_replace_empty_new_string_does_NOT_raise`)
+> pins the surface against accidental future
+> guarding. The `_validate_nonempty_value`
+> docstring explicitly excludes `new_string`
+> from its threading list.
+>
+> Ordering invariant: every guard fires *before*
+> T39's name normalization, so a caller passing
+> `name=""` still sees
+> `ToolError("name must not be empty")` rather
+> than the normalized form `".md"` silently
+> succeeding (which would create a page named
+> `.md` — definitely not what the caller meant).
+> Locked by `test_t40_normalization_runs_after_empty_guard`.
+>
+> 17 new Layer-1 cases in
+> `tests/test_tools_in_memory.py` cover:
+> empty / whitespace-only inputs across every
+> tool, the no-SB-round-trip invariant (a mock
+> that 500s on PUT would otherwise surface a
+> `silverbullet error: 500` rather than the
+> empty-input guard), the normalization-runs-
+> after-empty-guard ordering, the
+> `patch_page_replace` `new_string=""` non-guard
+> case, and the wording-consistency pins for
+> each tool (so a future threading change can't
+> silently rename `text` to `content` or vice
+> versa). 245 in-memory tests pass; 496 total
+> tests pass; live e2e tests skip cleanly
+> without env vars.
+>
+> Tool descriptions in `server.py` and the §
+> Tools table rows in `docs/design.md` updated
+> to mention the new guards (one short sentence
+> per affected tool, naming the exact `ToolError`
+> wording). README updated with the same
+> one-liners. `CHANGELOG.md` v1.5 `[Unreleased]`
+> section documents T40 alongside T39 with the
+> full threading list, the drive-by deviation
+> rationale, and a pointer at the 17 new test
+> cases.
+>
+> Unblocks: nothing (terminal ticket). T41 +
+> T42 + T43 + T44 remain on the frontier;
+> T41's `.md`-suffix-convention sentence in
+> `MCPServer.instructions` was unblocked by T39
+> (already shipped) and is now ready to claim.
 
 ### T41. Doc clarifications: `index.md` source-vs-render, `move_page` no-op, `.md`-suffix convention (b5, b8)
 
