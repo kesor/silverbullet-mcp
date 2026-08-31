@@ -8,15 +8,20 @@ Versions correspond to the build-map (wayfinder) charts under
 `docs/wayfinder/`. The map for an in-flight version lists the open
 tickets; this file records what's already shipped.
 
-## [v1.4] — JWT inbound auth
+## [v1.4] — JWT inbound auth + discovery-surface clarity
 
 Build map: [`docs/wayfinder/map-v1.4.md`](docs/wayfinder/map-v1.4.md).
-**Status: T37 + T38 shipped; v1.4 destination reached** — the
-inbound auth surface widened from "one shared secret" to a JWT
+**Status: T37 shipped 2026-08-31; T38 still on the frontier** —
+the inbound auth surface widened from "one shared secret" to a JWT
 mode that validates per-user tokens against an IdP's JWKS
 (default config targets Cloudflare Access; the v1.x
 static-token mode stays available via
-`MCP_SILVERBULLET_AUTH_MODE=static`).
+`MCP_SILVERBULLET_AUTH_MODE=static`). T37 widens `list_pages`'s
+filter surface so an operator who reads "filtered by prefix" as
+substring has an explicit `contains=` knob (see Added below);
+T38 will surface the journal gate's purpose and opt-in path
+more loudly in the README and tool descriptions (a follow-up
+session).
 
 v1.3 closed on 2026-08-30; v1.4 takes the bridge from
 "single-user behind a tunnel" to "per-user authenticated by
@@ -81,6 +86,26 @@ per-user SB credentials to thread off of.
     over ``select_verifier`` that handles the
     ``None``-vs-empty-string distinction
     ``load_settings`` produces.
+
+- **T37 `list_pages` substring filter** — new
+  `contains: str = ""` parameter on `list_pages`
+  that does substring matching against the page
+  name (alongside the existing `prefix=` filter
+  which keeps v1's `startswith` semantics). The two
+  filters compose as AND when both are set; either
+  empty is a no-op for that criterion; both empty
+  returns the full listing. Both filters run
+  client-side before per-page hydration, so a
+  narrow filter reduces the N+1 round-trip count
+  the same way `prefix=` does. Wire surface: the
+  v1 / v1.1 / v1.2 / v1.3 `prefix=` semantics are
+  unchanged for callers that already use the
+  parameter; the new `contains=` parameter is purely
+  additive. Closes the bug-report surface where an
+  operator reads "filtered by prefix" as substring
+  and now has an explicit knob. T38 (journal gate
+  docs) remains on the frontier; this entry ships
+  T37 alone.
 
 ## [Unreleased] — v1.5 (agent-experience hardening)
 

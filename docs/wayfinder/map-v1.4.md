@@ -225,8 +225,8 @@ ordering and an explicit "Blocks:" line per ticket).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed 2026-08-31)
+> **Status**: 🟡 open — claimed, working
 > **Question**: How does `list_pages` accept substring matching
 > alongside its existing `startswith` `prefix=` filter, without
 > breaking the v1 / v1.1 / v1.2 / v1.3 wire surface?

@@ -3601,6 +3601,239 @@ async def test_list_pages_filters_by_prefix() -> None:
     }
 
 
+# --- list_pages substring filter (T37) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pages_contains_filter() -> None:
+    """T37: ``contains=`` does substring matching against page name.
+
+    The bug reporter's `kesor_list_pages` symptom ("prefix silently
+    ignored") was a v1-pre-T10 regression on the ``prefix=`` side;
+    T37 widens the surface so an operator who reads "filtered by
+    prefix" as substring has an explicit knob. ``prefix`` keeps
+    ``startswith`` semantics (unchanged for v1 / v1.1 / v1.2 / v1.3
+    callers); ``contains`` is the new substring narrowing. Both
+    compose as AND when both are set.
+    """
+    payload = [
+        {"name": "index.md", "etag": None, "size": 1},
+        {"name": "journal/2026-01-01.md", "etag": None, "size": 2},
+        {"name": "trade-journal-2026-q1.md", "etag": None, "size": 3},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=__import__("json").dumps(payload).encode())
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {"contains": "journal"})
+
+    assert result.is_error is False
+    # ``journal`` substring appears in both ``journal/…`` and
+    # ``trade-journal-…``; ``index.md`` is filtered out.
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "journal/2026-01-01.md",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "trade-journal-2026-q1.md",
+                "etag": None,
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_prefix_and_contains_compose() -> None:
+    """T37: ``prefix=`` + ``contains=`` compose as AND.
+
+    Both set means the row must satisfy both criteria — a tighter
+    set than either alone, never a wider one. The
+    ``trade-journal-…`` row matches ``contains="journal"`` but
+    fails ``prefix="journal/"``; only the rows under the
+    ``journal/`` folder that also contain the substring survive.
+    """
+    payload = [
+        {"name": "index.md", "etag": None, "size": 1},
+        {"name": "journal/2026-01-01.md", "etag": None, "size": 2},
+        {"name": "journal/2026-01-02.md", "etag": None, "size": 3},
+        {"name": "trade-journal-2026-q1.md", "etag": None, "size": 4},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=__import__("json").dumps(payload).encode())
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "list_pages",
+            {"prefix": "journal/", "contains": "2026"},
+        )
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "journal/2026-01-01.md",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "journal/2026-01-02.md",
+                "etag": None,
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_contains_empty_is_full_list() -> None:
+    """T37: ``contains=""`` returns the full listing (v1 behavior).
+
+    Empty string is the no-op sentinel for the ``contains`` filter
+    — same as ``prefix=""`` already shipped. A caller that passes
+    ``{}`` (no filters at all) gets the v1 surface byte-for-byte:
+    the full listing, no narrowing, no extra cost. This pins the
+    surface so a future refactor that flips the empty-check
+    semantics doesn't silently drop rows.
+    """
+    payload = [
+        {"name": "index.md", "etag": None, "size": 1},
+        {"name": "journal/2026-01-01.md", "etag": None, "size": 2},
+        {"name": "trade-journal-2026-q1.md", "etag": None, "size": 3},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=__import__("json").dumps(payload).encode())
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {"contains": ""})
+
+    assert result.is_error is False
+    # Full listing — the empty ``contains`` filter is a no-op.
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "index.md",
+                "etag": None,
+                "size_bytes": 1,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "journal/2026-01-01.md",
+                "etag": None,
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "trade-journal-2026-q1.md",
+                "etag": None,
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_pages_contains_runs_before_hydration() -> None:
+    """T37: ``contains`` filter runs before per-row hydration, same
+    as ``prefix``.
+
+    The order (filter → hydrate) is locked by T28's
+    ``test_list_pages_hydration_runs_after_prefix_filter`` test
+    so that a narrow filter reduces the per-page round-trip
+    count; T37 inherits the same ordering because the new
+    filter is mechanically identical (one-line substring
+    narrowing). A future refactor that moves hydration before
+    either filter would surface as wasted SB load rather than
+    a silent regression.
+    """
+    list_payload = [
+        {"name": "index.md", "size": 1},
+        {"name": "journal/2026-01-01.md", "size": 2},
+        {"name": "trade-journal-2026-q1.md", "size": 3},
+    ]
+
+    per_page_etags = {
+        "index.md": '"hydrated-index"',
+        "journal/2026-01-01.md": '"hydrated-journal-2026-01-01"',
+        "trade-journal-2026-q1.md": '"hydrated-trade-journal-2026-q1"',
+    }
+
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.url.path == "/.fs":
+            return httpx.Response(
+                200, content=__import__("json").dumps(list_payload).encode()
+            )
+        # Per-page GET — match against the path after ``/.fs/``.
+        name = request.url.path[len("/.fs/"):]
+        return httpx.Response(
+            200,
+            text="body",
+            headers={"ETag": per_page_etags[name]},
+        )
+
+    # Hydration on, narrow ``contains`` filter — only the journal
+    # rows should be visited for etag-hydration (the index
+    # row's etag is irrelevant because the filter discards it
+    # before the hydration walker runs).
+    server = _build(handler, hydrate_etags=True)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {"contains": "journal"})
+
+    assert result.is_error is False
+    # Exactly one ``GET /.fs`` (the list call) + two
+    # ``GET /.fs/{name}`` (hydration for the two journal
+    # rows). The index row's hydration is skipped because the
+    # ``contains`` filter discards it before the walker runs.
+    # Filter-then-hydrate ordering is locked here.
+    assert seen == [
+        ("GET", "/.fs"),
+        ("GET", "/.fs/journal/2026-01-01.md"),
+        ("GET", "/.fs/trade-journal-2026-q1.md"),
+    ]
+    assert result.structured_content == {
+        "result": [
+            {
+                "name": "journal/2026-01-01.md",
+                "etag": '"hydrated-journal-2026-01-01"',
+                "size_bytes": 2,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+            {
+                "name": "trade-journal-2026-q1.md",
+                "etag": '"hydrated-trade-journal-2026-q1"',
+                "size_bytes": 3,
+                "last_modified_ms": None,
+                "created_ms": None,
+            },
+        ]
+    }
+
+
 @pytest.mark.asyncio
 async def test_list_pages_5xx_returns_tool_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:

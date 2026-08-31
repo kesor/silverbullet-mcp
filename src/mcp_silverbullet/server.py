@@ -2468,9 +2468,17 @@ def register_tools(
         title="List pages",
         description=(
             "List pages in the SilverBullet space, optionally filtered "
-            "by prefix. v1 does the filter client-side (server-side "
-            "Space Lua search is out of scope per T4 of the prior map). "
-            "v1.2 T28 widened the return shape from "
+            "by `prefix` (substring match of the path's `startswith`) "
+            "and/or `contains` (substring anywhere in the page name). "
+            "Both filters compose as AND when both are set; either "
+            "alone is a single-criterion narrowing; both empty "
+            "returns the full listing (v1 default). v1's `prefix` "
+            "filter stays at `startswith` semantics — the substring "
+            "narrowing lives at `contains` (T37) so the v1 / v1.1 / "
+            "v1.2 / v1.3 wire surface is unchanged for callers that "
+            "already use `prefix`. v1 does the filter client-side "
+            "(server-side Space Lua search is out of scope per T4 of "
+            "the prior map). v1.2 T28 widened the return shape from "
             "`[{name, etag}]` (v1.1 minimal subset) to the same "
             "envelope family the read and write tools use: each row "
             "is `{name, etag, size_bytes, last_modified_ms, "
@@ -2492,11 +2500,16 @@ def register_tools(
             "or timing out leaves that row's `etag=None` rather "
             "than failing the whole list call — an agent that "
             "needs the etag for a specific page can always "
-            "`read_page` it directly."
+            "`read_page` it directly. Note: this filter only ever "
+            "matches against page *names*; body-content search "
+            "lives behind the journal gate (T38 — see the README's "
+            "Discovery tools section, `MCP_SILVERBULLET_JOURNAL_TOOLS=1` "
+            "+ `MCP_SILVERBULLET_SPACE_PATH`)."
         ),
     )
     async def list_pages(
         prefix: str = "",
+        contains: str = "",
     ) -> list[dict[str, object]]:
         async with _translate_sb_errors(""):
             metas = await sb_client.list_pages()
@@ -2511,8 +2524,23 @@ def register_tools(
         # test locks this down so a future refactor that
         # re-orders for any reason surfaces as wasted SB load
         # rather than a silent efficiency regression.
+        #
+        # T37 widens the filter surface: `prefix` keeps its
+        # ``startswith`` semantics (unchanged for v1 / v1.1 /
+        # v1.2 / v1.3 callers) and a sibling ``contains``
+        # parameter does substring matching against the page
+        # name. The two compose as AND — a caller that passes
+        # both gets the tighter set, never the wider one.
+        # Either filter set to "" is a no-op for that criterion;
+        # both empty returns the full listing (v1 default).
+        # Both filters run before hydration, so a narrow
+        # ``contains`` reduces the per-page round-trip count the
+        # same way ``prefix`` does (no wasted GETs for rows the
+        # filter is about to discard).
         if prefix:
             metas = [m for m in metas if m.name.startswith(prefix)]
+        if contains:
+            metas = [m for m in metas if contains in m.name]
         if hydrate_etags:
             metas = await _hydrate_list_etags(sb_client, metas)
         # Project each PageMeta down to the T23 write-shape (which

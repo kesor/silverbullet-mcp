@@ -59,13 +59,22 @@ the new etag on every successful write — read it and feed it back via
   last_modified_ms=None, created_ms=None}` — hard delete; SB's
   DELETE response doesn't echo timestamps / size. Empty `name`
   raises `ToolError("name must not be empty")` upfront (T40).
-- `list_pages(prefix?)` → `[{name, etag, size_bytes, last_modified_ms,
-  created_ms}][]` — sends `X-Sync-Mode: 1` so SB 2.x returns JSON
-  from `GET /.fs` instead of 307-redirecting to the SPA. The etag
-  field is `null` on this SB build unless you opt in to per-page
+- `list_pages(prefix?, contains?)` → `[{name, etag, size_bytes,
+  last_modified_ms, created_ms}][]` — sends `X-Sync-Mode: 1` so SB
+  2.x returns JSON from `GET /.fs` instead of 307-redirecting to
+  the SPA. `prefix=` does `startswith` matching (unchanged from v1);
+  `contains=` (T37) does substring matching against the page name.
+  Both filters compose as AND when both are set; either empty is a
+  no-op for that criterion; both empty returns the full listing.
+  Both filters run client-side *before* per-page hydration, so a
+  narrow filter reduces the N+1 round-trip count. The etag field
+  is `null` on this SB build unless you opt in to per-page
   hydration with `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS=1`
   (one GET per row; partial failures leave the affected row's etag
-  as `null` rather than failing the whole call).
+  as `null` rather than failing the whole call). The filter only
+  ever matches against page *names*; body-content search lives
+  behind the journal gate (see "Discovery tools (journal-gated)"
+  below).
 - `diff_pages(name, other_name?, other_body?)` → `{diff, name, other?}`
   — line-based unified diff between two pages (or a page and a
   literal string). Pass exactly one of `other_name` / `other_body`;
