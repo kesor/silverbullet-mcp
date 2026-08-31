@@ -87,6 +87,7 @@ wording.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx2 as httpx
 import pytest
@@ -136,6 +137,27 @@ def _text(result) -> str:
     return "".join(
         block.text for block in result.content if getattr(block, "type", None) == "text"
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_contention_log():
+    """Clear the T42 contention counter between tests.
+
+    T42's ``_contention_log`` is a process-global dict (by design —
+    a single-user bridge has one in-memory contention view). A
+    test that asserts the bare 412 wording ("precondition failed;
+    check if_match/if_none_match" with no marker) would otherwise
+    start running after enough prior tests have tripped the
+    threshold on the same ``name``, and the wire message would
+    carry ``[concurrent_edit_hint: true]`` regardless of what
+    *this* test did. The fixture clears the dict before every
+    test so each one starts with a fresh sliding window.
+    """
+    from mcp_silverbullet.server import _contention_log
+
+    _contention_log.clear()
+    yield
+    _contention_log.clear()
 
 
 # --- read_page ---------------------------------------------------------
@@ -7954,3 +7976,177 @@ async def test_t41_instructions_advertise_md_suffix_convention() -> None:
         "existing extension pass through unchanged (the Foo.txt "
         "example)"
     )
+
+
+# --- T42: 412 contention hint ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_t42_three_412s_no_hint_fourth_carries_concurrent_edit_hint() -> None:
+    """T42: after N=3 412s on the same page, the 4th 412
+    ``ToolError`` carries ``[concurrent_edit_hint: true]``.
+
+    The first three 412s use the bare ``precondition failed``
+    wording (so an agent that pattern-matches on the standard
+    wording still matches). The fourth appends the marker so
+    an agent that knows the new marker can extract it and back
+    off. Threshold matches :data:`_CONTENTION_THRESHOLD` (3).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        for i in range(3):
+            result = await client.call_tool(
+                "write_page",
+                {"name": "W36.md", "content": "x", "if_match": "*"},
+            )
+            assert result.is_error is True
+            assert _text(result) == (
+                "Error executing tool write_page: precondition "
+                "failed; check if_match/if_none_match"
+            ), f"412 #{i + 1} should not carry the hint"
+
+        # Fourth 412 trips the threshold.
+        result = await client.call_tool(
+            "write_page",
+            {"name": "W36.md", "content": "x", "if_match": "*"},
+        )
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool write_page: precondition failed; "
+        "check if_match/if_none_match [concurrent_edit_hint: true]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t42_counter_is_per_page_not_global() -> None:
+    """T42: 1 412 on page A + 1 412 on page B; neither carries
+    the hint.
+
+    The contention counter is keyed on ``name`` (one deque per
+    distinct page). A single 412 on each page leaves both deques
+    at length 1, well below the threshold of 3, so neither 412
+    gets the marker. This pins the per-page isolation — a global
+    counter (the wrong shape) would have tripped the hint here.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        for name in ("A.md", "B.md"):
+            result = await client.call_tool(
+                "write_page",
+                {"name": name, "content": "x", "if_match": "*"},
+            )
+            assert result.is_error is True
+            assert _text(result) == (
+                f"Error executing tool write_page: precondition "
+                f"failed; check if_match/if_none_match"
+            ), f"single 412 on {name} should not carry the hint"
+
+
+@pytest.mark.asyncio
+async def test_t42_sliding_window_evicts_old_timestamps(monkeypatch) -> None:
+    """T42: after 3 412s within the window, a 60s+ jump clears
+    the deque and the next 412 carries no hint.
+
+    Uses ``monkeypatch`` on ``time.monotonic`` to advance the
+    clock past :data:`_CONTENTION_WINDOW_SECONDS` without
+    sleeping. The deque is bounded to ``_CONTENTION_THRESHOLD``
+    entries; advancing the clock past the window evicts all
+    three, leaving the deque empty, so the next 412 pushes a
+    single entry (length 1, below threshold).
+    """
+    real_monotonic = time.monotonic
+    fake_now = [1000.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    monkeypatch.setattr("mcp_silverbullet.server.time.monotonic", fake_monotonic)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        # Three 412s on the same page within the window.
+        for _ in range(3):
+            result = await client.call_tool(
+                "write_page",
+                {"name": "W36.md", "content": "x", "if_match": "*"},
+            )
+            assert result.is_error is True
+            assert "concurrent_edit_hint" not in _text(result)
+
+        # Jump past the window — every prior timestamp evicts.
+        fake_now[0] += 61.0
+
+        result = await client.call_tool(
+            "write_page",
+            {"name": "W36.md", "content": "x", "if_match": "*"},
+        )
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool write_page: precondition failed; "
+        "check if_match/if_none_match"
+    )
+    assert "concurrent_edit_hint" not in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t42_successful_write_after_412s_carries_no_hint() -> None:
+    """T42: the hint is never raised on the success path.
+
+    Even after three 412s on the same page (which would normally
+    trip the hint on the *next* 412), a successful write returns
+    the T23 ack envelope without the marker. The hint is purely
+    an error-path signal — it never appears on 200 responses.
+    This guards against an accidental future change that threads
+    the hint into both paths.
+    """
+    from mcp_silverbullet.server import _CONTENTION_THRESHOLD
+
+    put_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal put_count
+        if request.method == "PUT":
+            put_count += 1
+            if put_count <= _CONTENTION_THRESHOLD:
+                return httpx.Response(412, text="precondition failed")
+            return httpx.Response(
+                200,
+                headers={"ETag": '"v1"', "X-Content-Length": "1"},
+            )
+        # GET — read_page's first call (or the read-modify-write
+        # preamble). The success-path branch on the final 412'd
+        # write still does a re-read for etag verification.
+        return httpx.Response(
+            200,
+            text="x",
+            headers={"ETag": '"v1"', "X-Content-Length": "1"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        for _ in range(_CONTENTION_THRESHOLD):
+            result = await client.call_tool(
+                "write_page",
+                {"name": "W36.md", "content": "y", "if_match": "*"},
+            )
+            assert result.is_error is True
+            assert "concurrent_edit_hint" not in _text(result)
+
+        # Fourth call succeeds.
+        result = await client.call_tool(
+            "write_page",
+            {"name": "W36.md", "content": "y", "if_match": "*"},
+        )
+    assert result.is_error is False
+    # The success envelope is the T23 ack; the hint must not
+    # surface anywhere on it.
+    assert "concurrent_edit_hint" not in _text(result)

@@ -92,6 +92,8 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import time
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -143,6 +145,88 @@ _DEFAULT_RESOURCE_URL = "http://127.0.0.1:8000/mcp"
 _BODY_LIMIT_MIB = 4
 
 
+# T42 contention-hint knobs. After ``_CONTENTION_THRESHOLD`` 412s on
+# the same page within ``_CONTENTION_WINDOW_SECONDS``, the next 412
+# ``ToolError`` carries a ``[concurrent_edit_hint: true]`` marker so
+# an agent stuck in a contention loop (the bug reporter's W36
+# pattern — SB UI racing a second editor every few minutes) gets a
+# clear signal to back off rather than pattern-matching
+# ``precondition failed`` strings. Constants are at module scope so
+# tuning is a one-line change, not a ticket.
+#
+# N=3 / M=60s is a starting point; whether the live contention
+# pattern matches is empirical (see T42's resolution for the
+# follow-up note). The values are documented in ``docs/design.md``
+# § Tools § Status-code mapping 412 row.
+_CONTENTION_WINDOW_SECONDS = 60
+_CONTENTION_THRESHOLD = 3
+
+# Per-page ring buffer of 412 timestamps. ``_contention_hint``
+# pushes the current timestamp, evicts entries older than the
+# window, and returns whether the buffer crossed the threshold. A
+# bounded per-name memory footprint (one ``deque`` per distinct
+# ``name``, max length = ``_CONTENTION_THRESHOLD``) — the deque
+# never grows past the threshold because every push that's about
+# to make it grow also evicts the oldest entry first. Keys are the
+# ``name`` parameter threaded into :func:`_translate_sb_errors`;
+# an empty ``name`` (e.g. ``list_pages``) is the no-op path so the
+# per-page counter doesn't drift on the list call. The bridge is
+# single-process / single-user, so no cross-replica or persistence
+# concerns apply.
+_contention_log: dict[str, deque[float]] = {}
+
+
+def _contention_hint(name: str) -> bool:
+    """Return whether ``name`` is in a 412-contention window.
+
+    T42: pure side-effect-bearing helper called from
+    :func:`_translate_sb_errors`'s ``PreconditionFailed`` clause.
+    Pushes the current ``time.monotonic()`` timestamp onto
+    ``name``'s deque, evicts entries older than
+    :data:`_CONTENTION_WINDOW_SECONDS`, and returns ``True`` once
+    the deque length has crossed :data:`_CONTENTION_THRESHOLD`.
+
+    Why a wrapper rather than checking the deque length inline at
+    the 412 clause: the helper is the single place that knows the
+    threshold and the window, and a future change to either (e.g.
+    tuning N down to 2, or widening the window to 5 minutes) is a
+    one-line edit here rather than chasing the constant through
+    every tool handler.
+
+    Why ``time.monotonic()`` rather than ``time.time()``: the
+    helper is wall-clock-agnostic on purpose — system clock
+    changes (NTP corrections, DST jumps, container time-skew)
+    can't artificially trip the hint. The downside (no
+    human-readable timestamps in logs) doesn't apply because the
+    helper produces no log output.
+
+    Empty ``name`` is a no-op that returns ``False``: the helper
+    still has to be called from :func:`_translate_sb_errors` for
+    the non-page tools (``list_pages``), but the per-page counter
+    shouldn't drift on those calls. The caller-side guard
+    (``if name``) keeps the dict from accumulating empty-string
+    keys.
+    """
+    if not name:
+        return False
+    log = _contention_log.setdefault(name, deque(maxlen=_CONTENTION_THRESHOLD))
+    now = time.monotonic()
+    # Evict entries older than the sliding window. The deque is
+    # bounded to ``_CONTENTION_THRESHOLD`` entries, so this loop
+    # runs at most that many times — no unbounded scan.
+    cutoff = now - _CONTENTION_WINDOW_SECONDS
+    while log and log[0] < cutoff:
+        log.popleft()
+    # Trip-on-next semantics: capture the length *before* this push.
+    # After N=3 412s land within the window, the deque is at the
+    # threshold, and the *next* push (the 4th 412) is the one that
+    # carries the hint. ``len(log) >= _CONTENTION_THRESHOLD`` means
+    # "this name already burned through the threshold; back off."
+    already_at_threshold = len(log) >= _CONTENTION_THRESHOLD
+    log.append(now)
+    return already_at_threshold
+
+
 @contextlib.asynccontextmanager
 async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     """Wrap a single ``sb_client`` call, mapping its exceptions to ``ToolError``.
@@ -191,7 +275,23 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     except PageNotFound as exc:
         raise ToolError(f"page not found: {name}") from exc
     except PreconditionFailed as exc:
-        raise ToolError("precondition failed; check if_match/if_none_match") from exc
+        # T42: surface the contention hint when this page has hit
+        # 412 N times within the sliding window. The hint is
+        # appended to the standard 412 ``ToolError`` message as a
+        # machine-parseable suffix (`` [concurrent_edit_hint: true]``)
+        # rather than as a structured envelope field, because the
+        # MCP SDK's ``ToolError`` is rendered to the wire as plain
+        # ``TextContent(text=str(exc))`` (``mcp/server/mcpserver/
+        # server.py:_handle_call_tool``) — no native envelope
+        # field exists. An agent that pattern-matches on the
+        # standard ``precondition failed`` wording still matches;
+        # an agent that knows the new marker can extract it. The
+        # marker only appears when the threshold trips, so a
+        # one-off 412 (the common case) is unchanged.
+        msg = "precondition failed; check if_match/if_none_match"
+        if _contention_hint(name):
+            msg += " [concurrent_edit_hint: true]"
+        raise ToolError(msg) from exc
     except BodyTooLarge as exc:
         raise ToolError(f"body too large: limit is {_BODY_LIMIT_MIB} MiB") from exc
     except ServerError as exc:
