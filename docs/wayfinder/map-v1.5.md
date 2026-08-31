@@ -142,11 +142,10 @@ all unblocked, all on the frontier. None claimed this
 session — the user asked for a chart-only pass, not a
 resolution.
 
-**Status as of 2026-08-31**: T39 + T40 + T44
-shipped (commits `39f7c` and `50f03`; T44 ships in
-this session). Remaining on the frontier: T41 (doc
-clarifications — unblocked since T39 shipped), T42
-(412 contention hint), T43 (CF 5xx `cf_hint`
+**Status as of 2026-08-31**: T39 + T40 + T41 + T44
+shipped (commits `39f7c` and `50f03`; T41 + T44
+ship in this session). Remaining on the frontier:
+T42 (412 contention hint), T43 (CF 5xx `cf_hint`
 envelope — charted this session).
 
 ## Notes
@@ -237,6 +236,7 @@ ticket's resolution below -->
 - [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them).
 - [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
 - [T40 (2026-08-31)](#t40-lift-upfront-empty-input-validation-across-the-remaining-write-tools-b9): two shared helpers in `server.py` — `_validate_nonempty_name(name)` (`ToolError("name must not be empty")`) + `_validate_nonempty_value(value, *, label)` (`ToolError("<label> must not be empty")`); threaded into 7 call sites across 4 previously-unguarded tools (`write_page` name + content, `delete_page`, `move_page` source + destination, `patch_page_lines`) + 5 already-guarded tools lifted into the helper for wording consistency (`create_page`, `append_to_page`, `prepend_to_page`, `patch_page_replace`'s `find`, `check_task`'s `ref`); guards fire *before* T39's name normalization so empty `name` raises loudly rather than normalizing to `".md"` silently; **drive-by deviation from the ticket's charter**: `patch_page_replace`'s `new_string=""` is the documented "delete every match" path, NOT a caller bug, so it's deliberately NOT guarded (a dedicated test pins the surface against accidental future guarding); 17 new Layer-1 cases in `tests/test_tools_in_memory.py`; 245 in-memory + 496 total tests pass.
+- [T41 (2026-08-31)](#t41-doc-clarifications-indexmd-source-vs-render-move_page-no-op-md-suffix-convention-b5-b8): three docstring additions, no new code beyond the description strings — `read_page` gains a sentence noting Space Lua template pages return raw source (transport, not renderer); `move_page` gains a sentence noting the `name == new_name` no-op never raises 412 even with stale `if_match`; `MCPServer.instructions` gains a paragraph noting the T39 `.md`-suffix convention; 3 new Layer-1 cases in `tests/test_tools_in_memory.py` lock the surface; `docs/design.md` § Tools table rows for `read_page` and `move_page` mention the T41 sentence in the Side-effects column + a sibling paragraph in the v1.5 surface description; `CHANGELOG.md` v1.5 `### Added` gains a T41 entry; no behavior change; no wire-shape change; no new dependencies; 500 tests pass.
 - [T44 (2026-08-31)](#t44-fix-t31bs-false-positive-concurrent-edit-detected-b12): single code change in `synthesize_etag` — the synthesized form went from `"{last_modified_ms}-{size_bytes}"` to `"{size_bytes}"` alone. Root cause: the bridge stamps `X-Last-Modified` with `now_ms` on every PUT (`_WRITE_HEADERS`), so the pre-T44 dashed form drifted on every write and T31b's post-write verification raised `ToolError("concurrent edit detected: …")` on every successful write where the write actually succeeded. Size alone is the correct primitive (same body → same size → same etag; different body → different size → different etag). **Wire-shape breaking change** for v1.3 / v1.4 callers holding a synthesized etag across calls (CHANGELOG migration note: re-read once after T44 lands to pick up the new canonical form); real `ETag` headers (the v1.3 contract path) are unaffected. Trade-offs: dropped the `"{ms}"` fallback (a proxy that strips `X-Content-Length` now returns `None` rather than a weaker primitive that tracked the *when* drift); lost pre-write concurrent-edit detection on SBs that strip `ETag` (post-write verification still catches the common case). One new Layer-1 test reproduces the user's defect on a realistic mock; six existing tests in `test_sb_client.py` updated for the new shape; `test_e2e_live_sb.py` updated to construct the new form and assert the new wire shape; `docs/design.md` § SilverBullet client contract + § Tools § Status-code mapping 412 row + `README.md` concurrency section + `CHANGELOG.md` v1.5 `### Changed` entry document the migration; 497 total tests pass.
 
 ## Not yet specified
@@ -783,8 +783,8 @@ shipped); T42 unchanged (independent).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed + shipped same session, 2026-08-31)
+> **Status**: 🟢 closed — shipped 2026-08-31 (three docstring additions, three Layer-1 tests)
 > **Question**: How do three small documentation
 > gaps — `read_page` returning template source
 > instead of rendered output (b5), `move_page`'s
@@ -875,6 +875,97 @@ shipped); T42 unchanged (independent).
 > separately from the source-level descriptions
 > (the README's table already cross-links to the
 > source; T41 doesn't add a second copy).
+
+**Resolution** (positive, 2026-08-31): shipped in
+`src/mcp_silverbullet/server.py` and `tests/test_tools_in_memory.py`.
+Three docstring additions, three Layer-1 tests, no
+behavior change, no wire-shape change, no new
+dependencies — exactly the charter. Implementation:
+
+- `read_page`'s tool description gains one
+  sentence: "Pages containing Space Lua template
+  syntax (e.g. `${template.each(...)}`) are
+  returned as raw markdown source, never as
+  rendered output — the bridge is a transport, not
+  a renderer (T41)." Inserted between the
+  `last_modified_ms` are `None` clause and the
+  404-equivalent `ToolError` clause so the
+  template-vs-render note sits with the
+  other body-content notes.
+- `move_page`'s tool description gains one
+  sentence: "the no-op never raises 412, even when
+  the caller passes `if_match=<stale_etag>` and
+  the page has drifted — no write happens so no
+  precondition check fires (T41)." Inserted
+  inside the existing same-name short-circuit
+  clause; the existing "callers that need to
+  verify the etag should chain
+  `write_page(...)` themselves" sentence stays.
+  Before T41, the description said `if_match`
+  wasn't honored on a same-name no-op but
+  didn't explicitly say it would never raise 412
+  — the silent-success case is now loud.
+- `MCPServer.instructions` gains one paragraph
+  (call it a "sentence" per the ticket — it's
+  one logical statement spanning five lines in
+  source): "Page names passed to any
+  `name`-taking tool (`read_page` / `page_exists`
+  / `write_page` / `create_page` / `delete_page` /
+  `append_to_page` / `prepend_to_page` /
+  `patch_page_lines` / `patch_page_replace` /
+  `move_page` / `diff_pages` / `check_task` /
+  `list_tasks`) without a file extension are
+  automatically suffixed with `.md` (T39); names
+  with an existing extension (`Foo.txt`) pass
+  through unchanged. The bridge surfaces a
+  `name_resolution` field on success envelopes
+  when the canonical form differs from the
+  caller's input, so an agent learns the
+  convention for its next call." Inserted at the
+  end of the instructions block, after the
+  `check_task` state enumeration. The existing
+  v1.3 tool-list / journal-tools / read-modify-
+  write / dry-run / list_pages-hydrate /
+  diff_pages / list_tasks / check_task clauses
+  stay.
+
+Three new Layer-1 tests in
+`tests/test_tools_in_memory.py` lock the surface:
+`test_t41_read_page_description_notes_template_source_vs_render`,
+`test_t41_move_page_description_notes_noop_never_raises_412`,
+and `test_t41_instructions_advertise_md_suffix_convention`.
+Each opens an in-memory server via the existing
+`_build` helper, calls `list_tools` (for the tool
+descriptions) or reads `server.instructions` directly
+(for the system-prompt text), and asserts the T41
+sentence is present. Existing v1.3 instructions /
+list_tools pin tests
+(`test_v1_3_instructions_advertise_fourteen_always_on_tools`,
+`test_v1_3_instructions_advertise_six_journal_tools`,
+`test_v1_3_list_tools_returns_fourteen_always_on_tools`)
+all continue to pass — the T41 additions don't drop
+or rename any tool.
+
+`docs/design.md` § Tools table rows for `read_page`
+and `move_page` updated to mention the T41 sentence
+in the Side-effects column. The existing v1.5
+"name normalization (T39)" paragraph gains a sibling
+"v1.5 added doc clarifications (T41)" paragraph
+that covers all three additions in one place so an
+operator reading design.md sees the v1.5 surface
+described coherently. `CHANGELOG.md` v1.5
+`### Added` gains a T41 entry with the three
+additions summarized; the v1.5 status line is
+updated to reflect T39 + T40 + T41 + T44 shipped
+(T42 / T43 remain on the frontier).
+
+No new Python deps; no test count drop; 500 tests
+pass (497 pre-T41 + 3 new T41 cases). No
+behaviour change; no wire-shape change; the bridge
+is byte-for-byte the same on the success path and
+on the error path. The T41 changes are local to
+the tool handler docstrings and the `instructions`
+string — nothing else.
 
 ### T42. 412 contention hint: surface "you are in a contention window" to the agent (b10)
 
