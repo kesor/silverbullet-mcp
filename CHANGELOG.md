@@ -85,23 +85,27 @@ per-user SB credentials to thread off of.
 ## [Unreleased] — v1.5 (agent-experience hardening)
 
 Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
-**Status: T39 + T40 + T44 shipped 2026-08-31; v1.5
-destination partial** — the `.md`-suffix split closes via
-T39's name-normalization helper (threaded into every
-`name`-taking tool), with a `name_resolution` envelope
-field that teaches the agent the convention for its next
-call. T40 lifts the upfront empty-input guard (already
-shipped on `create_page` / `append_to_page` /
-`prepend_to_page` / `patch_page_replace` / `check_task`)
-into two shared helpers and threads them into the four
-tools that didn't have it yet (`write_page` /
-`delete_page` / `move_page`'s source and destination /
-`patch_page_lines`). T44 fixes T31b's false-positive
-"concurrent edit detected" on every successful write by
-dropping the mtime component from the synthesized etag
-(see Changed below for the wire-shape migration note).
-T41 / T42 / T43 remain on the frontier (same charter: doc
-clarifications, 412 contention hint, CF 5xx wrapper JSON
+**Status: T39 + T40 + T41 + T44 shipped 2026-08-31;
+v1.5 destination partial** — the `.md`-suffix split
+closes via T39's name-normalization helper (threaded
+into every `name`-taking tool), with a
+`name_resolution` envelope field that teaches the
+agent the convention for its next call. T40 lifts
+the upfront empty-input guard (already shipped on
+`create_page` / `append_to_page` /
+`prepend_to_page` / `patch_page_replace` /
+`check_task`) into two shared helpers and threads
+them into the four tools that didn't have it yet
+(`write_page` / `delete_page` / `move_page`'s source
+and destination / `patch_page_lines`). T41 lands
+three small doc clarifications on the tool surface
+and the bridge's `MCPServer.instructions` block (see
+Added below). T44 fixes T31b's false-positive
+"concurrent edit detected" on every successful write
+by dropping the mtime component from the synthesized
+etag (see Changed below for the wire-shape migration
+note). T42 / T43 remain on the frontier (same
+charter: 412 contention hint, CF 5xx wrapper JSON
 parsing respectively).
 
 T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
@@ -226,6 +230,64 @@ agent learns the convention rather than continuing to retype.
   `server.py` and `docs/design.md` § Tools
   table rows updated to mention the new
   guards.
+
+- **T41 doc clarifications on the tool
+  surface** — three small, sharp doc
+  additions, no new code beyond the
+  description strings:
+
+  - `read_page`'s description gains a
+    sentence noting that pages containing
+    Space Lua template syntax (e.g.
+    `${template.each(...)}`) are returned
+    as raw markdown source, never as
+    rendered output — the bridge is a
+    transport, not a renderer
+    (`b5`). Before: an agent reading the
+    page for the first time saw
+    "broken" template syntax and
+    sometimes reported it as a bug.
+    After: the description tells the
+    agent what to expect.
+  - `move_page`'s description gains a
+    sentence noting that the `name ==
+    new_name` no-op never raises 412 even
+    when the caller passes
+    `if_match=<stale_etag>` and the page
+    has drifted (`b8`). Before: the
+    description said the no-op ignores
+    `if_match` but didn't say it never
+    raises 412 — a caller passing
+    `if_match=<expected_etag>` on a
+    no-op might wait for a 412 that will
+    never come. After: the description
+    makes the silent no-op contract
+    explicit.
+  - `MCPServer.instructions` gains a
+    single sentence noting the `.md`-
+    suffix convention lifted by T39:
+    "Page names passed to any `name`-
+    taking tool without a file extension
+    are automatically suffixed with
+    `.md` (T39); names with an existing
+    extension (`Foo.txt`) pass through
+    unchanged." Before: an agent that
+    connected for the first time didn't
+    know about the convention until its
+    first successful response. After:
+    the convention is in the
+    system-prompt-ish text the agent
+    reads on connect.
+
+  Three new Layer-1 cases in
+  `tests/test_tools_in_memory.py` lock
+  the T41 surface (one per addition).
+  `docs/design.md` § Tools table rows
+  for `read_page` and `move_page`
+  updated to mention the T41 sentence
+  in the Side-effects column. No
+  behavior change; no wire-shape change;
+  no new dependencies.
 
 ### Changed
 

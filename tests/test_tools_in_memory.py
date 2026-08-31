@@ -7854,3 +7854,103 @@ async def test_v1_3_list_tools_returns_fourteen_always_on_tools() -> None:
         assert expected.issubset(names), (
             f"v1.3 missing tools: {expected - names}"
         )
+
+
+# --- T41 doc clarifications -------------------------------------------
+#
+# T41 lifts three small doc gaps onto the tool surface so an agent
+# caller doesn't trip on them in the same session: `read_page`
+# returning Space Lua template source (raw markdown, not rendered
+# output), `move_page`'s same-name no-op never raising 412 even when
+# the caller passes `if_match`, and the `MCPServer.instructions`
+# block noting the `.md`-suffix convention lifted by T39. Each is a
+# one-sentence addition; the test pins the sentence so a future
+# drift surfaces as a test failure rather than as an agent
+# confusion in the wild.
+
+
+@pytest.mark.asyncio
+async def test_t41_read_page_description_notes_template_source_vs_render() -> None:
+    """T41: ``read_page`` description says template pages are
+    raw markdown, never rendered output.
+
+    ``b5`` was the agent reporter's W36 page reading "${template
+    .each(...)}" literally and thinking the bridge returned broken
+    syntax. The bridge is a transport; it returns whatever SB
+    stored. The T41 sentence sits in the description so an agent
+    reading the description sees it before the call.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        by_name = {t.name: t for t in tools.tools}
+        description = by_name["read_page"].description
+    assert "raw markdown source" in description, (
+        "T41: read_page description should note raw source vs "
+        "rendered output for Space Lua template pages"
+    )
+    assert "transport, not a renderer" in description, (
+        "T41: read_page description should clarify the bridge is "
+        "a transport, not a renderer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t41_move_page_description_notes_noop_never_raises_412() -> None:
+    """T41: ``move_page`` description says the same-name no-op
+    never raises 412 even when ``if_match`` is passed.
+
+    ``b8`` was the agent reporter's expectation that
+    ``move_page("Foo", "Foo", if_match=<stale_etag>)`` would
+    surface as a 412 if the page had drifted. It doesn't — no
+    write happens so no precondition check fires. The T41
+    sentence makes the silent no-op contract explicit so an agent
+    doesn't wait for a 412 that will never come.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        by_name = {t.name: t for t in tools.tools}
+        description = by_name["move_page"].description
+    assert "no-op never raises 412" in description, (
+        "T41: move_page description should say the same-name "
+        "no-op never raises 412"
+    )
+    assert "if_match=<stale_etag>" in description, (
+        "T41: move_page description should reference the "
+        "stale-etag + drifted-page scenario by name"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t41_instructions_advertise_md_suffix_convention() -> None:
+    """T41: ``instructions`` block notes the `.md`-suffix
+    convention lifted by T39.
+
+    Now that T39 ships (auto-append `.md` to bare names), the
+    bridge's ``MCPServer.instructions`` block carries a single
+    sentence so an agent that connects for the first time sees
+    the convention in the system-prompt-ish text rather than
+    inferring it from the first successful response.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    text = server.instructions
+    assert text is not None
+    assert "automatically suffixed with `.md`" in text, (
+        "T41: instructions block should note the T39 .md-suffix "
+        "convention"
+    )
+    assert "Foo.txt" in text, (
+        "T41: instructions block should show that names with an "
+        "existing extension pass through unchanged (the Foo.txt "
+        "example)"
+    )
