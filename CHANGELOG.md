@@ -85,13 +85,14 @@ per-user SB credentials to thread off of.
 ## [Unreleased] — v1.5 (agent-experience hardening)
 
 Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
-**Status: T39 + T40 + T41 + T44 shipped 2026-08-31;
-v1.5 destination partial** — the `.md`-suffix split
-closes via T39's name-normalization helper (threaded
-into every `name`-taking tool), with a
-`name_resolution` envelope field that teaches the
-agent the convention for its next call. T40 lifts
-the upfront empty-input guard (already shipped on
+**Status: T39 + T40 + T41 + T42 + T44 shipped
+2026-08-31; v1.5 destination partial** — the
+`.md`-suffix split closes via T39's
+name-normalization helper (threaded into every
+`name`-taking tool), with a `name_resolution`
+envelope field that teaches the agent the
+convention for its next call. T40 lifts the
+upfront empty-input guard (already shipped on
 `create_page` / `append_to_page` /
 `prepend_to_page` / `patch_page_replace` /
 `check_task`) into two shared helpers and threads
@@ -100,13 +101,15 @@ them into the four tools that didn't have it yet
 and destination / `patch_page_lines`). T41 lands
 three small doc clarifications on the tool surface
 and the bridge's `MCPServer.instructions` block (see
-Added below). T44 fixes T31b's false-positive
-"concurrent edit detected" on every successful write
-by dropping the mtime component from the synthesized
-etag (see Changed below for the wire-shape migration
-note). T42 / T43 remain on the frontier (same
-charter: 412 contention hint, CF 5xx wrapper JSON
-parsing respectively).
+Added below). T42 surfaces a contention-window
+signal on the 412 error envelope after N=3 412s on
+the same page within M=60s. T44 fixes T31b's
+false-positive "concurrent edit detected" on every
+successful write by dropping the mtime component
+from the synthesized etag (see Changed below for
+the wire-shape migration note). T43 remains on the
+frontier (same charter: CF 5xx wrapper JSON
+parsing for a `cf_hint` envelope field).
 
 T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
 that explicitly pass `name="Foo"` (bare) expecting a 500-shaped
@@ -288,6 +291,71 @@ agent learns the convention rather than continuing to retype.
   in the Side-effects column. No
   behavior change; no wire-shape change;
   no new dependencies.
+
+- **T42 412 contention hint** — when
+  the bridge raises the unified 412
+  `ToolError("precondition failed;
+  check if_match/if_none_match")` on
+  the same page N=3 times within
+  M=60 seconds, the *next* 412 on
+  that page appends
+  ` [concurrent_edit_hint: true]` to
+  the message so an agent stuck in a
+  contention loop (the bug reporter's
+  W36 pattern: SB UI racing a second
+  editor every few minutes) gets a
+  clear signal to back off rather than
+  pattern-matching bare
+  `precondition failed` strings. New
+  module-scope helper
+  `_contention_hint(name)` in
+  `src/mcp_silverbullet/server.py`
+  (per-name sliding-window counter
+  keyed on `(name,)`, bounded at
+  `_CONTENTION_THRESHOLD` entries per
+  deque; trip-on-next semantics so the
+  4th 412 is the first one carrying the
+  marker). Threaded into the
+  `PreconditionFailed` clause of
+  `_translate_sb_errors`. The hint is
+  **advisory, never authoritative** —
+  the bridge still raises the standard
+  412 `ToolError` regardless; agents
+  that don't check for the marker see
+  no change. The marker only appears
+  on the error path; a successful
+  write after three 412s returns the
+  T23 ack envelope with no hint field.
+  Constants at module scope
+  (`_CONTENTION_WINDOW_SECONDS=60`,
+  `_CONTENTION_THRESHOLD=3`) so
+  future tuning is a one-line change,
+  not a ticket. Four new Layer-1 cases
+  in
+  `tests/test_tools_in_memory.py`
+  lock the surface: 4 consecutive
+  412s on the same page (the 4th
+  carries the marker; the first 3
+  don't); 1 412 each on two different
+  pages (neither carries the marker
+  — the counter is per-page); a 60s
+  window jump after 3 412s evicts the
+  old timestamps (the next 412 carries
+  no marker); a successful write
+  after three 412s returns the T23
+  ack envelope with no marker on the
+  success path. An autouse fixture in
+  the test file resets the per-process
+  contention counter between tests
+  so test isolation is preserved (a
+  process-global state that drifted
+  across tests would otherwise pollute
+  tests asserting the bare 412
+  wording). No new dependencies; no
+  behavior change for the
+  happy-path single-412 case (the
+  hint only fires after the threshold
+  trips).
 
 ### Changed
 

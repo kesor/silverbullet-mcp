@@ -142,11 +142,13 @@ all unblocked, all on the frontier. None claimed this
 session — the user asked for a chart-only pass, not a
 resolution.
 
-**Status as of 2026-08-31**: T39 + T40 + T41 + T44
-shipped (commits `39f7c` and `50f03`; T41 + T44
-ship in this session). Remaining on the frontier:
-T42 (412 contention hint), T43 (CF 5xx `cf_hint`
-envelope — charted this session).
+**Status as of 2026-08-31**: T39 + T40 + T41 + T42 +
+T44 shipped (commits `39f7c` and `50f03`; T41 + T44
+ship in their respective sessions; T42 ships in
+this session — commit pending). Remaining on the
+frontier: T43 (CF 5xx `cf_hint` envelope — charted
+this session, on the v1.5 frontier for a future
+session to claim).
 
 ## Notes
 
@@ -233,11 +235,12 @@ envelope — charted this session).
 <!-- index only — one line per closed ticket, link to the
 ticket's resolution below -->
 
-- [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them).
+- [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them). **As of 2026-08-31**: T39 + T40 + T41 + T42 + T44 are resolved (T42 claimed + shipped this session); T43 is the only remaining frontier ticket.
 - [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
 - [T40 (2026-08-31)](#t40-lift-upfront-empty-input-validation-across-the-remaining-write-tools-b9): two shared helpers in `server.py` — `_validate_nonempty_name(name)` (`ToolError("name must not be empty")`) + `_validate_nonempty_value(value, *, label)` (`ToolError("<label> must not be empty")`); threaded into 7 call sites across 4 previously-unguarded tools (`write_page` name + content, `delete_page`, `move_page` source + destination, `patch_page_lines`) + 5 already-guarded tools lifted into the helper for wording consistency (`create_page`, `append_to_page`, `prepend_to_page`, `patch_page_replace`'s `find`, `check_task`'s `ref`); guards fire *before* T39's name normalization so empty `name` raises loudly rather than normalizing to `".md"` silently; **drive-by deviation from the ticket's charter**: `patch_page_replace`'s `new_string=""` is the documented "delete every match" path, NOT a caller bug, so it's deliberately NOT guarded (a dedicated test pins the surface against accidental future guarding); 17 new Layer-1 cases in `tests/test_tools_in_memory.py`; 245 in-memory + 496 total tests pass.
 - [T41 (2026-08-31)](#t41-doc-clarifications-indexmd-source-vs-render-move_page-no-op-md-suffix-convention-b5-b8): three docstring additions, no new code beyond the description strings — `read_page` gains a sentence noting Space Lua template pages return raw source (transport, not renderer); `move_page` gains a sentence noting the `name == new_name` no-op never raises 412 even with stale `if_match`; `MCPServer.instructions` gains a paragraph noting the T39 `.md`-suffix convention; 3 new Layer-1 cases in `tests/test_tools_in_memory.py` lock the surface; `docs/design.md` § Tools table rows for `read_page` and `move_page` mention the T41 sentence in the Side-effects column + a sibling paragraph in the v1.5 surface description; `CHANGELOG.md` v1.5 `### Added` gains a T41 entry; no behavior change; no wire-shape change; no new dependencies; 500 tests pass.
 - [T44 (2026-08-31)](#t44-fix-t31bs-false-positive-concurrent-edit-detected-b12): single code change in `synthesize_etag` — the synthesized form went from `"{last_modified_ms}-{size_bytes}"` to `"{size_bytes}"` alone. Root cause: the bridge stamps `X-Last-Modified` with `now_ms` on every PUT (`_WRITE_HEADERS`), so the pre-T44 dashed form drifted on every write and T31b's post-write verification raised `ToolError("concurrent edit detected: …")` on every successful write where the write actually succeeded. Size alone is the correct primitive (same body → same size → same etag; different body → different size → different etag). **Wire-shape breaking change** for v1.3 / v1.4 callers holding a synthesized etag across calls (CHANGELOG migration note: re-read once after T44 lands to pick up the new canonical form); real `ETag` headers (the v1.3 contract path) are unaffected. Trade-offs: dropped the `"{ms}"` fallback (a proxy that strips `X-Content-Length` now returns `None` rather than a weaker primitive that tracked the *when* drift); lost pre-write concurrent-edit detection on SBs that strip `ETag` (post-write verification still catches the common case). One new Layer-1 test reproduces the user's defect on a realistic mock; six existing tests in `test_sb_client.py` updated for the new shape; `test_e2e_live_sb.py` updated to construct the new form and assert the new wire shape; `docs/design.md` § SilverBullet client contract + § Tools § Status-code mapping 412 row + `README.md` concurrency section + `CHANGELOG.md` v1.5 `### Changed` entry document the migration; 497 total tests pass.
+- [T42 (2026-08-31)](#t42-412-contention-hint-surface-you-are-in-a-contention-window-to-the-agent-b10): trip-on-next sliding-window counter — `_CONTENTION_THRESHOLD=3` consecutive 412s on the same page within `_CONTENTION_WINDOW_SECONDS=60` trips the hint; the *next* (4th) 412 `ToolError` carries ` [concurrent_edit_hint: true]` as a machine-parseable suffix on the standard `precondition failed; check if_match/if_none_match` wording. **Envelope-shape design call resolved at claim time**: the MCP SDK renders `ToolError` to the wire as plain `TextContent(text=str(exc))` (verified at `mcp/server/mcpserver/server.py:_handle_call_tool`) — no native envelope field exists, so the ticket's anticipated "thin wrapper class" was unnecessary; the hint rides on the existing message-text channel instead. `time.monotonic()` for the wall clock (NTP / DST / container-time-skew can't artificially trip). Per-page isolation (one `deque` per distinct `name`, bounded at `_CONTENTION_THRESHOLD` entries). Autouse fixture `_reset_contention_log` in `tests/test_tools_in_memory.py` clears the process-global counter between tests so pre-existing 412-wording tests don't drift. 4 new Layer-1 cases (4 consecutive 412s on same page; per-page isolation across two pages; sliding-window eviction; success-path non-leak). `docs/design.md` § Tools § Status-code mapping 412 row + `CHANGELOG.md` v1.5 `### Added` document the surface; 504 tests pass.
 
 ## Not yet specified
 
@@ -778,6 +781,9 @@ shipped); T42 unchanged (independent).
 > T41's `.md`-suffix-convention sentence in
 > `MCPServer.instructions` was unblocked by T39
 > (already shipped) and is now ready to claim.
+> T42 + T43 + T44 claimed and resolved in
+> subsequent sessions; T41 + T42 + T44 ship in
+> 2026-08-31 commits, T43 still on the frontier.
 
 ### T41. Doc clarifications: `index.md` source-vs-render, `move_page` no-op, `.md`-suffix convention (b5, b8)
 
@@ -971,8 +977,8 @@ string — nothing else.
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed + resolved 2026-08-31)
+> **Status**: ✅ resolved (commit pending; see resolution below)
 > **Question**: How does the bridge signal to an
 > agent that it's hitting the same page's 412
 > precondition over and over — without changing
@@ -1090,6 +1096,105 @@ string — nothing else.
 > replacing the standard 412 wording with a
 > hint-flavored variant (the hint is additive,
 > not replacing).
+
+**Resolution** (positive, 2026-08-31): shipped in
+`src/mcp_silverbullet/server.py` and
+`tests/test_tools_in_memory.py`. Implementation
+matched the ticket's charter with one design
+deviation and one small adjustment:
+
+- **Envelope-shape design call resolved at claim
+  time**: the MCP SDK renders `ToolError` to the
+  wire as plain `TextContent(text=str(exc))` in
+  `mcp/server/mcpserver/server.py:_handle_call_tool`
+  — no native envelope field. The ticket's
+  anticipated "thin wrapper class" turned out to be
+  unnecessary: instead of subclassing `ToolError`
+  with a custom field, the helper threads the hint
+  into the standard 412 message as a
+  machine-parseable suffix
+  (` [concurrent_edit_hint: true]`). An agent that
+  pattern-matches on the bare `precondition
+  failed` wording still matches; an agent that
+  knows the marker can extract it with a simple
+  substring check. The marker only appears when the
+  threshold trips, so the common-case 412
+  (1-of-3, 2-of-3) is unchanged from the bridge's
+  pre-T42 surface.
+
+- **Trip-on-next semantics**: the helper captures
+  the deque length *before* the current push and
+  returns `True` only if the deque was already at
+  the threshold. After 3 412s land within the
+  window, the deque is at length 3, and the *next*
+  push (the 4th 412) is the one that trips the
+  hint. This matches the ticket's "After N=3
+  consecutive 412s, the bridge adds the field" /
+  test expectation "the 4th carries the hint; the
+  first 3 don't" reading. The deque is bounded at
+  `_CONTENTION_THRESHOLD` entries (one `deque` per
+  distinct `name`, max length 3) so memory stays
+  bounded per-page. `time.monotonic()` is used for
+  the wall clock so NTP corrections / container
+  time-skew can't artificially trip the hint.
+
+- **Test isolation via autouse fixture**: T42's
+  process-global `_contention_log` would otherwise
+  pollute tests asserting the bare 412 wording
+  (e.g. `test_write_page_412_returns_tool_error_...`)
+  when prior tests in the same suite had already
+  tripped the threshold on the same page. Added an
+  autouse fixture
+  `_reset_contention_log` in
+  `tests/test_tools_in_memory.py` that clears the
+  dict before and after every test. The fixture is
+  scoped to this test file (Layer 1); Layer 2/3
+  tests don't exercise the contention path because
+  they don't issue enough 412s to trip the
+  threshold.
+
+- **No SDK version requirement change, no new
+  dependencies**. The hint rides on the existing
+  `ToolError` text channel that the SDK already
+  surfaces — no upgrade needed. Constants at
+  module scope so future tuning is a one-line
+  change, not a ticket.
+
+Four new Layer-1 cases in
+`tests/test_tools_in_memory.py`:
+
+1. `test_t42_three_412s_no_hint_fourth_carries_concurrent_edit_hint` —
+   4 consecutive 412s on the same page; the first
+   3 use the bare wording, the 4th carries the
+   marker.
+2. `test_t42_counter_is_per_page_not_global` — 1
+   412 on page A + 1 412 on page B; neither
+   carries the marker (per-page isolation).
+3. `test_t42_sliding_window_evicts_old_timestamps` —
+   3 412s, jump `time.monotonic()` past the window
+   with `monkeypatch`, 4th 412 carries no marker
+   (the deque evicted all old entries).
+4. `test_t42_successful_write_after_412s_carries_no_hint` —
+   after 3 412s, the 4th write succeeds (no
+   marker on the success path; the T23 ack
+   envelope is unchanged).
+
+All 504 tests pass (500 baseline + 4 new T42
+cases). CHANGELOG v1.5 `[Unreleased]` gained a
+T42 entry under `### Added`; the `## Status`
+paragraph at the top of v1.5 updated to list T42
+alongside T39 / T40 / T41 / T44 as shipped and
+T43 as the remaining frontier ticket.
+`docs/design.md` § Tools § Status-code mapping 412
+row gained a "T42 hint" paragraph noting the
+threshold, the marker format, the trip-on-next
+semantics, and the per-process scope of
+`_contention_hint`. The pre-resolution fog patch
+"T42's threshold values (N, M)" remains in the
+`## Not yet specified` section — N=3 / M=60s is a
+starting point; whether the live contention
+pattern matches is empirical, and the constants
+are at module scope for tuning.
 
 ---
 

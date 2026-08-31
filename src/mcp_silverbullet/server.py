@@ -269,6 +269,17 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     every handler: ``read_page`` (a GET) won't raise
     ``PreconditionFailed`` or ``BodyTooLarge``, so those clauses
     never fire there; ``list_pages`` likewise.
+
+    T42: the ``PreconditionFailed`` clause appends a
+    ``[concurrent_edit_hint: true]`` marker to the standard
+    412 wording when this page has hit the contention
+    threshold (see :func:`_contention_hint`). The marker
+    rides on the existing message-text channel because the
+    MCP SDK renders ``ToolError`` to the wire as plain
+    ``TextContent(text=str(exc))`` — no native envelope
+    field. ``create_page`` (T32) intercepts
+    ``PreconditionFailed`` *before* this helper, so the
+    hint never reaches the ``already exists`` wording.
     """
     try:
         yield
