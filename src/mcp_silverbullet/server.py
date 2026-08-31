@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import json
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -280,6 +281,21 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     field. ``create_page`` (T32) intercepts
     ``PreconditionFailed`` *before* this helper, so the
     hint never reaches the ``already exists`` wording.
+
+    T43: the ``ServerError`` clause appends a
+    ``[cf_hint: {...}]`` marker carrying the parsed
+    ``retry_after`` / ``error_code`` / ``title`` from a
+    Cloudflare-shaped 5xx body when
+    :attr:`ServerError.cf_hint` was populated by
+    :func:`mcp_silverbullet.sb_client._raise_for_status`.
+    Same message-text-channel pattern as T42; the
+    marker is conditional (``None`` ``cf_hint`` leaves
+    the error envelope unchanged), so a non-CF 5xx
+    (the common case) sees the pre-T43 wording
+    byte-for-byte. An agent that
+    ``json.loads`` the marker gets a clean dict to
+    decide whether to retry (matching ``retry_after``)
+    rather than pattern-matching the raw CF JSON.
     """
     try:
         yield
@@ -306,7 +322,28 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
     except BodyTooLarge as exc:
         raise ToolError(f"body too large: limit is {_BODY_LIMIT_MIB} MiB") from exc
     except ServerError as exc:
-        raise ToolError(str(exc)) from exc
+        # T43: surface the CF hint when the 5xx body looked
+        # CF-shaped (parsed upstream in :func:`_parse_cf_error`).
+        # Same message-text-channel pattern as T42's
+        # ``concurrent_edit_hint``: the MCP SDK renders ``ToolError``
+        # to the wire as plain ``TextContent(text=str(exc))`` (no
+        # native envelope field), so the hint rides as a
+        # machine-parseable suffix on the standard wording. An
+        # agent that pattern-matches on the standard wording still
+        # matches; an agent that knows the new marker can extract
+        # it and back off based on ``retry_after``. The marker is
+        # **conditional** — only present when ``exc.cf_hint`` is
+        # populated — so a non-CF 5xx (the common case: SB behind a
+        # plain reverse proxy) sees the unchanged wording, byte-
+        # for-byte. The marker uses ``json.dumps`` (not
+        # ``repr``) so the suffix is a clean JSON object the
+        # agent can ``json.loads`` directly: `` [cf_hint:
+        # {"retry_after": 60, "error_code": 502, "title": "Error
+        # 502: Bad gateway"}]``.
+        msg = str(exc)
+        if getattr(exc, "cf_hint", None):
+            msg += f" [cf_hint: {json.dumps(exc.cf_hint)}]"
+        raise ToolError(msg) from exc
     except httpx.TimeoutException as exc:
         raise ToolError("silverbullet request timed out") from exc
 

@@ -71,6 +71,7 @@ handling on older SB / proxy-stripped responses.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -138,7 +139,30 @@ class BodyTooLarge(SBError):
 
 
 class ServerError(SBError):
-    """SB returned a 5xx status. Carries the status code."""
+    """SB returned a 5xx status. Carries the status code.
+
+    T43: when the 5xx response body looks CF-shaped (a Cloudflare
+    error page wrapping an ``origin_bad_gateway`` /
+    ``origin_unreachable`` / etc. failure), the optional
+    ``cf_hint`` attribute carries a structured dict of the bits
+    an agent needs to decide whether to retry: ``retry_after``
+    (seconds, may be ``None`` if the upstream didn't include it),
+    ``error_code`` (the numeric CF error code, e.g. ``502``), and
+    ``title`` (the human-readable summary, e.g. ``"Error 502:
+    Bad gateway"``). Other CF fields (``ray_id``, ``zone``,
+    ``instance``, etc.) are deliberately dropped — they're useful
+    for debugging the CF/proxy layer, not for the agent's
+    decision-making. ``cf_hint`` is ``None`` for any 5xx whose
+    body doesn't look CF-shaped (the common case: SB behind a
+    plain reverse proxy that returns a non-JSON HTML error page,
+    or an empty body). The MCP tool layer reads ``cf_hint`` and
+    attaches it to the error envelope so an MCP-SDK-aware wrapper
+    can surface the hint cleanly; a wrapper that unwraps to raw
+    body still gets the same CF JSON, but the bridge has done its
+    part by giving the structured envelope.
+    """
+
+    cf_hint: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -835,6 +859,84 @@ def _parse_int_header(value: str | None) -> int | None:
         return None
 
 
+# T43: marker fields that identify a Cloudflare-shaped 5xx body. CF's
+# error pages wrap every 5xx in a JSON envelope carrying a few
+# diagnostic fields (``ray_id`` for tracing, ``error_category`` for
+# classification, ``cloudflare_error`` as a self-identifier). When any
+# of these is present we know the body is a CF wrapper rather than SB's
+# own error format (or a plain reverse-proxy HTML page); we then extract
+# the three fields useful for an agent's retry decision. The marker
+# check is deliberately permissive — *any* of the three fields triggers
+# the parser, not all three — because CF's body shape has shifted
+# across releases and we don't want a future CF format change to
+# silently drop the hint.
+_CF_MARKER_FIELDS = ("cloudflare_error", "error_category", "ray_id")
+
+
+def _parse_cf_error(body: str | None) -> dict[str, Any] | None:
+    """Return a structured hint for a CF-shaped 5xx body, else ``None``.
+
+    T43: parses Cloudflare's JSON error envelope (the body that
+    surfaces when a CF-fronted SB 502s / 503s / 504s on the origin)
+    and extracts the three fields an agent needs to decide
+    whether to retry:
+
+    - ``retry_after`` (seconds, may be ``None`` if upstream omitted it)
+    - ``error_code`` (the numeric CF error code, e.g. ``502``)
+    - ``title`` (the human-readable summary, e.g. ``"Error 502:
+      Bad gateway"``)
+
+    Returns ``None`` when the body doesn't look CF-shaped: empty
+    body, body that isn't valid JSON, or body that's JSON but
+    carries none of the CF marker fields. The marker check is
+    deliberately permissive — *any* of
+    ``"cloudflare_error"``, ``"error_category"``, or ``"ray_id"``
+    triggers the parse, so a future CF format change that drops one
+    field doesn't silently disable the hint.
+
+    Other CF fields (``ray_id``, ``zone``, ``instance``,
+    ``error_name``, ``timestamp``, ``what_you_should_do``, etc.)
+    are intentionally dropped — they're useful for debugging the
+    CF/proxy layer, not for the agent's decision-making. Surfacing
+    them as part of the hint would add noise without a useful
+    signal.
+
+    Defensive against malformed input: ``json.JSONDecodeError``
+    (body isn't valid JSON) and ``TypeError`` (body is bytes /
+    ``None`` / a non-string) both return ``None`` rather than
+    raising. The caller is a 5xx error path already; propagating
+    a parser exception would mask the original 5xx with a
+    secondary failure.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not any(field in data for field in _CF_MARKER_FIELDS):
+        return None
+    # Surface the three useful fields. ``retry_after`` is allowed to
+    # be missing from the upstream payload (not every CF 5xx carries
+    # a retry hint); the field is *always* present in the returned
+    # dict when the body is CF-shaped, but its value can be ``None``.
+    # ``error_code`` may be numeric (502) or string-typed depending on
+    # CF release; coerce to ``int`` for caller convenience.
+    error_code = data.get("error_code")
+    if isinstance(error_code, str):
+        try:
+            error_code = int(error_code)
+        except (TypeError, ValueError):
+            pass
+    return {
+        "retry_after": data.get("retry_after"),
+        "error_code": error_code,
+        "title": data.get("title"),
+    }
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     """Translate SB HTTP statuses to typed exceptions.
 
@@ -844,6 +946,18 @@ def _raise_for_status(response: httpx.Response) -> None:
     of the prior map; the bridge verifies the inbound token, so an
     outbound 401 means the SB ``SB_AUTH_TOKEN`` drifted from the
     bridge's and the operator needs to investigate).
+
+    T43: 5xx responses additionally call :func:`_parse_cf_error` on
+    the response body; when the body looks CF-shaped, the parsed
+    hint is attached to the raised :class:`ServerError` as
+    ``cf_hint``. The MCP tool layer then surfaces ``cf_hint`` on
+    the error envelope so an agent can decide whether to retry
+    (matching the ``retry_after`` value CF publishes) without
+    pattern-matching the raw CF JSON. Non-CF 5xx bodies (SB's
+    own error format, plain HTML from a reverse proxy, empty
+    body) leave ``cf_hint=None`` and the error envelope is
+    unchanged from the pre-T43 shape — no new field on the wire,
+    no breakage for non-CF deployments.
     """
     status = response.status_code
     if 200 <= status < 300:
@@ -859,7 +973,11 @@ def _raise_for_status(response: httpx.Response) -> None:
             f"body too large: limit is {_BODY_LIMIT_BYTES // (1024 * 1024)} MiB"
         )
     if status >= 500:
-        raise ServerError(f"silverbullet error: {status}")
+        exc = ServerError(f"silverbullet error: {status}")
+        exc.cf_hint = _parse_cf_error(response.text)
+        raise exc
     # 4xx we don't model explicitly — treat as a server-side
     # configuration drift (likely auth-related) and surface as 5xx.
-    raise ServerError(f"silverbullet error: {status}")
+    exc = ServerError(f"silverbullet error: {status}")
+    exc.cf_hint = _parse_cf_error(response.text)
+    raise exc

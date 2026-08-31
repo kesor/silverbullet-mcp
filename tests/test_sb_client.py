@@ -31,6 +31,7 @@ from mcp_silverbullet.sb_client import (
     PreconditionFailed,
     SBClient,
     ServerError,
+    _parse_cf_error,
     synthesize_etag,
 )
 
@@ -1437,3 +1438,269 @@ async def test_inbound_bearer_is_forwarded_to_sb() -> None:
         await sb.list_pages()
 
     assert seen_auth[0] == f"Bearer {TOKEN}"
+
+
+# --- T43: CF 5xx wrapper parsing ---------------------------------------
+
+
+_CF_BODY = (
+    '{"type":"https://...","title":"Error 502: Bad gateway",'
+    '"status":502,"detail":"...","instance":"a33e...",'
+    '"error_code":502,"error_name":"origin_bad_gateway",'
+    '"error_category":"origin","ray_id":"a33e...",'
+    '"timestamp":"2026-08-31T19:40:15Z","zone":"sb.kesor.net",'
+    '"cloudflare_error":true,"retryable":true,"retry_after":60,'
+    '"owner_action_required":true,"what_you_should_do":"**Wait '
+    'and retry.**...","footer":"..."}'
+)
+
+
+def test_parse_cf_error_returns_hint_for_cf_shaped_body() -> None:
+    """T43: a CF-shaped body yields the three useful fields.
+
+    The full CF error envelope carries ~15 fields; only
+    ``retry_after``, ``error_code``, and ``title`` are surfaced —
+    the rest are debug-only and intentionally dropped. The hint
+    must round-trip ``retry_after`` as a number (the JSON parser
+    already coerced it), ``error_code`` as an int (the JSON
+    number 502, not the string "502"), and ``title`` as a string.
+    """
+    hint = _parse_cf_error(_CF_BODY)
+    assert hint == {
+        "retry_after": 60,
+        "error_code": 502,
+        "title": "Error 502: Bad gateway",
+    }
+
+
+def test_parse_cf_error_returns_none_for_empty_body() -> None:
+    """T43: empty body (no CF marker fields to detect) returns ``None``.
+
+    The 5xx path still raises ``ServerError`` with ``cf_hint=None``
+    so the MCP tool envelope is unchanged from the pre-T43
+    wording. This is the common case for SB behind a plain
+    reverse proxy that returns a non-JSON HTML error page or an
+    empty body — the bridge sees a 502 with no body and surfaces
+    ``"silverbullet error: 502"`` exactly as before.
+    """
+    assert _parse_cf_error("") is None
+    assert _parse_cf_error(None) is None
+
+
+def test_parse_cf_error_returns_none_for_non_json_body() -> None:
+    """T43: a non-JSON body (plain text, HTML error page) returns ``None``.
+
+    Even though CF sometimes returns HTML error pages rather
+    than JSON, the only bodies that carry the retry hint are
+    the JSON envelope ones. Plain text and HTML are surfaced
+    unchanged by the bridge (the body is thrown away on 5xx
+    per the design doc), and the ``cf_hint`` field stays
+    ``None``. This pins the conservative posture: don't try
+    to scrape HTML.
+    """
+    assert _parse_cf_error("bad gateway") is None
+    assert _parse_cf_error("<html><body>502 Bad Gateway</body></html>") is None
+
+
+def test_parse_cf_error_returns_none_for_random_json_without_cf_markers() -> None:
+    """T43: random JSON without CF marker fields returns ``None``.
+
+    Some reverse proxies (e.g. nginx with a custom error page)
+    return JSON bodies that happen to parse cleanly but carry
+    no CF marker fields — the helper detects the absence of
+    ``cloudflare_error`` / ``error_category`` / ``ray_id`` and
+    returns ``None``. The 5xx path still raises ``ServerError``
+    with no ``cf_hint`` on the envelope.
+    """
+    assert _parse_cf_error('{"error": "internal", "code": 500}') is None
+    assert _parse_cf_error('{"detail": "upstream timeout"}') is None
+
+
+def test_parse_cf_error_keeps_retry_after_field_even_when_omitted_upstream() -> None:
+    """T43: CF body without ``retry_after`` still surfaces the
+    field as ``None``.
+
+    The field is *always* present in the returned dict when
+    the body is CF-shaped, but its value can be ``None`` if the
+    upstream omitted it. This gives the agent a consistent
+    schema (``cf_hint`` always has the three keys when the
+    body is CF-shaped) so it doesn't have to ``KeyError``-guard
+    every field; it can read ``cf_hint.retry_after`` and decide
+    whether to fall back to a default retry interval based on
+    ``None``.
+    """
+    body = (
+        '{"cloudflare_error":true,"error_code":504,'
+        '"title":"Error 504: Gateway timeout"}'
+    )
+    hint = _parse_cf_error(body)
+    assert hint == {
+        "retry_after": None,
+        "error_code": 504,
+        "title": "Error 504: Gateway timeout",
+    }
+
+
+def test_parse_cf_error_coerces_string_error_code_to_int() -> None:
+    """T43: string-typed ``error_code`` is coerced to ``int``.
+
+    Older CF release branches emit ``"error_code": "502"``
+    (string-typed) rather than ``502`` (numeric). The parser
+    normalizes both forms to ``int`` so the agent sees a
+    consistent numeric field. A non-numeric string (which
+    shouldn't happen but might in a malformed CF response)
+    passes through unchanged rather than raising.
+    """
+    body = (
+        '{"cloudflare_error":true,"error_code":"503",'
+        '"retry_after":30,"title":"Error 503"}'
+    )
+    assert _parse_cf_error(body) == {
+        "retry_after": 30,
+        "error_code": 503,
+        "title": "Error 503",
+    }
+    # Non-numeric string passes through (defensive — shouldn't
+    # happen on real CF responses).
+    body_bad = '{"cloudflare_error":true,"error_code":"foo","title":"x"}'
+    assert _parse_cf_error(body_bad) == {
+        "retry_after": None,
+        "error_code": "foo",
+        "title": "x",
+    }
+
+
+def test_parse_cf_error_tolerates_top_level_non_object() -> None:
+    """T43: top-level non-object JSON returns ``None``.
+
+    Defensive: a CF 5xx body should always be a JSON object,
+    but if a future release wraps the envelope in a list or
+    a scalar, the parser must not raise. ``json.loads`` itself
+    succeeds on a list; the ``isinstance(data, dict)`` guard
+    returns ``None`` instead of indexing into a list and
+    raising ``TypeError``. (Pin: a future change that drops
+    the guard would surface a ``TypeError`` from inside the
+    5xx path, masking the original 5xx.)
+    """
+    assert _parse_cf_error("[]") is None
+    assert _parse_cf_error("null") is None
+    assert _parse_cf_error("42") is None
+
+
+@pytest.mark.asyncio
+async def test_5xx_response_populates_cf_hint_on_server_error() -> None:
+    """T43: SB returns 502 with a CF body; the raised
+    ``ServerError`` carries ``cf_hint`` with the parsed fields.
+
+    This is the integration check on the
+    ``_raise_for_status`` → ``_parse_cf_error`` →
+    ``ServerError.cf_hint`` chain. The ``read_page`` path
+    raises ``ServerError`` (not ``PageNotFound``) on a 502,
+    and the ``cf_hint`` attribute on the raised exception
+    carries the parsed hint — ready for the MCP tool layer
+    in ``server.py`` to attach to the error envelope.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text=_CF_BODY)
+
+    async with _client(handler) as sb:
+        with pytest.raises(ServerError) as ei:
+            await sb.read_page("Foo")
+    assert str(ei.value) == "silverbullet error: 502"
+    assert ei.value.cf_hint == {
+        "retry_after": 60,
+        "error_code": 502,
+        "title": "Error 502: Bad gateway",
+    }
+
+
+@pytest.mark.asyncio
+async def test_5xx_response_leaves_cf_hint_none_for_non_cf_body() -> None:
+    """T43: a 5xx with a plain-text (non-CF) body leaves
+    ``cf_hint=None``.
+
+    The conservative posture: only the CF JSON envelope is
+    parsed; any other 5xx body leaves ``cf_hint`` unset so
+    the MCP tool envelope stays byte-for-byte the same as
+    the pre-T43 shape (no `` [cf_hint: ...]`` suffix on the
+    error message). A non-CF deployment (SB behind nginx,
+    Caddy, or a plain reverse proxy that returns its own
+    HTML error page) sees no behavior change.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="internal server error plain text")
+
+    async with _client(handler) as sb:
+        with pytest.raises(ServerError) as ei:
+            await sb.read_page("Foo")
+    assert str(ei.value) == "silverbullet error: 500"
+    assert ei.value.cf_hint is None
+
+
+@pytest.mark.asyncio
+async def test_5xx_response_leaves_cf_hint_none_for_empty_body() -> None:
+    """T43: a 5xx with an empty body leaves ``cf_hint=None``.
+
+    Empty body is the same shape as the test above: no body
+    bytes to parse, so the parser short-circuits to ``None``.
+    A CF-fronted SB in some failure modes returns a 502 with
+    no body at all; the bridge sees that as a generic 5xx
+    with no hint, which is the correct conservative posture.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="")
+
+    async with _client(handler) as sb:
+        with pytest.raises(ServerError) as ei:
+            await sb.read_page("Foo")
+    assert str(ei.value) == "silverbullet error: 502"
+    assert ei.value.cf_hint is None
+
+
+@pytest.mark.asyncio
+async def test_5xx_response_cf_hint_threads_to_every_write_tool() -> None:
+    """T43: the ``cf_hint`` is populated on 5xx from every
+    path that flows through ``_raise_for_status``.
+
+    Pin: any future entry point added to ``sb_client`` that
+    bypasses ``_raise_for_status`` (e.g. a new method that
+    catches ``httpx`` directly) would silently drop the
+    ``cf_hint``. This test exercises every 5xx-touched path
+    in ``sb_client`` that surfaces a ``ServerError`` to its
+    caller (``read_page``, ``write_page``, ``delete_page``,
+    ``exists_page``, ``read_page_meta``, ``list_pages``) and
+    asserts the ``cf_hint`` is on every raised
+    ``ServerError``. ``read_page_meta_safe`` is *not* on this
+    list — it deliberately swallows 5xx to ``None`` (the
+    list-pages hydration walker treats 5xx as transient per
+    page and keeps the row's ``etag=None`` rather than
+    surfacing the failure to the agent); the
+    ``cf_hint`` is intentionally dropped there because the
+    safe wrapper is the layer that decides whether to
+    surface 5xx at all.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text=_CF_BODY)
+
+    async with _client(handler) as sb:
+        # Every entry point that flows through ``_raise_for_status``
+        # and surfaces the resulting ``ServerError`` to its caller.
+        # Each one must surface the same ``cf_hint`` so the MCP tool
+        # layer can attach it to the error envelope.
+        for call in (
+            ("read_page", lambda sb: sb.read_page("Foo")),
+            ("write_page", lambda sb: sb.write_page("Foo", "body")),
+            ("delete_page", lambda sb: sb.delete_page("Foo")),
+            ("exists_page", lambda sb: sb.exists_page("Foo")),
+            ("read_page_meta", lambda sb: sb.read_page_meta("Foo")),
+            ("list_pages", lambda sb: sb.list_pages()),
+        ):
+            name, fn = call
+            with pytest.raises(ServerError) as ei:
+                await fn(sb)
+            assert ei.value.cf_hint is not None, (
+                f"{name} did not populate cf_hint on a 5xx"
+            )
+            assert ei.value.cf_hint["error_code"] == 502, (
+                f"{name} populated wrong cf_hint: {ei.value.cf_hint}"
+            )

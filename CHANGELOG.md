@@ -85,8 +85,8 @@ per-user SB credentials to thread off of.
 ## [Unreleased] — v1.5 (agent-experience hardening)
 
 Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
-**Status: T39 + T40 + T41 + T42 + T44 shipped
-2026-08-31; v1.5 destination partial** — the
+**Status: T39 + T40 + T41 + T42 + T43 + T44 shipped
+2026-08-31; v1.5 destination reached** — the
 `.md`-suffix split closes via T39's
 name-normalization helper (threaded into every
 `name`-taking tool), with a `name_resolution`
@@ -107,9 +107,18 @@ the same page within M=60s. T44 fixes T31b's
 false-positive "concurrent edit detected" on every
 successful write by dropping the mtime component
 from the synthesized etag (see Changed below for
-the wire-shape migration note). T43 remains on the
-frontier (same charter: CF 5xx wrapper JSON
-parsing for a `cf_hint` envelope field).
+the wire-shape migration note). T43 surfaces a
+`[cf_hint: {...}]` marker on the 5xx error
+envelope when the upstream body is CF-shaped
+(carries `cloudflare_error` / `error_category` /
+`ray_id`); the marker is a JSON-serialized dict
+of `retry_after` / `error_code` / `title` that
+an agent can `json.loads` directly to decide
+whether to retry without pattern-matching the
+raw CF JSON body (see Added below). The marker
+is conditional on a CF-shaped body — non-CF 5xx
+bodies leave the pre-T43 wording unchanged,
+so non-CF deployments see no behavior change.
 
 T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
 that explicitly pass `name="Foo"` (bare) expecting a 500-shaped
@@ -356,6 +365,71 @@ agent learns the convention rather than continuing to retype.
   happy-path single-412 case (the
   hint only fires after the threshold
   trips).
+
+- **T43 CF 5xx `cf_hint` envelope** — when the
+  bridge raises a 5xx ``ToolError`` against a
+  CF-fronted SB whose response body is a
+  Cloudflare-shaped JSON envelope (carries
+  ``cloudflare_error`` / ``error_category`` /
+  ``ray_id``), the error message gains a
+  `` [cf_hint: {...}]`` suffix carrying the
+  parsed ``retry_after`` (seconds), ``error_code``
+  (the numeric CF code, e.g. ``502``), and
+  ``title`` (the human-readable summary). New
+  module-scope helper
+  `_parse_cf_error(body: str | None) -> dict |
+  None` in `src/mcp_silverbullet/sb_client.py`
+  — returns ``None`` for non-CF bodies (empty,
+  plain text, random JSON, or JSON without the
+  CF marker fields), else returns the
+  three-field hint dict. New ``cf_hint: dict |
+  None = None`` attribute on
+  :class:`mcp_silverbullet.sb_client.ServerError`;
+  populated by ``_raise_for_status`` on any 5xx
+  response (and the catch-all 4xx that folds to
+  ``ServerError``). Threaded into the
+  ``ServerError`` clause of
+  ``_translate_sb_errors`` in ``server.py``;
+  the marker rides on the message-text channel
+  (``TextContent(text=str(exc))``) using
+  ``json.dumps`` so an agent can ``json.loads``
+  the suffix directly — same envelope-shape
+  design call as T42's
+  ``concurrent_edit_hint`` (no native envelope
+  field exists on the MCP wire). The hint is
+  **conditional** — ``None`` ``cf_hint`` leaves
+  the pre-T43 wording byte-for-byte unchanged,
+  so non-CF deployments see no behavior change.
+  Six new Layer-1 cases in
+  ``tests/test_tools_in_memory.py`` (CF body →
+  marker present, non-CF body → no marker,
+  random JSON body → no marker, empty body →
+  no marker, CF body without ``retry_after`` →
+  ``retry_after: None`` in marker, success
+  path after 5xx → no marker on the T23 ack)
+  and eleven new Layer-3 cases in
+  ``tests/test_sb_client.py`` (CF body →
+  three fields, empty body → ``None``, non-JSON
+  → ``None``, random JSON → ``None``, CF body
+  without ``retry_after`` → ``retry_after:
+  None``, string ``error_code`` coercion,
+  top-level non-object JSON → ``None``, 5xx
+  populates ``cf_hint`` on ``ServerError``,
+  non-CF 5xx leaves ``cf_hint=None``, empty
+  5xx body leaves ``cf_hint=None``, every
+  entry point that flows through
+  ``_raise_for_status`` threads the hint).
+  `docs/design.md` § Tools § Status-code
+  mapping 5xx row gains a `cf_hint` field
+  note documenting the marker shape, the
+  three surfaced fields, the conditional
+  behavior, and the rationale for the
+  message-text-channel pattern. No new
+  dependencies; no behavior change for
+  non-CF 5xx; no wire-shape change for the
+  success path; the agent's hint-extraction
+  is opt-in (a caller that doesn't
+  ``json.loads`` the suffix sees no change).
 
 ### Changed
 

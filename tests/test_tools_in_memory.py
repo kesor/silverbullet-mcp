@@ -8150,3 +8150,242 @@ async def test_t42_successful_write_after_412s_carries_no_hint() -> None:
     # The success envelope is the T23 ack; the hint must not
     # surface anywhere on it.
     assert "concurrent_edit_hint" not in _text(result)
+
+
+# --- T43: CF 5xx cf_hint envelope --------------------------------------
+
+
+# A representative Cloudflare error envelope — the body the bridge
+# sees when a CF-fronted SB 502s on the origin. The shape is taken
+# from the user's 2026-08-31 incident (the wrapper's error stream
+# surfaced this exact JSON). T43's parser reads only
+# ``retry_after``, ``error_code``, and ``title``; the other
+# fields are intentionally dropped. The hint rides on the
+# error message as a `` [cf_hint: {...}]`` suffix that an agent
+# can ``json.loads`` directly to decide whether to retry.
+_T43_CF_BODY = (
+    '{"type":"https://...","title":"Error 502: Bad gateway",'
+    '"status":502,"detail":"...","instance":"a33e...",'
+    '"error_code":502,"error_name":"origin_bad_gateway",'
+    '"error_category":"origin","ray_id":"a33e...",'
+    '"timestamp":"2026-08-31T19:40:15Z","zone":"sb.kesor.net",'
+    '"cloudflare_error":true,"retryable":true,"retry_after":60,'
+    '"owner_action_required":true,"what_you_should_do":"**Wait '
+    'and retry.**...","footer":"..."}'
+)
+
+
+@pytest.mark.asyncio
+async def test_t43_cf_5xx_envelope_attaches_cf_hint_to_tool_error() -> None:
+    """T43: SB returns 502 with a CF-shaped body; the bridge's
+    ``ToolError`` envelope carries `` [cf_hint: {...}]`` carrying
+    the parsed ``retry_after`` / ``error_code`` / ``title``.
+
+    Same message-text-channel pattern as T42's
+    ``concurrent_edit_hint``: the MCP SDK renders ``ToolError`` as
+    plain ``TextContent(text=str(exc))`` — no native envelope
+    field exists — so the hint rides as a JSON-serialized suffix
+    on the standard wording. An agent that knows the marker can
+    ``json.loads`` the suffix and act on ``retry_after`` directly
+    without pattern-matching the raw CF JSON body. An agent that
+    doesn't know the marker still matches on the standard
+    ``silverbullet error: <status>`` wording.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text=_T43_CF_BODY)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+    assert result.is_error is True
+    text = _text(result)
+    # Standard wording is unchanged; the marker rides as a suffix.
+    assert text.startswith(
+        "Error executing tool read_page: silverbullet error: 502"
+    )
+    # Marker is present and contains the three fields. Parsing the
+    # JSON suffix locks the wire shape: an agent can ``json.loads``
+    # the part between ``[cf_hint: `` and ``]`` to get the dict.
+    assert "[cf_hint: " in text
+    start = text.index("[cf_hint: ") + len("[cf_hint: ")
+    end = text.rindex("]")
+    payload = json.loads(text[start:end])
+    assert payload == {
+        "retry_after": 60,
+        "error_code": 502,
+        "title": "Error 502: Bad gateway",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t43_non_cf_5xx_envelope_carries_no_cf_hint() -> None:
+    """T43: a 5xx with a plain-text body leaves the error
+    envelope unchanged (no ``[cf_hint: ...]`` marker).
+
+    Non-CF deployments (SB behind a plain reverse proxy that
+    returns its own HTML error page) see no behavior change.
+    The pre-T43 wording ``"silverbullet error: <status>"`` is
+    surfaced byte-for-byte; the marker is conditional on a
+    CF-shaped body, so a non-CF body produces no marker.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="internal server error plain text")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool read_page: silverbullet error: 500"
+    )
+    assert "[cf_hint" not in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t43_5xx_with_non_cf_json_body_carries_no_cf_hint() -> None:
+    """T43: a 5xx with random non-CF JSON body leaves the
+    envelope unchanged.
+
+    A reverse proxy (nginx with a custom JSON error page, or
+    a CF configuration that strips the CF envelope but still
+    returns JSON) returns JSON that parses cleanly but carries
+    no CF marker fields. The parser detects the absence of
+    ``cloudflare_error`` / ``error_category`` / ``ray_id`` and
+    returns ``None``, so the tool envelope stays unchanged.
+    This pins the conservative posture: only the CF-shaped
+    subset of 5xx bodies gets the hint.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text='{"error": "internal", "code": 500}')
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool read_page: silverbullet error: 502"
+    )
+    assert "[cf_hint" not in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t43_5xx_with_empty_body_carries_no_cf_hint() -> None:
+    """T43: a 5xx with an empty body leaves the envelope unchanged.
+
+    A CF-fronted SB in some failure modes (the
+    ``cloudflare_error: true`` set without a JSON body) returns
+    a 502 with no bytes. The parser short-circuits on the empty
+    body, the tool envelope is the unchanged
+    ``"silverbullet error: 502"`` wording, and the agent sees
+    the same error string as a non-CF 5xx.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+    assert result.is_error is True
+    assert _text(result) == (
+        "Error executing tool read_page: silverbullet error: 502"
+    )
+    assert "[cf_hint" not in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t43_cf_body_without_retry_after_surfaces_field_as_none() -> None:
+    """T43: a CF-shaped body that omits ``retry_after`` still
+    carries the marker, with ``retry_after`` set to ``None``.
+
+    The marker is conditional on the body being CF-shaped
+    (``cloudflare_error`` / ``error_category`` / ``ray_id``
+    present), not on every field being present. The marker
+    schema is *consistent* (``retry_after`` / ``error_code``
+    / ``title`` always present, with values that may be
+    ``None``) so an agent can read the keys without
+    ``KeyError``-guarding. An agent that sees
+    ``retry_after: None`` can fall back to a default retry
+    interval (e.g. the T42 60-second window) instead of
+    pattern-matching on CF's hint structure.
+    """
+    body = (
+        '{"cloudflare_error":true,"error_code":504,'
+        '"title":"Error 504: Gateway timeout"}'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(504, text=body)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("read_page", {"name": "Foo"})
+    assert result.is_error is True
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool read_page: silverbullet error: 504"
+    )
+    assert "[cf_hint: " in text
+    start = text.index("[cf_hint: ") + len("[cf_hint: ")
+    end = text.rindex("]")
+    payload = json.loads(text[start:end])
+    assert payload == {
+        "retry_after": None,
+        "error_code": 504,
+        "title": "Error 504: Gateway timeout",
+    }
+
+
+@pytest.mark.asyncio
+async def test_t43_successful_write_after_5xx_carries_no_cf_hint() -> None:
+    """T43: the ``cf_hint`` marker is never raised on the
+    success path.
+
+    Even after the bridge has surfaced the marker on one or
+    more 5xx responses, a subsequent successful write returns
+    the T23 ack envelope with no marker. The marker is
+    purely an error-path signal — it never appears on 200
+    responses. This guards against an accidental future
+    change that threads the marker into both paths (e.g. a
+    per-page counter that lingers on the success envelope).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # First read returns 502 with a CF body.
+            if not getattr(handler, "_first_read_done", False):
+                handler._first_read_done = True  # type: ignore[attr-defined]
+                return httpx.Response(502, text=_T43_CF_BODY)
+            return httpx.Response(
+                200,
+                text="# hello",
+                headers={
+                    "ETag": '"v1"',
+                    "X-Last-Modified": "1700000000123",
+                    "X-Content-Length": "7",
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"ETag": '"v2"', "X-Content-Length": "12"},
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        # First read 502s with a CF body — the marker is on
+        # the error envelope.
+        result = await client.call_tool("read_page", {"name": "Foo"})
+        assert result.is_error is True
+        assert "[cf_hint: " in _text(result)
+
+        # Second read succeeds — no marker on the success path.
+        result = await client.call_tool("read_page", {"name": "Foo"})
+        assert result.is_error is False
+        assert "[cf_hint" not in _text(result)
+
+        # Subsequent write also succeeds — no marker on the
+        # success envelope.
+        result = await client.call_tool(
+            "write_page",
+            {"name": "Foo", "content": "# hello"},
+        )
+        assert result.is_error is False
+        assert "[cf_hint" not in _text(result)
