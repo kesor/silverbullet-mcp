@@ -138,17 +138,21 @@ session:
   future session doesn't relitigate.
 
 The map has **four open tickets** (T39, T40, T41, T42),
-all unblocked, all on the frontier. None claimed this
-session — the user asked for a chart-only pass, not a
-resolution.
+all unblocked, all on the frontier at chart time.
+None claimed this session — the user asked for a
+chart-only pass, not a resolution. T43 / T44 were
+charted later (2026-08-31) in the same map and
+brought the open count to six.
 
 **Status as of 2026-08-31**: T39 + T40 + T41 + T42 +
-T44 shipped (commits `39f7c` and `50f03`; T41 + T44
-ship in their respective sessions; T42 ships in
-this session — commit pending). Remaining on the
-frontier: T43 (CF 5xx `cf_hint` envelope — charted
-this session, on the v1.5 frontier for a future
-session to claim).
+T43 + T44 shipped (commits `39f7c` and `50f03`;
+T41 + T44 ship in their respective sessions; T42
+ships in its session — commit pending; T43 ships
+in this session — commit pending). **v1.5
+destination reached.** No remaining frontier
+tickets on the v1.5 map; v1.4's T37 / T38 are
+still on the v1.4 frontier (this map doesn't
+re-litigate them).
 
 ## Notes
 
@@ -235,12 +239,13 @@ session to claim).
 <!-- index only — one line per closed ticket, link to the
 ticket's resolution below -->
 
-- [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them). **As of 2026-08-31**: T39 + T40 + T41 + T42 + T44 are resolved (T42 claimed + shipped this session); T43 is the only remaining frontier ticket.
+- [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them). **As of 2026-08-31**: T39 + T40 + T41 + T42 + T43 + T44 are resolved (T43 claimed + shipped this session); **v1.5 destination reached**.
 - [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
 - [T40 (2026-08-31)](#t40-lift-upfront-empty-input-validation-across-the-remaining-write-tools-b9): two shared helpers in `server.py` — `_validate_nonempty_name(name)` (`ToolError("name must not be empty")`) + `_validate_nonempty_value(value, *, label)` (`ToolError("<label> must not be empty")`); threaded into 7 call sites across 4 previously-unguarded tools (`write_page` name + content, `delete_page`, `move_page` source + destination, `patch_page_lines`) + 5 already-guarded tools lifted into the helper for wording consistency (`create_page`, `append_to_page`, `prepend_to_page`, `patch_page_replace`'s `find`, `check_task`'s `ref`); guards fire *before* T39's name normalization so empty `name` raises loudly rather than normalizing to `".md"` silently; **drive-by deviation from the ticket's charter**: `patch_page_replace`'s `new_string=""` is the documented "delete every match" path, NOT a caller bug, so it's deliberately NOT guarded (a dedicated test pins the surface against accidental future guarding); 17 new Layer-1 cases in `tests/test_tools_in_memory.py`; 245 in-memory + 496 total tests pass.
 - [T41 (2026-08-31)](#t41-doc-clarifications-indexmd-source-vs-render-move_page-no-op-md-suffix-convention-b5-b8): three docstring additions, no new code beyond the description strings — `read_page` gains a sentence noting Space Lua template pages return raw source (transport, not renderer); `move_page` gains a sentence noting the `name == new_name` no-op never raises 412 even with stale `if_match`; `MCPServer.instructions` gains a paragraph noting the T39 `.md`-suffix convention; 3 new Layer-1 cases in `tests/test_tools_in_memory.py` lock the surface; `docs/design.md` § Tools table rows for `read_page` and `move_page` mention the T41 sentence in the Side-effects column + a sibling paragraph in the v1.5 surface description; `CHANGELOG.md` v1.5 `### Added` gains a T41 entry; no behavior change; no wire-shape change; no new dependencies; 500 tests pass.
 - [T44 (2026-08-31)](#t44-fix-t31bs-false-positive-concurrent-edit-detected-b12): single code change in `synthesize_etag` — the synthesized form went from `"{last_modified_ms}-{size_bytes}"` to `"{size_bytes}"` alone. Root cause: the bridge stamps `X-Last-Modified` with `now_ms` on every PUT (`_WRITE_HEADERS`), so the pre-T44 dashed form drifted on every write and T31b's post-write verification raised `ToolError("concurrent edit detected: …")` on every successful write where the write actually succeeded. Size alone is the correct primitive (same body → same size → same etag; different body → different size → different etag). **Wire-shape breaking change** for v1.3 / v1.4 callers holding a synthesized etag across calls (CHANGELOG migration note: re-read once after T44 lands to pick up the new canonical form); real `ETag` headers (the v1.3 contract path) are unaffected. Trade-offs: dropped the `"{ms}"` fallback (a proxy that strips `X-Content-Length` now returns `None` rather than a weaker primitive that tracked the *when* drift); lost pre-write concurrent-edit detection on SBs that strip `ETag` (post-write verification still catches the common case). One new Layer-1 test reproduces the user's defect on a realistic mock; six existing tests in `test_sb_client.py` updated for the new shape; `test_e2e_live_sb.py` updated to construct the new form and assert the new wire shape; `docs/design.md` § SilverBullet client contract + § Tools § Status-code mapping 412 row + `README.md` concurrency section + `CHANGELOG.md` v1.5 `### Changed` entry document the migration; 497 total tests pass.
 - [T42 (2026-08-31)](#t42-412-contention-hint-surface-you-are-in-a-contention-window-to-the-agent-b10): trip-on-next sliding-window counter — `_CONTENTION_THRESHOLD=3` consecutive 412s on the same page within `_CONTENTION_WINDOW_SECONDS=60` trips the hint; the *next* (4th) 412 `ToolError` carries ` [concurrent_edit_hint: true]` as a machine-parseable suffix on the standard `precondition failed; check if_match/if_none_match` wording. **Envelope-shape design call resolved at claim time**: the MCP SDK renders `ToolError` to the wire as plain `TextContent(text=str(exc))` (verified at `mcp/server/mcpserver/server.py:_handle_call_tool`) — no native envelope field exists, so the ticket's anticipated "thin wrapper class" was unnecessary; the hint rides on the existing message-text channel instead. `time.monotonic()` for the wall clock (NTP / DST / container-time-skew can't artificially trip). Per-page isolation (one `deque` per distinct `name`, bounded at `_CONTENTION_THRESHOLD` entries). Autouse fixture `_reset_contention_log` in `tests/test_tools_in_memory.py` clears the process-global counter between tests so pre-existing 412-wording tests don't drift. 4 new Layer-1 cases (4 consecutive 412s on same page; per-page isolation across two pages; sliding-window eviction; success-path non-leak). `docs/design.md` § Tools § Status-code mapping 412 row + `CHANGELOG.md` v1.5 `### Added` document the surface; 504 tests pass.
+- [T43 (2026-08-31)](#t43-cf-5xx-wrapper-json-parse-retry_after-and-surface-as-cf_hint-on-servererror-b11): new `_parse_cf_error(body: str | None) -> dict | None` helper in `src/mcp_silverbullet/sb_client.py` that returns the parsed hint dict (`{retry_after, error_code, title}`) for CF-shaped bodies (any of `cloudflare_error` / `error_category` / `ray_id` triggers the parse), `None` for empty / non-JSON / random-JSON / top-level-non-object bodies; new `cf_hint: dict | None = None` attribute on `ServerError` populated by `_raise_for_status` on every 5xx branch (and the catch-all 4xx that folds to `ServerError`); thread-through covers `read_page` / `write_page` / `delete_page` / `exists_page` / `read_page_meta` / `list_pages` (every entry point that flows through `_raise_for_status`), with `read_page_meta_safe` deliberately *not* on the list because it swallows 5xx → `None` (the hydration walker treats per-page 5xx as transient). `_translate_sb_errors`'s `ServerError` clause in `server.py` attaches ` [cf_hint: {json}]` to the standard `silverbullet error: <status>` message when `exc.cf_hint` is non-`None`; `None` `cf_hint` leaves the wording byte-for-byte unchanged. **Envelope-shape design call resolved at claim time**: same shape as T42 — the MCP SDK renders `ToolError` to the wire as plain `TextContent(text=str(exc))`, no native envelope field, so the hint rides as a `json.dumps`-serialized suffix the agent can `json.loads` directly. `getattr(exc, "cf_hint", None)` guards the `ServerError` constructor at `list_pages`'s `unexpected /.fs response` branch (a non-5xx malformed body, not a CF 5xx). `error_code` is string-coerced to `int` (older CF releases emit `"502"` as a string); `retry_after` is always present in the returned dict when the body is CF-shaped (value may be `None`). Other CF fields (`ray_id`, `zone`, `instance`, `error_name`, `timestamp`, `what_you_should_do`, etc.) are deliberately dropped — useful for CF debugging, not for the agent's retry decision. 6 new Layer-1 cases in `tests/test_tools_in_memory.py` (CF body → marker, non-CF body → no marker, random JSON → no marker, empty body → no marker, CF body without `retry_after` → `retry_after: None`, success path after 5xx → no marker) + 11 new Layer-3 cases in `tests/test_sb_client.py` (CF body parses, empty / non-JSON / random-JSON / top-level-non-object short-circuit, CF body without `retry_after` keeps the field as `None`, string `error_code` coerces to `int`, 5xx populates `cf_hint` on `ServerError`, non-CF 5xx leaves `cf_hint=None`, empty 5xx body leaves `cf_hint=None`, every entry point threads the hint). `docs/design.md` § Tools § Status-code mapping 5xx row gains a `cf_hint` paragraph; `_translate_sb_errors`'s docstring gains a T43 paragraph parallel to the T42 paragraph. `CHANGELOG.md` v1.5 `[Unreleased]` gained a T43 entry under `### Added`; the v1.5 status paragraph updated to "T43 shipped; v1.5 destination reached". 529 tests pass.
 
 ## Not yet specified
 
@@ -782,8 +787,9 @@ shipped); T42 unchanged (independent).
 > `MCPServer.instructions` was unblocked by T39
 > (already shipped) and is now ready to claim.
 > T42 + T43 + T44 claimed and resolved in
-> subsequent sessions; T41 + T42 + T44 ship in
-> 2026-08-31 commits, T43 still on the frontier.
+> subsequent sessions; T41 + T42 + T43 + T44
+> ship in 2026-08-31 commits. v1.5 destination
+> reached.
 
 ### T41. Doc clarifications: `index.md` source-vs-render, `move_page` no-op, `.md`-suffix convention (b5, b8)
 
@@ -962,8 +968,8 @@ operator reading design.md sees the v1.5 surface
 described coherently. `CHANGELOG.md` v1.5
 `### Added` gains a T41 entry with the three
 additions summarized; the v1.5 status line is
-updated to reflect T39 + T40 + T41 + T44 shipped
-(T42 / T43 remain on the frontier).
+updated to reflect T39 + T40 + T41 + T42 + T43 +
+T44 shipped (v1.5 destination reached).
 
 No new Python deps; no test count drop; 500 tests
 pass (497 pre-T41 + 3 new T41 cases). No
@@ -1183,8 +1189,9 @@ All 504 tests pass (500 baseline + 4 new T42
 cases). CHANGELOG v1.5 `[Unreleased]` gained a
 T42 entry under `### Added`; the `## Status`
 paragraph at the top of v1.5 updated to list T42
-alongside T39 / T40 / T41 / T44 as shipped and
-T43 as the remaining frontier ticket.
+alongside T39 / T40 / T41 / T44 as shipped (T43
+was the remaining frontier ticket at that
+snapshot, then resolved in a subsequent session).
 `docs/design.md` § Tools § Status-code mapping 412
 row gained a "T42 hint" paragraph noting the
 threshold, the marker format, the trip-on-next
@@ -1202,8 +1209,8 @@ are at module scope for tuning.
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed + resolved 2026-08-31)
+> **Status**: ✅ resolved — shipped 2026-08-31
 > **Question**: How does the bridge defend against
 > the messy CF 5xx wrapper JSON leaking into the
 > agent's error stream when CF (in front of SB)
@@ -1392,6 +1399,241 @@ are at module scope for tuning.
 > CF hint across retries (the bridge
 > re-parses on each 5xx; no cross-call
 > state needed).
+
+**Resolution** (positive, 2026-08-31): shipped in
+`src/mcp_silverbullet/sb_client.py`,
+`src/mcp_silverbullet/server.py`,
+`tests/test_sb_client.py`, and
+`tests/test_tools_in_memory.py`. Implementation
+matched the ticket's charter with one envelope-
+shape design call (the same one T42 already
+resolved at claim time):
+
+- **Envelope-shape design call resolved at
+  claim time**: same as T42. The MCP SDK renders
+  `ToolError` to the wire as plain
+  `TextContent(text=str(exc))` in
+  `mcp/server/mcpserver/server.py:_handle_call_tool`
+  — no native envelope field. The ticket's
+  anticipated "`cf_hint: dict` field on the
+  error envelope" turned out to need the same
+  text-channel treatment as T42's
+  `concurrent_edit_hint`: the hint rides as a
+  `json.dumps`-serialized suffix on the standard
+  5xx message
+  (` [cf_hint: {"retry_after": 60, "error_code":
+  502, "title": "Error 502: Bad gateway"}]`),
+  which an agent can `json.loads` directly to
+  extract the dict. An agent that
+  pattern-matches on the bare
+  `silverbullet error: <status>` wording still
+  matches; an agent that knows the marker can
+  extract it with a substring slice and
+  `json.loads`. The marker is **conditional** —
+  `None` `cf_hint` leaves the wording unchanged
+  byte-for-byte, so non-CF deployments see no
+  behavior change.
+
+- **`_parse_cf_error(body: str | None) -> dict |
+  None` helper in `sb_client.py`**: returns
+  `None` for empty body, non-JSON body, random
+  JSON without CF marker fields, or top-level
+  non-object JSON (a defensive `isinstance(data,
+  dict)` guard that catches future CF format
+  changes). Detects CF-shaped bodies via a
+  permissive marker check — *any* of
+  `cloudflare_error` / `error_category` /
+  `ray_id` triggers the parse, not all three —
+  so a future CF release that drops one marker
+  field doesn't silently disable the hint. The
+  parser string-coerces `error_code` to `int`
+  (older CF releases emit `"502"` as a string),
+  surfaces `retry_after` as `None` when the
+  upstream omitted it (the field is *always*
+  present in the returned dict when the body is
+  CF-shaped, but its value can be `None` so the
+  agent schema is consistent — no
+  `KeyError`-guarding). Other CF fields
+  (`ray_id`, `zone`, `instance`, `error_name`,
+  `timestamp`, `what_you_should_do`,
+  `owner_action_required`, `footer`, `type`,
+  `detail`, `retryable`) are deliberately
+  dropped: they're useful for debugging the
+  CF/proxy layer, not for the agent's
+  decision-making.
+
+- **`ServerError.cf_hint` attribute and
+  `_raise_for_status` plumbing**: new optional
+  class attribute `cf_hint: dict[str, Any] |
+  None = None` on `ServerError`. Populated by
+  `_raise_for_status` on both the 5xx branch
+  (`status >= 500`) and the catch-all 4xx that
+  folds to `ServerError` (`status` not in 404 /
+  412 / 413 — auth drift, proxy substitution,
+  etc.). Every entry point that flows through
+  `_raise_for_status` threads the hint:
+  `read_page`, `write_page`, `delete_page`,
+  `exists_page`, `read_page_meta`, `list_pages`
+  — a Layer-3 test
+  (`test_5xx_response_cf_hint_threads_to_every_write_tool`)
+  pins the surface; any future entry point that
+  bypasses the helper would fail this test.
+  `read_page_meta_safe` deliberately swallows
+  5xx to `None` (the list-pages hydration
+  walker treats per-page 5xx as transient) and
+  is **not** on the thread-through list — the
+  `cf_hint` is intentionally dropped there
+  because the safe wrapper is the layer that
+  decides whether to surface 5xx at all.
+  `ServerError` itself stays a plain
+  `Exception` subclass (no `frozen=True`
+  dataclass); the attribute is set
+  post-construction inside
+  `_raise_for_status`.
+
+- **`_translate_sb_errors`'s `ServerError`
+  clause threads the hint onto the
+  `ToolError` envelope**: when
+  `exc.cf_hint` is non-`None`, the standard
+  message gets a ` [cf_hint: {...}]` suffix
+  carrying `json.dumps(exc.cf_hint)` (clean
+  JSON, not `repr`, so the agent's
+  `json.loads` is straightforward). When
+  `exc.cf_hint` is `None`, the message is the
+  unchanged pre-T43 wording byte-for-byte.
+  The `getattr(exc, "cf_hint", None)` guard
+  protects against any future `ServerError`
+  constructed without `cf_hint` (e.g. the
+  `unexpected /.fs response` branch in
+  `list_pages`, which raises on a non-5xx
+  malformed body, not on a CF 5xx).
+
+- **Doc updates**: `docs/design.md` § Tools §
+  Status-code mapping 5xx row gains a T43
+  `cf_hint` paragraph documenting the marker
+  shape, the three surfaced fields, the
+  conditional behavior (non-CF 5xx leaves the
+  pre-T43 wording unchanged), and the
+  rationale for the message-text-channel
+  pattern (matching T42's `concurrent_edit_hint`).
+  `_translate_sb_errors`'s docstring gains a
+  T43 paragraph parallel to the T42 paragraph.
+
+- **No SDK version requirement change, no new
+  dependencies, no behavior change for
+  non-CF 5xx, no wire-shape change for the
+  success path**. The marker is opt-in: a
+  caller that doesn't check for the substring
+  sees the pre-T43 `ToolError` wording
+  unchanged; an MCP-SDK-aware wrapper that
+  surfaces the parsed hint gets a structured
+  dict to drive its retry policy.
+
+Six new Layer-1 cases in
+`tests/test_tools_in_memory.py`:
+
+1. `test_t43_cf_5xx_envelope_attaches_cf_hint_to_tool_error`
+   — SB returns 502 with a CF body; the
+   `ToolError` envelope carries
+   ` [cf_hint: {...}]` with the three parsed
+   fields; an agent can `json.loads` the
+   suffix.
+2. `test_t43_non_cf_5xx_envelope_carries_no_cf_hint`
+   — SB returns 500 with a plain-text body;
+   the envelope is the unchanged
+   `silverbullet error: 500` wording
+   byte-for-byte; no `[cf_hint` substring.
+3. `test_t43_5xx_with_non_cf_json_body_carries_no_cf_hint`
+   — SB returns 502 with random non-CF JSON
+   (`{"error": "internal", "code": 500}`);
+   the helper detects the absence of CF
+   marker fields and returns `None`; the
+   envelope is unchanged.
+4. `test_t43_5xx_with_empty_body_carries_no_cf_hint`
+   — SB returns 502 with an empty body; the
+   parser short-circuits to `None`; the
+   envelope is unchanged.
+5. `test_t43_cf_body_without_retry_after_surfaces_field_as_none`
+   — CF body omits `retry_after`; the
+   envelope still carries the marker, but
+   `retry_after` is `None` (consistent
+   schema regardless of upstream completeness).
+6. `test_t43_successful_write_after_5xx_carries_no_cf_hint`
+   — first read 502s with a CF body; the
+   marker is on the error envelope. Second
+   read succeeds and the third write
+   succeeds; neither carries the marker
+   (the hint is purely an error-path signal).
+
+Eleven new Layer-3 cases in
+`tests/test_sb_client.py`:
+
+1. `test_parse_cf_error_returns_hint_for_cf_shaped_body`
+   — the full CF envelope parses to the
+   three-field dict.
+2. `test_parse_cf_error_returns_none_for_empty_body`
+   — `""` and `None` short-circuit to `None`.
+3. `test_parse_cf_error_returns_none_for_non_json_body`
+   — plain text and HTML error pages
+   short-circuit to `None`.
+4. `test_parse_cf_error_returns_none_for_random_json_without_cf_markers`
+   — `{"error": "internal", "code": 500}`
+   and `{"detail": "upstream timeout"}`
+   short-circuit to `None`.
+5. `test_parse_cf_error_keeps_retry_after_field_even_when_omitted_upstream`
+   — `retry_after` is `None` in the
+   returned dict when the upstream body
+   omitted it; the field is always present
+   when the body is CF-shaped.
+6. `test_parse_cf_error_coerces_string_error_code_to_int`
+   — string-typed `"502"` coerces to `int`;
+   non-numeric strings pass through (a
+   defensive posture for malformed CF
+   responses).
+7. `test_parse_cf_error_tolerates_top_level_non_object`
+   — top-level `[]`, `null`, `42` all
+   short-circuit to `None` rather than
+   raising.
+8. `test_5xx_response_populates_cf_hint_on_server_error`
+   — `read_page` 502 with a CF body raises
+   `ServerError` with `cf_hint` populated;
+   the standard `silverbullet error: 502`
+   wording is unchanged.
+9. `test_5xx_response_leaves_cf_hint_none_for_non_cf_body`
+   — non-CF 5xx body leaves `cf_hint=None`.
+10. `test_5xx_response_leaves_cf_hint_none_for_empty_body`
+    — empty 5xx body leaves `cf_hint=None`.
+11. `test_5xx_response_cf_hint_threads_to_every_write_tool`
+    — `read_page` / `write_page` /
+    `delete_page` / `exists_page` /
+    `read_page_meta` / `list_pages` all
+    surface the same `cf_hint` on a 502
+    with a CF body; pins the
+    `_raise_for_status`-threads-the-hint
+    contract.
+
+All 529 tests pass (521 baseline + 11 new T43
+sb_client Layer-3 cases + 6 new T43 Layer-1
+cases; 8 live-SB e2e tests env-gated as before
+and skipped on this dev box). `CHANGELOG.md`
+v1.5 `[Unreleased]` gained a T43 entry under
+`### Added`; the v1.5 status paragraph at the
+top of v1.5 updated to list T43 alongside T39 /
+T40 / T41 / T42 / T44 as shipped; the v1.5
+header status line updated from "T43 remains on
+the frontier" to "T43 shipped; v1.5 destination
+reached". `docs/design.md` § Tools §
+Status-code mapping 5xx row gained a T43
+`cf_hint` paragraph. The T43 ticket's charter
+called out the
+**envelope-shape design call** as a claim-time
+decision; the resolution records that the same
+call resolved identically to T42's (message-
+text-channel + JSON-serialized suffix), and
+that no other charter deviation was needed. The
+v1.5 destination ("agent-experience hardening")
+is now reached: all six tickets (T39 + T40 +
+T41 + T42 + T43 + T44) shipped.
 
 ---
 
