@@ -18,7 +18,9 @@ the new etag on every successful write — read it and feed it back via
 - `page_exists(name)` → `bool` — `True` on 200, `False` on 404,
   `ToolError` on 5xx so "no, proceed" stays distinct from "SB is broken".
 - `write_page(name, content, if_match?)` → `{name, etag, size_bytes,
-  last_modified_ms, created_ms}` — create or overwrite.
+  last_modified_ms, created_ms}` — create or overwrite. Empty
+  `name`/`content` raises `ToolError("... must not be empty")`
+  upfront (T40).
 - `create_page(name, content)` → same envelope as `write_page` — but
   refuses to overwrite an existing page, surfacing
   `ToolError("page already exists: {name}; use write_page to overwrite")`
@@ -28,7 +30,8 @@ the new etag on every successful write — read it and feed it back via
   write append (one newline separator inserted unless the body
   already ends in one); returns the same envelope. With
   `dry_run=True` returns `{dry_run, original, patched, diff}` without
-  writing.
+  writing. Empty `text` raises `ToolError("text must not be empty")`
+  upfront (T40).
 - `prepend_to_page(name, content, position="after_frontmatter"|"top",
   if_match?, dry_run=False)` — top-of-body insert with YAML
   frontmatter awareness. Default `position="after_frontmatter"`
@@ -42,16 +45,20 @@ the new etag on every successful write — read it and feed it back via
   dry_run=False)` — replace lines `start_line..end_line` (1-indexed,
   inclusive) with `new_content`; pass `new_content=""` to delete a
   range; preserves the page's trailing newline if it had one.
+  Empty `name` raises `ToolError("name must not be empty")`
+  upfront (T40).
 - `patch_page_replace(name, find, new_string, replace_all=False,
   if_match?, dry_run=False)` — literal substring replace (no regex);
   `replace_all=False` (the safe default) errors if `find` matches
   more than once, so a typo never silently mass-edits.
 - `move_page(name, new_name, if_match?)` — rename (write-then-delete
   so a partial failure leaves the body at the new name); destination
-  always refuses to overwrite.
+  always refuses to overwrite. Empty `name`/`new_name` raises
+  `ToolError("name must not be empty")` upfront (T40).
 - `delete_page(name, if_match?)` → `{name, etag, size_bytes=None,
   last_modified_ms=None, created_ms=None}` — hard delete; SB's
-  DELETE response doesn't echo timestamps / size.
+  DELETE response doesn't echo timestamps / size. Empty `name`
+  raises `ToolError("name must not be empty")` upfront (T40).
 - `list_pages(prefix?)` → `[{name, etag, size_bytes, last_modified_ms,
   created_ms}][]` — sends `X-Sync-Mode: 1` so SB 2.x returns JSON
   from `GET /.fs` instead of 307-redirecting to the SPA. The etag

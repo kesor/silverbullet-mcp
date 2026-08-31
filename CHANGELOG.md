@@ -85,13 +85,19 @@ per-user SB credentials to thread off of.
 ## [Unreleased] — v1.5 (agent-experience hardening)
 
 Build map: [`docs/wayfinder/map-v1.5.md`](docs/wayfinder/map-v1.5.md).
-**Status: T39 shipped 2026-08-31; v1.5 destination partial** —
-the `.md`-suffix split closes via T39's name-normalization
-helper (threaded into every `name`-taking tool), with a
-`name_resolution` envelope field that teaches the agent the
-convention for its next call. T40 / T41 / T42 remain on the
-frontier (same charter: empty-input validation, doc
-clarifications, 412 contention hint respectively).
+**Status: T39 + T40 shipped 2026-08-31; v1.5 destination
+partial** — the `.md`-suffix split closes via T39's
+name-normalization helper (threaded into every `name`-taking
+tool), with a `name_resolution` envelope field that teaches
+the agent the convention for its next call. T40 lifts the
+upfront empty-input guard (already shipped on
+`create_page` / `append_to_page` / `prepend_to_page` /
+`patch_page_replace` / `check_task`) into two shared helpers
+and threads them into the four tools that didn't have it
+yet (`write_page` / `delete_page` / `move_page`'s source and
+destination / `patch_page_lines`). T41 / T42 remain on the
+frontier (same charter: doc clarifications, 412 contention
+hint respectively).
 
 T39 is **behavior-changing** for v1 / v1.1 / v1.2 / v1.3 callers
 that explicitly pass `name="Foo"` (bare) expecting a 500-shaped
@@ -149,6 +155,72 @@ agent learns the convention rather than continuing to retype.
   and gets back `name_resolution.suffix_added:
   ".md"` learns to pass `Foo.md` on its next
   call.
+
+- **T40 lift upfront empty-input validation
+  across write tools** — two module-scope
+  helpers in `src/mcp_silverbullet/server.py`:
+
+  - `_validate_nonempty_name(name)` raises
+    `ToolError("name must not be empty")` when
+    the caller's `name` is empty or
+    whitespace-only.
+  - `_validate_nonempty_value(value, *, label)`
+    raises
+    `ToolError("<label> must not be empty")`
+    with the parameter name inlined, for
+    body-shaped inputs whose parameter name
+    varies by tool.
+
+  Threaded into every write tool at the top of
+  each handler, **before** T39's name
+  normalization (so a caller passing `name=""`
+  still sees the loud empty-name error rather
+  than the normalized form `".md"` silently
+  succeeding):
+
+  - `write_page` — both `name` and `content`
+    guards. `name=""` raises
+    `ToolError("name must not be empty")`;
+    `content=""` raises
+    `ToolError("content must not be empty")`.
+  - `delete_page` — `name` guard.
+    `name=""` raises
+    `ToolError("name must not be empty")`.
+  - `move_page` — both `name` and `new_name`
+    guards (same helper, same wording).
+  - `patch_page_lines` — `name` guard.
+  - `patch_page_replace` — already had the
+    `find` guard; threaded through the helper
+    for consistency. The `new_string=""` case
+    is **deliberately not** guarded — it's the
+    documented "delete the match" path
+    (`"abcdefg".replace("cd", "")` is
+    `"abefg"`), not a caller bug. T40's
+    ticket originally proposed guarding it,
+    but the documented delete-match surface
+    takes priority; this is now a
+    `## Drive-by` note rather than an open
+    ticket.
+
+  The five already-guarded tools
+  (`create_page` / `append_to_page` /
+  `prepend_to_page` / `patch_page_replace` /
+  `check_task`) had their inline guards
+  replaced with the shared helpers so the
+  wording matches across every tool. Existing
+  test cases continue to pass byte-for-byte;
+  17 new Layer-1 cases in
+  `tests/test_tools_in_memory.py` lock the
+  T40 surface (empty + whitespace-only
+  inputs across every tool, no-SB-round-trip
+  invariant, normalization-runs-after-empty-
+  guard ordering, and a test pinning the
+  `patch_page_replace`'s `new_string=""`
+  "delete match" path against an accidental
+  future guard). Tool descriptions in
+  `server.py` and `docs/design.md` § Tools
+  table rows updated to mention the new
+  guards.
 
 ## [v1.3] — agent-grade discovery + edit hygiene
 
@@ -861,6 +933,6 @@ Build map: [`docs/wayfinder/map.md`](docs/wayfinder/map.md).
   `journal_histogram`, `tag_summary`, `recent_pages`,
   `pages_touching_topic`.
 
-[Unreleased]: #unreleased--v12-agent-facing-qol--bullet-primitives
+[Unreleased]: #unreleased--v15-agent-experience-hardening
 [v1.1]: #v11--full-crud--editing
 [v1.0]: #v10--minimal-runnable-bridge

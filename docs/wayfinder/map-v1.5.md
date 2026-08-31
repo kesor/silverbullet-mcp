@@ -588,8 +588,8 @@ shipped); T42 unchanged (independent).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed 2026-08-31, working same session)
+> **Status**: 🔵 in progress — claimed this session, shipping before EOD
 > **Question**: How does every write tool gain the
 > same upfront empty-input guard that
 > `create_page` / `append_to_page` /

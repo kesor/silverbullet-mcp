@@ -7174,6 +7174,460 @@ def test_t36_check_body_size_uses_utf8_byte_count_not_codepoint_count() -> None:
     assert "body too large" in str(excinfo.value)
 
 
+# --- T40: lift upfront empty-input validation across write tools ------
+#
+# The bug report's b9 surfaces a real gap on the v1.3 code: four
+# write tools (``write_page`` / ``delete_page`` / ``move_page`` /
+# ``patch_page_lines``) had no upfront empty-input guard, so
+# ``write_page(name="", content="test")`` and ``write_page(name="x",
+# content="")`` both reached SB and surfaced a 500. T40 lifts the
+# pattern from the already-guarded tools (``create_page` /
+# ``append_to_page`` / ``prepend_to_page`` / ``patch_page_replace``
+# / ``check_task``) into two shared helpers
+# (:func:`_validate_nonempty_name` / :func:`_validate_nonempty_value`)
+# and threads them into the un-guarded tools at the top of each
+# handler — *before* T39's name normalization so a caller passing
+# ``name=""`` still sees the loud empty-name error rather than the
+# normalized form ``".md"`` silently succeeding.
+#
+# These tests lock the T40 charter: empty inputs surface
+# :exc:`ToolError` upfront with no SB round trip (the handler
+# never fires, so the mock's PUT counter stays at zero), and the
+# wording matches the existing inline guards exactly so agents
+# that have learned the shape for one tool see the same shape
+# across all of them.
+
+
+@pytest.mark.asyncio
+async def test_t40_write_page_empty_name_returns_tool_error() -> None:
+    """``write_page(name="")`` → upfront ``ToolError("name must not be empty")``.
+
+    The guard fires before any SB round trip, before
+    :func:`_normalize_page_name`, and before
+    :func:`_check_body_size`. The agent sees the same wording as
+    :func:`create_page` so the surface is consistent across the
+    create-vs-overwrite split.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "", "content": "hello"}
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_write_page_whitespace_only_name_returns_tool_error() -> None:
+    """``write_page(name="  \\n  ")`` → upfront ``ToolError("name must not be empty")``.
+
+    Whitespace-only names are empty in practice — SB would reject
+    them downstream with a less-helpful 500. The guard catches it
+    upstream with the same wording so the agent sees one shape
+    across the empty and whitespace-only cases.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "  \n  ", "content": "hello"},
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_write_page_empty_content_returns_tool_error() -> None:
+    """``write_page(content="")`` → upfront ``ToolError("content must not be empty")``.
+
+    A zero-byte overwrite is almost certainly a caller bug
+    (``write_page` is overwrite-or-create; for an empty body the
+    caller wants ``delete_page``). The guard fires before any
+    SB round trip. Wording matches :func:`prepend_to_page`'s
+    existing ``content must not be empty`` style.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "Foo", "content": ""}
+        )
+
+    assert result.is_error is True
+    assert "content must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_write_page_whitespace_only_content_returns_tool_error() -> None:
+    """``write_page(content="  ")`` → upfront ``ToolError("content must not be empty")``.
+
+    Whitespace-only content is empty in practice. Same wording
+    as the empty case so the agent sees one shape across both.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "Foo", "content": "  \t\n"},
+        )
+
+    assert result.is_error is True
+    assert "content must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_write_page_no_sb_round_trip_on_empty_inputs() -> None:
+    """Empty inputs surface the guard before any PUT fires.
+
+    A mock that 500s on PUT would otherwise surface a
+    ``silverbullet error: 500`` rather than the empty-input
+    guard — locking the no-round-trip invariant catches a
+    regression that moves the guard below the SB call.
+    """
+    seen_puts: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            seen_puts.append(request.content)
+        # Return 500 on PUT so a regression surfaces as a
+        # ``silverbullet error: 500`` rather than silent success.
+        return httpx.Response(500, text="boom")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        for empty in ({"name": "", "content": "x"}, {"name": "x", "content": ""}):
+            result = await client.call_tool("write_page", empty)
+            assert result.is_error is True
+            assert "must not be empty" in _text(result)
+
+    assert seen_puts == []
+
+
+@pytest.mark.asyncio
+async def test_t40_delete_page_empty_name_returns_tool_error() -> None:
+    """``delete_page(name="")`` → upfront ``ToolError("name must not be empty")``.
+
+    Same wording as :func:`write_page` / :func:`create_page` so
+    the agent sees one shape across all ``name``-taking tools.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "delete_page", {"name": ""}
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_move_page_empty_source_name_returns_tool_error() -> None:
+    """``move_page(name="", new_name="Foo")`` → upfront ``ToolError("name must not be empty")``.
+
+    The guard fires on the source ``name`` before any SB round
+    trip. Wording matches the other ``name``-taking tools.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page",
+            {"name": "", "new_name": "Foo"},
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_move_page_empty_destination_name_returns_tool_error() -> None:
+    """``move_page(name="Foo", new_name="")`` → upfront ``ToolError("name must not be empty")``.
+
+    The guard fires on the destination ``new_name`` before any
+    SB round trip. Both ``name`` and ``new_name`` are guarded
+    by the same helper so the wording matches.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page",
+            {"name": "Foo", "new_name": ""},
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_move_page_both_empty_returns_tool_error() -> None:
+    """``move_page(name="", new_name="")`` → upfront ``ToolError("name must not be empty")``.
+
+    Both guards fire (the source guard runs first); the agent
+    sees one error message rather than two. Whichever the source
+    guard surfaces, the wording is consistent with the rest of
+    the bridge.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "move_page",
+            {"name": "", "new_name": ""},
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_patch_page_lines_empty_name_returns_tool_error() -> None:
+    """``patch_page_lines(name="", ...)`` → upfront ``ToolError("name must not be empty")``.
+
+    The guard fires before the ``start_line`` / ``end_line`` /
+    ``new_content`` checks (a caller passing ``name=""`` plus
+    out-of-bounds line numbers would otherwise see the line-
+    range error first, which is misleading). Wording matches
+    the other ``name``-taking tools.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "",
+                "start_line": 1,
+                "end_line": 1,
+                "new_content": "x",
+            },
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_patch_page_replace_empty_new_string_does_NOT_raise() -> None:
+    """``patch_page_replace(new_string="")`` is the documented "delete match" path.
+
+    T40's charter originally proposed guarding ``new_string``
+    too, but the surface explicitly documents
+    ``new_string=""`` as "delete every match"
+    (``"abcdefg".replace("cd", "")`` is ``"abefg"``). The
+    ticket's intent was the four tools with no guard at all;
+    :func:`patch_page_replace` already has the ``find`` guard
+    (the half that prevents a runaway match-everywhere), and
+    the ``new_string`` empty case is a legitimate edit, not a
+    caller bug. This test locks the *absence* of the guard so
+    a future "consistency" change doesn't accidentally
+    regress the documented delete-match path.
+    """
+    seen_writes: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text="abcdefg")
+        seen_writes.append(request.content)
+        return httpx.Response(200, headers={"ETag": '"v2"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index.md",
+                "find": "cd",
+                "new_string": "",
+            },
+        )
+
+    assert result.is_error is False
+    # ``cd`` is a single match → ``replace_all=False`` succeeds
+    # with a deletion. The PUT writes ``"abefg"``.
+    assert seen_writes == [b"abefg"]
+
+
+@pytest.mark.asyncio
+async def test_t40_create_page_empty_name_still_uses_shared_helper() -> None:
+    """``create_page(name="")`` → upfront ``ToolError("name must not be empty")``.
+
+    The pre-existing inline guard on :func:`create_page` is
+    replaced with :func:`_validate_nonempty_name` in T40 so the
+    wording and shape stay consistent across all name-taking
+    tools. This test pins the surface; the wording has not
+    changed (``"name must not be empty"`` is exactly what the
+    inline guard already said).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "create_page", {"name": "", "content": "hello"}
+        )
+
+    assert result.is_error is True
+    assert "name must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_check_task_empty_ref_still_uses_shared_helper() -> None:
+    """``check_task(ref="")`` → upfront ``ToolError("ref must not be empty")``.
+
+    The pre-existing inline guard on :func:`check_task` is
+    replaced with :func:`_validate_nonempty_value(ref,
+    label="ref")` in T40. The wording is unchanged; the test
+    pins the surface so a future threading change can't
+    silently rename ``ref`` to ``name`` (which would be wrong
+    — ``ref`` is a wikilink target, not a page name).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "check_task",
+            {"page": "Foo", "ref": "", "state": "done"},
+        )
+
+    assert result.is_error is True
+    assert "ref must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_append_to_page_empty_text_still_uses_shared_helper() -> None:
+    """``append_to_page(text="")`` → upfront ``ToolError("text must not be empty")``.
+
+    The pre-existing inline guard on :func:`append_to_page` is
+    replaced with :func:`_validate_nonempty_value(text,
+    label="text")` in T40. Wording unchanged; test pins the
+    surface so a future threading change can't silently rename
+    ``text`` to ``content``.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "Foo", "text": ""},
+        )
+
+    assert result.is_error is True
+    assert "text must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_prepend_to_page_empty_content_still_uses_shared_helper() -> None:
+    """``prepend_to_page(content="")`` → upfront ``ToolError("content must not be empty")``.
+
+    The pre-existing inline guard on :func:`prepend_to_page` is
+    replaced with :func:`_validate_nonempty_value(content,
+    label="content")` in T40. Wording unchanged; test pins the
+    surface so a future threading change can't silently rename
+    ``content`` to ``text`` (which would be wrong — the two
+    tools' parameters are different).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "prepend_to_page",
+            {"name": "Foo", "content": ""},
+        )
+
+    assert result.is_error is True
+    assert "content must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_patch_page_replace_empty_find_still_uses_shared_helper() -> None:
+    """``patch_page_replace(find="")`` → upfront ``ToolError("find must not be empty")``.
+
+    The pre-existing inline guard on :func:`patch_page_replace`
+    is replaced with :func:`_validate_nonempty_value(find,
+    label="find")` in T40. Wording unchanged; the guard still
+    fires upfront so the runaway ``match between every char``
+    case is rejected before any SB round trip.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "Foo",
+                "find": "",
+                "new_string": "x",
+            },
+        )
+
+    assert result.is_error is True
+    assert "find must not be empty" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t40_normalization_runs_after_empty_guard() -> None:
+    """``write_page(name="", ...)`` → ``name must not be empty``, NOT ``".md"`` silently.
+
+    Locks the T40 ↔ T39 ordering invariant: the empty-name guard
+    fires *before* :func:`_normalize_page_name` so a caller
+    passing ``name=""`` sees the loud empty-name error rather
+    than the normalized form ``".md"`` silently succeeding
+    (which would create a page named ``.md`` — definitely not
+    what the caller meant).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page", {"name": "", "content": "hello"}
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "name must not be empty" in text
+    # The agent does *not* see the normalization-happened message
+    # (``".md"`` was the resolved form), because the empty-name
+    # guard fired first and raised before normalization could run.
+    assert "normalized" not in text.lower()
+    assert ".md" not in text
+
+
 # --- v1.3 build-map invariants ----------------------------------------
 # These tests pin the v1.3 destination against docstring drift. The
 # ``MCPServer.instructions`` string is what the MCP client sees on

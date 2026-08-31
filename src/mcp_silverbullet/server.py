@@ -291,6 +291,86 @@ def _check_body_size(body: str) -> None:
         )
 
 
+def _validate_nonempty_name(name: str) -> None:
+    """Raise ``ToolError("name must not be empty")`` when ``name`` is blank.
+
+    T40: lifts the upfront empty-name guard that
+    :func:`create_page` already shipped as an inline check, into a
+    module-scope helper threaded into every ``name``-taking write
+    tool (``write_page``, ``delete_page``, ``move_page``'s source
+    and destination, ``patch_page_lines``, ``patch_page_replace``,
+    ``check_task`'s ``page``). One helper, one shape, one message.
+
+    Rejects both empty (``""``) and whitespace-only (e.g.
+    ``"   "``, ``"\\n"``) names — SB would reject them downstream
+    with a less-helpful 500, and the agent needs to see the bug
+    pinned at the call site. Mirrors :func:`_validate_nonempty_value`
+    for body-shaped inputs.
+
+    The guard fires *before* :func:`_normalize_page_name` so a
+    caller passing ``name=""`` still sees the loud
+    ``ToolError("name must not be empty")`` rather than the
+    normalized form ``".md"`` silently succeeding. Order matters:
+    empty guards fire on the caller's raw input; normalization
+    fires on the validated input.
+
+    Wording is fixed (``"name must not be empty"``) — matches
+    the existing inline guard on :func:`create_page` so agents
+    that have learned the shape for one tool see the same shape
+    across all of them. The helper has no caller-supplied label
+    because ``name`` is always the parameter; if a future tool
+    takes a *different* shape (e.g. ``source_path``), call
+    :func:`_validate_nonempty_value` with a label instead.
+    """
+    if not name or not name.strip():
+        raise ToolError("name must not be empty")
+
+
+def _validate_nonempty_value(value: str, *, label: str) -> None:
+    """Raise ``ToolError("<label> must not be empty")`` when ``value`` is blank.
+
+    T40: parameterized sibling of :func:`_validate_nonempty_name`
+    for body-shaped inputs whose parameter name varies by tool:
+    ``content`` (``write_page`` / ``prepend_to_page``),
+    ``text`` (``append_to_page``), ``find``
+    (``patch_page_replace``), ``ref`` (``check_task``'s wikilink
+    target).
+
+    Same rejection rules as :func:`_validate_nonempty_name`:
+    empty (``""``) and whitespace-only (``"   "``, ``"\\n"``)
+    values both raise. ``label`` is the exact parameter name as
+    the agent wrote it (``"content"``, ``"text"``, ``"find"``,
+    ``"ref"``) so the error message reads naturally to the
+    caller:
+
+    - ``write_page(name="x", content="")`` →
+      ``ToolError("content must not be empty")``
+    - ``append_to_page(name="x", text="")`` →
+      ``ToolError("text must not be empty")``
+    - ``prepend_to_page(name="x", content="")`` →
+      ``ToolError("content must not be empty")``
+    - ``patch_page_replace(name="x", find="")`` →
+      ``ToolError("find must not be empty")``
+    - ``check_task(page="x", ref="")`` →
+      ``ToolError("ref must not be empty")``
+
+    The helper has no implicit default for ``label`` because a
+    wrong label produces a wrong-looking error message — the
+    caller must pass it. This matches the standing-preferences
+    rule "lift the existing guard, don't invent a new shape":
+    every existing inline guard named the parameter correctly,
+    so the threaded-in version does too.
+
+    **Not** threaded for ``patch_page_replace``'s ``new_string``:
+    empty ``new_string`` is the documented "delete every match"
+    path (``"abcdefg".replace("cd", "")`` is ``"abefg"``), not a
+    caller bug. The ticket originally proposed guarding it too;
+    the documented delete-match surface takes priority.
+    """
+    if not value or not value.strip():
+        raise ToolError(f"{label} must not be empty")
+
+
 def _normalize_page_name(name: str) -> str:
     """Resolve a caller-supplied page name to SB's canonical form.
 
@@ -1226,7 +1306,11 @@ def register_tools(
             "acknowledgement `{name, etag, size_bytes, "
             "last_modified_ms, created_ms}` so the caller can chain "
             "edits without a follow-up read (T23). 412-equivalent "
-            "ToolError on precondition failure, 413 on body > 4 MiB."
+            "ToolError on precondition failure, 413 on body > 4 MiB. "
+            "Empty / whitespace-only `name` upfront "
+            "`ToolError(\"name must not be empty\")`; empty / "
+            "whitespace-only `content` upfront "
+            "`ToolError(\"content must not be empty\")` (T40)."
         ),
     )
     async def write_page(
@@ -1234,6 +1318,22 @@ def register_tools(
         content: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T40: cheap, no-read input validation first. An empty
+        # ``name`` is almost certainly a caller bug; surface it
+        # loudly upfront before any SB round trip. The guard
+        # fires *before* :func:`_normalize_page_name` (next) so a
+        # caller passing ``name=""`` still sees
+        # ``ToolError("name must not be empty")`` rather than the
+        # normalized form ``".md"`` silently succeeding.
+        _validate_nonempty_name(name)
+        # T40: same guard for ``content`` — a zero-byte write is
+        # almost certainly a caller bug (``write_page`` is a
+        # overwrite-or-create tool, not a "set empty" tool; for
+        # an empty body the caller wants ``delete_page`` instead).
+        # The wording matches :func:`append_to_page` /
+        # :func:`prepend_to_page`'s existing ``content must not
+        # be empty`` style.
+        _validate_nonempty_value(content, label="content")
         # T39: normalize the name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip. The
         # ``name_resolution`` field on the response envelope
@@ -1305,20 +1405,15 @@ def register_tools(
         # Cheap upfront guard: an empty name is almost
         # certainly a caller bug (the caller forgot to fill
         # in the page name); surface it loudly before the
-        # round trip. Mirrors the upfront guards on the
-        # other tools (`text must not be empty`,
-        # `find must not be empty`, `ref must not be empty`).
-        # T40's charter lifts this guard to the other
-        # write tools via a shared helper; for now the
-        # inline guard stays where it is.
-        # **T40 ordering note**: this empty-input guard
-        # fires *before* T39's name normalization, so a
+        # round trip. T40 lifts this guard into the shared
+        # :func:`_validate_nonempty_name` helper so the
+        # wording matches the other tools. The helper fires
+        # *before* T39's name normalization (next), so a
         # caller passing ``name=""`` still sees the loud
         # ``ToolError("name must not be empty")`` rather
         # than the normalized form ``".md"`` silently
         # succeeding.
-        if not name or not name.strip():
-            raise ToolError("name must not be empty")
+        _validate_nonempty_name(name)
         # T39: normalize the name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip.
         # The ``name_resolution`` field on the response
@@ -1390,14 +1485,24 @@ def register_tools(
             "body length or timestamps per the design doc, so "
             "those fields are `None`. The ETag (when present) "
             "echoes the deleted body's hash so the caller can "
-            "confirm what was removed. 404-equivalent ToolError "
-            "if the page is missing."
+            "confirm what was removed. Empty / whitespace-only "
+            "`name` upfront `ToolError(\"name must not be empty\")` "
+            "(T40); 404-equivalent ToolError if the page is "
+            "missing."
         ),
     )
     async def delete_page(
         name: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T40: cheap, no-read input validation first. An empty
+        # ``name`` is almost certainly a caller bug; surface it
+        # loudly upfront before any SB round trip. The guard
+        # fires *before* :func:`_normalize_page_name` (next) so a
+        # caller passing ``name=""`` still sees
+        # ``ToolError("name must not be empty")`` rather than the
+        # normalized form ``".md"`` silently succeeding.
+        _validate_nonempty_name(name)
         # T39: normalize the name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip. The
         # ``name_resolution`` field on the response envelope
@@ -1455,7 +1560,8 @@ def register_tools(
             "would have succeeded), and the tool reports back what "
             "would have changed. `dry_run=True` with `if_match=\"*\"` "
             "is the same as a live `if_match=\"*\"`: a missing page "
-            "404s on the read."
+            "404s on the read. Empty / whitespace-only `text` "
+            "upfront `ToolError(\"text must not be empty\")` (T40)."
         ),
     )
     async def append_to_page(
@@ -1470,8 +1576,10 @@ def register_tools(
         # trip isn't wasted on a no-op. ``write_page(name, content)``
         # is the right tool for "create with this body" and
         # ``append_to_page(name, "")`` would only ever mean that.
-        if not text:
-            raise ToolError("text must not be empty")
+        # T40: shared helper threaded here so the wording matches
+        # the other tools (``content must not be empty``,
+        # ``new_string must not be empty``, etc.).
+        _validate_nonempty_value(text, label="text")
         # T39: normalize the name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip. The
         # ``name_resolution`` field on the response envelope
@@ -1596,8 +1704,10 @@ def register_tools(
         # fill it in); surface it loudly upfront so the
         # read-modify-write round trip isn't wasted. Mirrors
         # the empty-``text`` guard on ``append_to_page``.
-        if not content:
-            raise ToolError("content must not be empty")
+        # T40: shared helper threaded here for wording consistency
+        # across tools (``text must not be empty``,
+        # ``find must not be empty``, ``ref must not be empty``).
+        _validate_nonempty_value(content, label="content")
         # Validate ``position`` upfront — an unknown value
         # is almost certainly a typo (``"topmost"``,
         # ``"first"``, ``"above_frontmatter"``, ...). The
@@ -1717,7 +1827,9 @@ def register_tools(
             "input-validation errors above still fire on dry-run — "
             "a caller that passes an inverted range shouldn't get a "
             "vague \"would have failed\" back, they get the same "
-            "specific ToolError the live path would surface."
+            "specific ToolError the live path would surface. Empty "
+            "/ whitespace-only `name` upfront "
+            "`ToolError(\"name must not be empty\")` (T40)."
         ),
     )
     async def patch_page_lines(
@@ -1728,6 +1840,14 @@ def register_tools(
         if_match: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, object]:
+        # T40: cheap, no-read input validation first. An empty
+        # ``name`` is almost certainly a caller bug; surface it
+        # loudly upfront before any SB round trip. The guard
+        # fires *before* :func:`_normalize_page_name` (below) so
+        # a caller passing ``name=""`` still sees
+        # ``ToolError("name must not be empty")`` rather than the
+        # normalized form ``".md"`` silently succeeding.
+        _validate_nonempty_name(name)
         # Cheap, no-read input validation first: a non-positive
         # start_line or an inverted range can't be helped by reading
         # the page (line_count is undefined until then), so the
@@ -1868,8 +1988,17 @@ def register_tools(
         # read-modify-write round trip isn't wasted and the bug is
         # pinned at the call site. Same pattern as
         # :func:`append_to_page`'s ``text must not be empty``.
-        if not find:
-            raise ToolError("find must not be empty")
+        # T40: shared helper threaded here for wording consistency
+        # across tools.
+        _validate_nonempty_value(find, label="find")
+        # NOTE: ``new_string=""`` is *legitimately* the "delete
+        # every match" path (``"abcdefg".replace("cd", "")`` is
+        # ``"abefg"``); the ticket originally proposed guarding
+        # it, but that's a documented surface (``pass new_string=""
+        # to delete the match``), not a caller bug. T40's actual
+        # scope is the four tools with no upfront guards at all;
+        # this tool already has the ``find`` guard, which is the
+        # half that prevents a runaway match-everywhere.
         # T39: normalize the name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip. The
         # ``name_resolution`` field on the response envelope
@@ -1979,7 +2108,10 @@ def register_tools(
             "to {new_name} but failed to delete {name}: <reason>; "
             "both now exist` so the caller can clean up the "
             "duplicate, 413 if the body exceeds 4 MiB on the "
-            "destination write."
+            "destination write. Empty / whitespace-only `name` or "
+            "`new_name` upfront `ToolError(\"name must not be "
+            "empty\")` (T40) — both args share the guard so the "
+            "wording is consistent."
         ),
     )
     async def move_page(
@@ -1987,6 +2119,16 @@ def register_tools(
         new_name: str,
         if_match: str | None = None,
     ) -> dict[str, object]:
+        # T40: cheap, no-read input validation first. An empty
+        # ``name`` or ``new_name`` is almost certainly a caller
+        # bug; surface it loudly upfront before any SB round
+        # trip. The guards fire *before*
+        # :func:`_normalize_page_name` (below) so a caller
+        # passing ``name=""`` or ``new_name=""`` still sees
+        # ``ToolError("name must not be empty")`` rather than
+        # the normalized form ``".md"`` silently succeeding.
+        _validate_nonempty_name(name)
+        _validate_nonempty_name(new_name)
         # T39: normalize both the source and destination names
         # (strip whitespace, append ``.md`` to bare names) before
         # the SB round trips. The source's ``name_resolution``
@@ -2497,9 +2639,9 @@ def register_tools(
         # failure than \"no task with ref on page\". Mirrors
         # the upfront guards on the other read-modify-write
         # tools (``append_to_page`'s empty-text,
-        # ``patch_page_replace`'s empty-find).
-        if not ref:
-            raise ToolError("ref must not be empty")
+        # ``patch_page_replace`'s empty-find). T40: shared
+        # helper threaded here for wording consistency.
+        _validate_nonempty_value(ref, label="ref")
         target_marker = _validate_check_task_state(state)
         # T39: normalize the page name (strip whitespace, append
         # ``.md`` to bare names) before the SB round trip. The
