@@ -142,13 +142,12 @@ all unblocked, all on the frontier. None claimed this
 session — the user asked for a chart-only pass, not a
 resolution.
 
-**Status as of 2026-08-31**: T39 + T40 shipped
-(commits `39f7c` and `50f03`). Remaining on the
-frontier: T41 (doc clarifications — unblocked since
-T39 shipped), T42 (412 contention hint), T43
-(CF 5xx `cf_hint` envelope — charted this session),
-T44 (fix T31b's false-positive — charted this
-session).
+**Status as of 2026-08-31**: T39 + T40 + T44
+shipped (commits `39f7c` and `50f03`; T44 ships in
+this session). Remaining on the frontier: T41 (doc
+clarifications — unblocked since T39 shipped), T42
+(412 contention hint), T43 (CF 5xx `cf_hint`
+envelope — charted this session).
 
 ## Notes
 
@@ -238,6 +237,7 @@ ticket's resolution below -->
 - [Chart pass, 2026-08-30](#status): v1.5 destination named ("agent-experience hardening"); T39 (name normalization for `.md` suffix), T40 (upfront empty-input validation across the remaining write tools), T41 (doc clarifications — index.md source-vs-render, move_page no-op, `.md`-suffix convention note), T42 (412 contention hint) charted with full detail below; T43 (CF 5xx `cf_hint` envelope — b11, the user's 2026-08-31 CF 502 incident) charted in this session and is on the frontier; T44 (fix T31b's false-positive "concurrent edit detected" — b12, the user's 2026-08-31 patch_page_replace-lies-about-412 report) charted in this session and is on the frontier; b2 / b3 / the pydantic-URL observation from the prior turn closed as out-of-scope (the bridge's current code doesn't reproduce those claims) and recorded under `## Drive-by`; v1.4's T37 / T38 are still on the v1.4 frontier (this map doesn't re-litigate them).
 - [T39 (2026-08-31)](#t39-normalize-name-inputs-to-handle-the-md-suffix-split-b1-b6): option A (auto-append `.md`) + a `name_resolution` envelope field that teaches the agent the convention for its next call; helper `_normalize_page_name(name)` at module scope in `server.py` (pure, idempotent, strips whitespace, appends `.md` to bare basenames); threaded into 12 call sites across 10 tools + the resource template + the hydration walker; error wording references the *resolved* name (consistent with the success-path envelope); behavior-changing for any v1 / v1.1 / v1.2 / v1.3 caller that explicitly passes a bare `name` and expected a 500-shaped error.
 - [T40 (2026-08-31)](#t40-lift-upfront-empty-input-validation-across-the-remaining-write-tools-b9): two shared helpers in `server.py` — `_validate_nonempty_name(name)` (`ToolError("name must not be empty")`) + `_validate_nonempty_value(value, *, label)` (`ToolError("<label> must not be empty")`); threaded into 7 call sites across 4 previously-unguarded tools (`write_page` name + content, `delete_page`, `move_page` source + destination, `patch_page_lines`) + 5 already-guarded tools lifted into the helper for wording consistency (`create_page`, `append_to_page`, `prepend_to_page`, `patch_page_replace`'s `find`, `check_task`'s `ref`); guards fire *before* T39's name normalization so empty `name` raises loudly rather than normalizing to `".md"` silently; **drive-by deviation from the ticket's charter**: `patch_page_replace`'s `new_string=""` is the documented "delete every match" path, NOT a caller bug, so it's deliberately NOT guarded (a dedicated test pins the surface against accidental future guarding); 17 new Layer-1 cases in `tests/test_tools_in_memory.py`; 245 in-memory + 496 total tests pass.
+- [T44 (2026-08-31)](#t44-fix-t31bs-false-positive-concurrent-edit-detected-b12): single code change in `synthesize_etag` — the synthesized form went from `"{last_modified_ms}-{size_bytes}"` to `"{size_bytes}"` alone. Root cause: the bridge stamps `X-Last-Modified` with `now_ms` on every PUT (`_WRITE_HEADERS`), so the pre-T44 dashed form drifted on every write and T31b's post-write verification raised `ToolError("concurrent edit detected: …")` on every successful write where the write actually succeeded. Size alone is the correct primitive (same body → same size → same etag; different body → different size → different etag). **Wire-shape breaking change** for v1.3 / v1.4 callers holding a synthesized etag across calls (CHANGELOG migration note: re-read once after T44 lands to pick up the new canonical form); real `ETag` headers (the v1.3 contract path) are unaffected. Trade-offs: dropped the `"{ms}"` fallback (a proxy that strips `X-Content-Length` now returns `None` rather than a weaker primitive that tracked the *when* drift); lost pre-write concurrent-edit detection on SBs that strip `ETag` (post-write verification still catches the common case). One new Layer-1 test reproduces the user's defect on a realistic mock; six existing tests in `test_sb_client.py` updated for the new shape; `test_e2e_live_sb.py` updated to construct the new form and assert the new wire shape; `docs/design.md` § SilverBullet client contract + § Tools § Status-code mapping 412 row + `README.md` concurrency section + `CHANGELOG.md` v1.5 `### Changed` entry document the migration; 497 total tests pass.
 
 ## Not yet specified
 
@@ -1203,8 +1203,17 @@ shipped); T42 unchanged (independent).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed + resolved 2026-08-31)
+> **Status**: ✅ resolved (commits `4ec6b` resolve + `78de8` map close)
+> **Question**: How does the bridge stop
+> raising `concurrent edit detected` on every
+> successful write — by changing T31a's
+> synthesized etag to drop the mtime component
+> (use only `X-Content-Length`) so re-reads of
+> the same body return the same etag, while
+> preserving the "different body → different
+> etag" property the concurrency primitive
+> relies on?
 > **Question**: How does the bridge stop
 > raising `concurrent edit detected` on every
 > successful write — by changing T31a's
@@ -1435,3 +1444,179 @@ shipped); T42 unchanged (independent).
 > `_etag_from_response` — real etag wins
 > when present, synthesized fallback when
 > not).
+>
+> **Resolution** (positive, 2026-08-31;
+> commits `4ec6b` resolve + `78de8` map close):
+> shipped in `src/mcp_silverbullet/sb_client.py`,
+> `tests/test_sb_client.py`,
+> `tests/test_tools_in_memory.py`,
+> `tests/test_e2e_live_sb.py`, `docs/design.md`,
+> `README.md`, `CHANGELOG.md`. The single
+> code change is in `synthesize_etag`:
+>
+> - **Before**: `synthesize_etag(ms, bytes)`
+>   returned `"{ms}-{bytes}"` when both
+>   fields were present, `"{ms}"` alone when
+>   only the timestamp was populated, and
+>   `None` when neither was available.
+> - **After**: `synthesize_etag(ms, bytes)`
+>   returns `"{bytes}"` when `bytes` is
+>   present, `None` otherwise. The
+>   `last_modified_ms` parameter is retained
+>   (so call sites don't need to change) but
+>   is unused.
+>
+> Root cause (per the chart): the bridge
+> stamps `X-Last-Modified` with `now_ms` on
+> every PUT request (`_WRITE_HEADERS` at
+> `sb_client.py:411`). With the pre-T44 dashed
+> form, two reads of the same body produced
+> different synthesized etags (different
+> `now_ms` stamps on each PUT) — the mtime
+> component was tracking *when* a write
+> happened independently of *what* it wrote.
+> T31b's post-write verification
+> (`_verify_concurrency_token` in
+> `server.py:472`) compared the post-write
+> re-read against the pre-write read and
+> raised `ToolError("concurrent edit detected:
+> the page changed since you read it at
+> {expected_etag}; …")` on every successful
+> write where the write actually succeeded.
+> The bridge was lying about 412 on every
+> read-modify-write tool's happy path
+> (`patch_page_replace` / `append_to_page` /
+> `prepend_to_page` / `patch_page_lines` /
+> `check_task`).
+>
+> Why size-only is the correct primitive: the
+> concurrency check needs to differ between
+> two *different* bodies — a body-length-
+> derived value satisfies that (same body →
+> same size → same etag; different body →
+> different size → different etag). The
+> pre-T44 mtime component tracked the wrong
+> axis (*when* a write happened) and drifted
+> on every write because the bridge itself
+> stamps the value.
+>
+> Trade-offs (deliberate, per the ticket's
+> `Out of scope` section):
+>
+> - **Wire-shape change**: the synthesized
+>   form went from `"{mtime}-{size}"` to
+>   `"{size}"`. Backwards-incompatible for
+>   v1.3 / v1.4 callers holding a
+>   synthesized etag across calls. The
+>   `CHANGELOG.md` v1.5 `[Unreleased]` entry
+>   documents the migration: any caller that
+>   persists an etag across calls should
+>   re-read once after T44 lands to pick up
+>   the new canonical form. Real `ETag`
+>   headers (the v1.3 contract path on SBs
+>   that emit them) are unaffected.
+> - **Pre-T44 `"{ms}"` fallback dropped**: a
+>   proxy that strips `X-Content-Length` but
+>   keeps `X-Last-Modified` now returns
+>   `None` (agent loses the concurrency
+>   primitive entirely) rather than offering
+>   the weaker `"{ms}"` value. The weaker
+>   value couldn't distinguish two writes in
+>   the same epoch-ms window with different
+>   bodies *and* it was the source of the
+>   T31b false-positive. Returning `None`
+>   here is the honest answer: the bridge
+>   has no useful primitive to offer when
+>   `X-Content-Length` is stripped. Same
+>   posture as a fully-stripped response
+>   pre-T31a.
+> - **Pre-write concurrent-edit detection
+>   lost** (acknowledged in the ticket's
+>   `Out of scope`): on SBs that strip
+>   `ETag`, T31a's pre-T44 mtime drift made
+>   pre-write concurrent edits detectable on
+>   the rare proxy that echoes the *caller's*
+>   `X-Last-Modified` rather than SB's
+>   store-time. Post-T44 the bridge detects
+>   pre-write concurrent edits only via body
+>   change (different body → different size
+>   → different etag). The T31b post-write
+>   verification still catches the post-write
+>   race (the more common case) — T44 drops
+>   only the unreliable pre-write race
+>   detection.
+>
+> Tests updated:
+>
+> - `tests/test_sb_client.py` — three
+>   `synthesize_etag` unit tests rewritten
+>   (the dashed-form test, the ms-only test,
+>   and the "size without mtime" test) plus
+>   three higher-level integration tests
+>   (`test_write_page_meta_etag_synthesized_when_etag_header_missing`,
+>   `test_read_page_meta_etag_synthesized_when_etag_header_missing`,
+>   `test_synthesized_etag_is_stable_across_re_reads_of_same_body`,
+>   `test_synthesized_etag_differs_when_body_changes`).
+>   The drift test now uses body-length drift
+>   (different bodies → different sizes →
+>   different synthesized etags) rather than
+>   mtime drift. Docstrings updated to
+>   explain the T44 wire-shape change and
+>   why size alone is the correct primitive.
+> - `tests/test_tools_in_memory.py` — one
+>   new test (`test_t31b_write_page_verification_passes_when_synthesized_etag_unchanged`)
+>   that reproduces the user's defect on a
+>   realistic mock (different `X-Last-Modified`
+>   values on the pre-write read vs the
+>   post-write re-read, same body, body
+>   unchanged) and asserts the tool returns
+>   the T23 ack envelope. Pre-fix this test
+>   failed with
+>   `'concurrent edit detected: the page changed since you read it at "1700000000000-4"'`
+>   — the exact wording the user reported.
+>   The existing two T31b happy-path tests
+>   continue to pass byte-for-byte (their
+>   mocks used real `ETag` headers which
+>   aren't affected by the synthesized-form
+>   change).
+> - `tests/test_e2e_live_sb.py` — both
+>   `etag_a = f'"{last_modified_a}-{size_a}"`'
+>   fallback branches updated to
+>   `etag_a = f'"{size_a}"`'`; the live
+>   drift test's `assert "-" in etag_a`
+>   shape-pin replaced with `assert
+>   etag_a.strip('"').isdigit()` (the new
+>   shape is a quoted numeric byte count).
+>
+> 497 in-memory + journal + verifier + http
+> tests pass; live e2e tests skip cleanly
+> without env vars (gated on
+> `MCP_SILVERBULLET_LIVE_SB_URL` /
+> `_TOKEN`).
+>
+> Docs updated:
+>
+> - `docs/design.md` § SilverBullet client
+>   contract caveat rewritten to document
+>   the new synthesized form, the dropped
+>   `"{ms}"` fallback, and the wire-shape
+>   migration. § Tools § Status-code mapping
+>   412 row gains a `**T44 caveat**` note
+>   pointing at the synthesized-form change
+>   and the re-read-once migration.
+> - `README.md` "Concurrency: read-then-write
+>   with current etag" section updated to
+>   reference `X-Content-Length` (the new
+>   synthesized source) and note the T44
+>   change in passing.
+> - `CHANGELOG.md` v1.5 `[Unreleased]`
+>   section's **Status** line updated to
+>   list T44 as shipped, and a new
+>   `### Changed` entry under T44 documents
+>   the wire-shape change with the
+>   migration note (caller holds a
+>   v1.3 / v1.4 synthesized etag across
+>   calls → re-read once after the fix).
+>
+> Unblocks: nothing (terminal ticket). T41 +
+> T42 + T43 remain on the frontier.
