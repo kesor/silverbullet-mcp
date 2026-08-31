@@ -2502,9 +2502,9 @@ def register_tools(
             "needs the etag for a specific page can always "
             "`read_page` it directly. Note: this filter only ever "
             "matches against page *names*; body-content search "
-            "lives behind the journal gate (T38 — see the README's "
-            "Discovery tools section, `MCP_SILVERBULLET_JOURNAL_TOOLS=1` "
-            "+ `MCP_SILVERBULLET_SPACE_PATH`)."
+            "lives behind the journal gate (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` "
+            "+ `MCP_SILVERBULLET_SPACE_PATH`; see the README's "
+            "Discovery tools (journal-gated) section)."
         ),
     )
     async def list_pages(

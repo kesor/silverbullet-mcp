@@ -83,8 +83,9 @@ the new etag on every successful write — read it and feed it back via
 - `list_tasks(page?, prefix?)` → `[{name, ref, line, state, text}][]`
   — enumerate checkbox bullets on a page (per-page form, always
   available via `GET /.fs/{page}`) or across the whole space
-  (space-walk form, requires `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and
-  `MCP_SILVERBULLET_SPACE_PATH`). `state` is the literal checkbox
+  (space-walk form, gated — see
+  [Discovery tools (journal-gated)](#discovery-tools-journal-gated)).
+  `state` is the literal checkbox
   character (`" "` for `[ ]`, `"x"` for `[x]`, `"X"` for `[X]`).
   Frontmatter-block bullets are skipped.
 - `check_task(page, ref, state="done", if_match?, dry_run=False)` —
@@ -123,19 +124,26 @@ the body to compute the patch), `if_match` is validated against the
 read's etag, and the response is `{dry_run, original, patched, diff}`.
 A no-op patch returns an empty `diff`.
 
-### Optional: journal surface
+### Discovery tools (journal-gated)
 
-Six additional tools are enabled when the bridge has direct read
-access to the SB space directory (typical on the same host that runs
-SilverBullet; rare behind a containerized split). Set both
-`MCP_SILVERBULLET_SPACE_PATH` (absolute path to the space) and
-`MCP_SILVERBULLET_JOURNAL_TOOLS=1` to opt in. Without either, the
-bridge boots cleanly without these tools and logs a single
-INFO/WARN line.
+When `list_pages(prefix=, contains=)` narrows the listing but the
+page you want isn't on a name match — its name doesn't contain the
+phrase, but its *body* does — the HTTP `/.fs` API can't help: SB has
+no built-in search endpoint, so substring search over page bodies
+needs filesystem access to the SB space directory. Three tools
+provide that; they live behind the **journal gate**, enabled by
+setting both:
 
-- `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`.
-- `tag_summary(prefix?)` — count occurrences of every `tags:` value.
-- `recent_pages(limit?, prefix?)` — newest pages by mtime.
+- `MCP_SILVERBULLET_SPACE_PATH` — absolute path to the SB space directory
+  (typical: same host that runs SilverBullet; rare behind a
+  containerized split).
+- `MCP_SILVERBULLET_JOURNAL_TOOLS=1` — truthy opt-in flag (`1` /
+  `true` / `yes` / `on`).
+
+Without either, the bridge boots cleanly without these tools and
+logs a single INFO/WARN line. Restart the bridge after changing
+either env var.
+
 - `pages_touching_topic(query, prefix?)` — case-insensitive
   name+content substring search; returns `{name, match, snippet}[]`
   (`match` is `"name"`, `"content"`, or `"both"`). Uses `rg --json`
@@ -152,6 +160,12 @@ INFO/WARN line.
   (`[[target|alias]]`) match the bare target. Self-links are returned
   (filter client-side). Empty / whitespace-only `target` raises
   `ToolError("target must not be empty")` upfront.
+
+Three additional journal tools (also gated, but not discovery-flavoured):
+
+- `journal_histogram(prefix?)` — bucket `*.md` pages by `YYYY-MM`.
+- `tag_summary(prefix?)` — count occurrences of every `tags:` value.
+- `recent_pages(limit?, prefix?)` — newest pages by mtime.
 
 ## Requirements
 
@@ -250,7 +264,8 @@ running in this checkout discovers the bridge automatically (via the
 `/reload` in Pi and the bridge's fourteen always-on tools register as
 direct Pi tools. The journal-surface tools register additionally
 when `MCP_SILVERBULLET_JOURNAL_TOOLS=1` and `MCP_SILVERBULLET_SPACE_PATH`
-are both set.
+are both set (see
+[Discovery tools (journal-gated)](#discovery-tools-journal-gated)).
 
 In static mode, the bearer token is read at HTTP-connect time via
 the `!command` syntax in `.mcp.json`, pointed at
@@ -283,8 +298,8 @@ try to connect until the first tool call.
 | `MCP_SILVERBULLET_HOST` | `127.0.0.1` | Bind address. |
 | `MCP_SILVERBULLET_PORT` | `8000` | Bind port. |
 | `MCP_SILVERBULLET_ALLOWED_HOSTS` | *(unset → SDK loopback default)* | Extra `Host` values, comma-separated. |
-| `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface. |
-| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the six journal tools; requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable. |
+| `MCP_SILVERBULLET_SPACE_PATH` | *(unset)* | Absolute path to the SB space directory; required to enable the journal surface (see [Discovery tools (journal-gated)](#discovery-tools-journal-gated)). |
+| `MCP_SILVERBULLET_JOURNAL_TOOLS` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) enables the six journal tools; requires `MCP_SILVERBULLET_SPACE_PATH` to be set and readable (see [Discovery tools (journal-gated)](#discovery-tools-journal-gated)). |
 | `MCP_SILVERBULLET_LIST_PAGES_HYDRATE_ETAGS` | *(unset)* | Truthy enables per-page etag-hydration on `list_pages`. Default off (N+1 cost is opt-in). The SB list payload omits the etag field on this build; an operator who needs `if_match` round-trips from a list call pays one GET per row to hydrate. |
 | `MCP_SILVERBULLET_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. `DEBUG` dumps sanitized HTTP request metadata and classifies uvicorn's opaque `Invalid HTTP request received` warnings (HTTP/2 preface vs TLS ClientHello vs junk). `UVICORN_LOG_LEVEL` is ignored — uvicorn is configured from this var. |
 | `MCP_SILVERBULLET_DEBUG` | *(unset)* | Truthy (`1` / `true` / `yes` / `on`) is a one-knob alias for `LOG_LEVEL=debug`. Explicit `LOG_LEVEL` wins if both are set. |

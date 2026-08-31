@@ -11,7 +11,7 @@ tickets; this file records what's already shipped.
 ## [v1.4] — JWT inbound auth + discovery-surface clarity
 
 Build map: [`docs/wayfinder/map-v1.4.md`](docs/wayfinder/map-v1.4.md).
-**Status: T37 shipped 2026-08-31; T38 still on the frontier** —
+**Status: T37 + T38 shipped 2026-08-31; v1.4 destination reached** —
 the inbound auth surface widened from "one shared secret" to a JWT
 mode that validates per-user tokens against an IdP's JWKS
 (default config targets Cloudflare Access; the v1.x
@@ -19,9 +19,10 @@ static-token mode stays available via
 `MCP_SILVERBULLET_AUTH_MODE=static`). T37 widens `list_pages`'s
 filter surface so an operator who reads "filtered by prefix" as
 substring has an explicit `contains=` knob (see Added below);
-T38 will surface the journal gate's purpose and opt-in path
-more loudly in the README and tool descriptions (a follow-up
-session).
+T38 surfaces the journal gate's purpose and opt-in path more
+loudly in the README and `list_pages`'s tool description so an
+operator who hits a "no body search" dead end has an obvious
+next step.
 
 v1.3 closed on 2026-08-30; v1.4 takes the bridge from
 "single-user behind a tunnel" to "per-user authenticated by
@@ -103,9 +104,38 @@ per-user SB credentials to thread off of.
   parameter; the new `contains=` parameter is purely
   additive. Closes the bug-report surface where an
   operator reads "filtered by prefix" as substring
-  and now has an explicit knob. T38 (journal gate
-  docs) remains on the frontier; this entry ships
-  T37 alone.
+  and now has an explicit knob.
+- **T38 journal-gate discovery pointer** — the
+  README's `### Optional: journal surface` section
+  is renamed to `### Discovery tools (journal-gated)`
+  and reframed around the three discovery tools
+  (`pages_touching_topic`, `search_pages`,
+  `find_backlinks`), with the two env vars that
+  unlock them (`MCP_SILVERBULLET_SPACE_PATH` +
+  `MCP_SILVERBULLET_JOURNAL_TOOLS=1`) named in the
+  preamble so an operator who hits a "no body
+  search" dead end has an obvious next step rather
+  than relitigating the scope. The `list_pages`
+  tool description gains a one-sentence pointer at
+  the same gate (matching the charter exactly:
+  "Body-content search lives behind the journal gate
+  (`MCP_SILVERBULLET_JOURNAL_TOOLS=1` +
+  `MCP_SILVERBULLET_SPACE_PATH`); this filter only
+  ever matches against page names."). The env-var
+  table rows for both gate vars gain a parenthetical
+  pointing at the new section. `docs/design.md`
+  § What we are not doing gains a dedicated
+  bullet on body-substring search without the
+  gate: SB exposes no HTTP search endpoint, the
+  bridge has no way to substring-search page bodies
+  without filesystem access, and the gate is the
+  only path. Layer-1 test
+  `test_t38_list_pages_description_points_at_journal_gate`
+  pins the description's gate pointer. No behavior
+  change; no wire-shape change; the journal gate
+  stays exactly as it was (the surface the bug
+  reporter wanted was already shipped — T38 makes
+  it discoverable).
 
 ## [Unreleased] — v1.5 (agent-experience hardening)
 

@@ -4252,6 +4252,62 @@ async def test_list_pages_hydration_runs_after_prefix_filter() -> None:
     assert names == ["journal/2026-01-01.md", "journal/2026-01-02.md"]
 
 
+# --- T38: journal-gate discovery pointer in list_pages description ----
+#
+# T38 surfaces the journal gate at the points of contact so an
+# operator who hits `list_pages(contains=...)` and still can't find
+# a page (because the substring lives in a body, not a name) has
+# an obvious next step. The pointer sits in two places:
+#
+#   1. The `list_pages` tool description — the agent sees it on
+#      `list_tools` *before* the agent makes the call.
+#   2. The README's "Discovery tools (journal-gated)" section —
+#      the operator sees it when reading docs after the agent
+#      failed to find the page.
+#
+# The test pins the description's T38 sentence so a future
+# edit can't silently drop the pointer — the consequence of
+# dropping it is exactly the bug reporter's experience (no
+# `search_*` tool, no obvious next step).
+
+
+@pytest.mark.asyncio
+async def test_t38_list_pages_description_points_at_journal_gate() -> None:
+    """T38: ``list_pages`` description names the journal gate.
+
+    Locks the description sentence: ``list_pages``'s filter only
+    ever matches against page *names*; body-content search lives
+    behind the journal gate (`MCP_SILVERBULLET_JOURNAL_TOOLS=1`
+    + `MCP_SILVERBULLET_SPACE_PATH`). The bug reporter filed a
+    ticket against a build where this pointer was missing; T38
+    makes the gate visible at the point of contact.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"v1"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        tools = await client.list_tools()
+        by_name = {t.name: t for t in tools.tools}
+        description = by_name["list_pages"].description
+    assert "matches against page *names*" in description, (
+        "T38: list_pages description should clarify the filter "
+        "matches against names only, not bodies"
+    )
+    assert "body-content search" in description, (
+        "T38: list_pages description should mention body-content "
+        "search as the missing axis"
+    )
+    assert "MCP_SILVERBULLET_JOURNAL_TOOLS=1" in description, (
+        "T38: list_pages description should name the journal-gate "
+        "opt-in env var by name"
+    )
+    assert "MCP_SILVERBULLET_SPACE_PATH" in description, (
+        "T38: list_pages description should name the journal-gate "
+        "space-path env var by name"
+    )
+
+
 # --- move_page --------------------------------------------------------
 
 
