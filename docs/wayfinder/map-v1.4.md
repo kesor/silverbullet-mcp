@@ -147,7 +147,8 @@ later session.
 <!-- index only — one line per closed ticket, link to the
 ticket's resolution below -->
 
-- [Chart pass, 2026-08-30](#status): v1.4 destination named ("clarify the discovery surface for operators without the journal gate"); T37 (substring filter) and T38 (gate docs) charted with full detail below; the bug reporter's "implement Space Lua search" suggestion closed as out-of-scope (SilverBullet feature, not a bridge feature; the bridge has no path to it) and recorded under `## Out of scope`; T37 / T38 are now on the frontier (both unblocked, neither claimed).
+- [Chart pass, 2026-08-30](#status): v1.4 destination named ("clarify the discovery surface for operators without the journal gate"); T37 (substring filter) and T38 (gate docs) charted with full detail below; the bug reporter's "implement Space Lua search" suggestion closed as out-of-scope (SilverBullet feature, not a bridge feature; the bridge has no path to it) and recorded under `## Out of scope`; T37 / T38 were on the frontier (both unblocked, neither claimed) at chart time.
+- [T37 (2026-08-31)](#t37-widen-list_pages-filter-to-also-accept-substring-matching): new `contains: str = ""` parameter on `list_pages` (parallel to the v1 `prefix=` filter); substring matching against page name; AND-composes with `prefix=` when both are set; either empty is a no-op for that criterion; both empty returns the full listing; runs client-side *before* per-page hydration (same ordering invariant T28 locked for `prefix=`); wire surface unchanged for v1 / v1.1 / v1.2 / v1.3 callers (the new parameter is purely additive); 4 new Layer-1 cases in `tests/test_tools_in_memory.py`; `docs/design.md` § Tools row + `README.md` tool inventory updated; `CHANGELOG.md` v1.4 header corrected and `### Added` section gains a T37 entry; T38 unblocked (the gate docs can now reference the new `contains=` parameter as the example of a name-only filter). **Status as of 2026-08-31**: T37 shipped; **T38 remains on the frontier** (unblocked, unclaimed).
 
 ## Not yet specified
 
@@ -225,8 +226,8 @@ ordering and an explicit "Blocks:" line per ticket).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: pi (claimed 2026-08-31)
-> **Status**: 🟡 open — claimed, working
+> **Assignee**: pi (claimed + resolved 2026-08-31)
+> **Status**: 🟢 closed — shipped 2026-08-31 (commit `205b1`)
 > **Question**: How does `list_pages` accept substring matching
 > alongside its existing `startswith` `prefix=` filter, without
 > breaking the v1 / v1.1 / v1.2 / v1.3 wire surface?
@@ -306,6 +307,133 @@ ordering and an explicit "Blocks:" line per ticket).
 > `## Out of scope`); renaming `prefix=` to a more
 > general `query=` (no benefit over adding
 > `contains=`; would break the wire surface).
+
+**Resolution** (positive, 2026-08-31; commit
+`205b1`): shipped in `src/mcp_silverbullet/server.py`
+and `tests/test_tools_in_memory.py`. The change is
+a one-line filter widening plus a parameter and a
+description refresh — exactly the charter:
+
+- New `contains: str = ""` parameter on
+  `list_pages`. Substring matching against page
+  name (parallel to `prefix=` which keeps v1's
+  `startswith` semantics). The two compose as
+  AND when both are set; either empty is a no-op
+  for that criterion; both empty returns the full
+  listing (v1 default). The new parameter slots
+  in as the second positional/keyword argument
+  on the tool, after `prefix=`, matching the
+  existing pattern where each filter takes a
+  default of `""` and applies only when non-empty.
+- New filter line in the handler:
+  ``if contains: metas = [m for m in metas if
+  contains in m.name]`` — runs *after* the
+  existing `prefix=` filter and *before*
+  per-page hydration, mirroring the T28
+  filter-before-hydrate ordering. A narrow
+  `contains=` reduces the per-page round-trip
+  count the same way `prefix=` does; a future
+  refactor that re-orders the filters and
+  hydration is caught by the same
+  `test_list_pages_hydration_runs_after_prefix_filter`
+  pin (T28) plus the new
+  `test_list_pages_contains_runs_before_hydration`
+  pin (T37).
+- Tool description updated to advertise both
+  parameters and the AND composition, plus a
+  one-sentence note that body-content search
+  lives behind the journal gate (T38's teaser —
+  the full T38 work is a separate ticket; this
+  sentence exists so an operator who reads the
+  description post-T37 and tries to find a
+  substring body has a clear pointer rather
+  than a dead end). The description is
+  targeted: the new parameters add a
+  one-paragraph shape at the top, the rest
+  of the v1.2 T28 hydration paragraph stays
+  unchanged.
+- No wire-shape change for v1 / v1.1 / v1.2 /
+  v1.3 callers — the existing `prefix=` surface
+  is byte-for-byte unchanged; the new
+  `contains=` parameter is purely additive. A
+  caller that already passes `prefix=` sees
+  no behavior change.
+- No new dependencies. No SDK version
+  requirement change. No new env vars. The
+  change is local to `list_pages` in
+  `server.py`.
+
+Four new Layer-1 cases in
+`tests/test_tools_in_memory.py`:
+
+1. `test_list_pages_contains_filter` — a
+   caller passing `contains="journal"`
+   against a list with `index` +
+   `journal/2026-01-01` + `trade-journal-2026-q1`
+   gets the two journal rows (substrings
+   anywhere in the name match).
+2. `test_list_pages_prefix_and_contains_compose` —
+   `prefix="journal/"` + `contains="2026"` returns
+   only the rows under the `journal/` folder that
+   also contain `2026`. The `trade-journal-…` row
+   matches `contains="journal"` but fails
+   `prefix="journal/"`, so it's excluded.
+3. `test_list_pages_contains_empty_is_full_list` —
+   `contains=""` returns the full listing (no
+   narrowing). Pins the empty-sentinel semantics
+   so a future refactor that flips the
+   empty-check doesn't silently drop rows.
+4. `test_list_pages_contains_runs_before_hydration` —
+   with hydration enabled and
+   `contains="journal"`, only the two journal
+   rows are visited for etag-hydration (the
+   `index` row's etag is irrelevant because the
+   filter discards it before the hydration
+   walker runs). Pins the
+   filter-before-hydrate ordering invariant
+   so a future refactor that re-orders the
+   pipeline surfaces as wasted SB load rather
+   than a silent regression.
+
+All 525 tests pass (521 pre-T37 + 4 new T37
+cases). Live e2e tests skip cleanly without
+env vars (gated on
+`MCP_SILVERBULLET_LIVE_SB_URL` / `_TOKEN`).
+
+Docs updated:
+
+- `docs/design.md` § Tools row for `list_pages`
+  updated: parameter column gains
+  `contains: str = ""`; the row's Side-effects
+  column gains a paragraph naming the AND
+  composition, the empty-sentinel semantics,
+  and the journal-gate scope boundary (so a
+  reader of design.md who follows the row to
+  understand the v1.4 surface sees T37's
+  shape in one place).
+- `README.md` tool inventory entry for
+  `list_pages` updated: the function signature
+  gains `(prefix?, contains?)`; the body of
+  the entry explains both filters, the AND
+  composition, and the journal-gate body-
+  search scope. The "Discovery tools
+  (journal-gated)" section's existing
+  preamble is left alone (T38 will widen
+  that section).
+- `CHANGELOG.md` v1.4 `[v1.4]` header
+  corrected: pre-T37 it said "T37 + T38
+  shipped" (forward-looking); post-T37 it
+  says "T37 shipped 2026-08-31; T38 still on
+  the frontier". The v1.4 `### Added`
+  section gains a T37 entry documenting
+  the new `contains=` parameter and the
+  AND-composition rule.
+
+T38 (journal gate docs) is now the lead
+frontier ticket on the v1.4 map. T37 was
+the blocker per the ticket's `Unblocks:`
+note; once T37 ships, T38 is unblocked and
+can be claimed by the next session.
 
 ### T38. Surface the journal gate's purpose and opt-in path more loudly
 
