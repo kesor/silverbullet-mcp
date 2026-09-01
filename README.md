@@ -112,6 +112,24 @@ re-read to compare. If a stale etag slips through, the bridge raises
 the write with the current etag")`. The fix is always the same: read
 the page again, take the new `etag` from the response, retry the write.
 
+**On a 412, the bridge tells you the next call's exact `if_match=`
+value (silent-overwrite path) or the `read_page(<name>)` call that
+gives you that value (standard path). You don't need to guess.** The
+silent-overwrite path (the W36 pattern: SB ignored `If-Match` and
+wrote anyway, the bridge's post-write re-read caught the drift)
+embeds the post-write etag in the error message — the agent's
+next call is `write_page(name, content, if_match="<that etag>")`,
+no extra round trip. The standard path (SB honored `If-Match` and
+returned 412) embeds a literal `read_page("<name>")` token pointing
+at the page; SB's 412 response body is empty on this build so the
+bridge can't surface the etag directly, but the next call is
+unambiguous. Both surfaces are byte-additive over v1.5 — an agent
+that pattern-matches on the bare `precondition failed` or
+`concurrent edit detected` prefix still matches; only agents that
+pinned the byte-for-byte full message need to update. The T42
+`[concurrent_edit_hint: true]` contention marker still rides as a
+trailing suffix after the v1.6 wording change.
+
 **Every successful write returns the new `etag`.** Pass it to the next
 `if_match` on the same page and you'll never see the concurrency error.
 

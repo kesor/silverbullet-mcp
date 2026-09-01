@@ -315,7 +315,41 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
         # an agent that knows the new marker can extract it. The
         # marker only appears when the threshold trips, so a
         # one-off 412 (the common case) is unchanged.
+        #
+        # T45: enrich the standard 412 wording with a literal
+        # ``read_page(<name>)`` pointer (the resolved page name
+        # the tool targeted) when the bridge knows the page —
+        # every per-page tool passes ``name`` to this helper;
+        # ``list_pages`` passes ``""`` and is treated as a
+        # non-page-scoped precondition (no pointer surfaces).
+        # The pointer sits between the T42-style "precondition
+        # failed; check if_match/if_none_match" prefix and the
+        # T42 ``[concurrent_edit_hint: true]`` suffix (when the
+        # contention window trips), so an agent that
+        # pattern-matches on either the bare prefix or the
+        # marker substring still matches. The standard path can't
+        # embed the current etag directly — SB's 412 response
+        # body is empty on this build (per the live SB the
+        # bridge tested against) — so the wording points the
+        # agent at ``read_page(name)``, which will return the
+        # current etag. The silent-overwrite 412
+        # (:func:`_verify_concurrency_token`) is the path where
+        # the bridge has the fresh etag in hand and the wording
+        # embeds it directly; this helper only sees the standard
+        # path.
         msg = "precondition failed; check if_match/if_none_match"
+        # T45: when the bridge knows the page that was preconditioned
+        # (every tool except ``list_pages``, which passes an empty
+        # string), surface a literal ``read_page(<name>)`` pointer so
+        # the agent doesn't have to guess the read tool's name or
+        # thread the page name itself. ``list_pages`` is the
+        # boundary case — its 412 isn't a per-page precondition (the
+        # call has no ``if_match`` surface), so an empty ``name``
+        # here means "the precondition wasn't page-scoped; just
+        # re-issue the call." Skipping the pointer for empty names
+        # keeps the message coherent in that edge case.
+        if name:
+            msg += f'; read_page("{name}") for the current etag and re-issue'
         if _contention_hint(name):
             msg += " [concurrent_edit_hint: true]"
         raise ToolError(msg) from exc
@@ -352,10 +386,26 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
 # Centralized here so future tweaks (renaming the conflict class,
 # adding the offending etag to the message) don't ripple across the
 # six call sites that thread an etag through ``if_match``.
+#
+# T45: two new placeholders — ``{name}`` (the resolved page name
+# the write targeted) and ``{current_etag}`` (the post-write etag
+# the helper just synthesized from the verification re-read).
+# The agent that followed the concurrency protocol correctly sees
+# the bridge tell it the exact ``if_match=`` value for the next
+# call, without an extra read round trip — the bridge just did
+# the read for them. Wording is byte-additive over the v1.3 /
+# v1.4 / v1.5 message: the existing prefix ("concurrent edit
+# detected: …") and the trailing "current etag" clause stay
+# verbatim; only the "on {name}" anchor and the literal
+# "if_match={current_etag}" copy-paste hint are new. An agent
+# that pattern-matches on the original "concurrent edit
+# detected" substring still matches; an agent that pinned the
+# byte-for-byte full message (a small set of T31b tests) needs
+# to update.
 _CONCURRENT_EDIT_MSG = (
-    "concurrent edit detected: the page changed since you read it at "
-    "{expected_etag}; read it again and re-issue the write with the "
-    "current etag"
+    "concurrent edit detected on {name}: the page changed since you "
+    "read it at {expected_etag}; current etag is {current_etag} — "
+    "re-issue the write with if_match={current_etag}"
 )
 
 
@@ -643,6 +693,26 @@ async def _verify_concurrency_token(
     seen on an SB that honored ``If-Match``, just delivered later
     in the round trip.
 
+    T45: the raised ``ToolError`` widens ``_CONCURRENT_EDIT_MSG``
+    from the v1.3 / v1.4 / v1.5 single-placeholder form
+    (``{expected_etag}``) to a three-placeholder form
+    (``{name}``, ``{expected_etag}``, ``current_etag``). The
+    bridge has the post-write etag in hand from this very
+    re-read, so embedding it in the wording closes the
+    "agent does an extra read to learn what the bridge already
+    knows" gap — the agent sees the literal ``if_match=`` value
+    for the next call without an extra round trip. ``name`` is
+    the *resolved* page name (the ``resolved_name`` the call
+    site threaded in, after T39's normalization) so the wording
+    matches the resolved name across the surface; ``current_etag``
+    falls back to the string ``"None"`` when SB stripped the
+    ``ETag`` header and the synthesized-etag primitive returned
+    ``None`` (the rare case; on this dev box the synthesized form
+    is ``"{size_bytes}"`` and is always populated). The wording
+    is byte-additive over the v1.3 / v1.4 / v1.5 message — an
+    agent that pattern-matches on the original
+    ``"concurrent edit detected"`` substring still matches.
+
     The helper runs only on **200 writes** (silent overwrite).
     On SBs that *do* honor ``If-Match``, the existing 412 path in
     :func:`_translate_sb_errors` still wins — cheaper than a
@@ -724,8 +794,31 @@ async def _verify_concurrency_token(
     except (ServerError, httpx.TimeoutException):
         return  # transient SB failure; verification is best-effort
     if post_meta.etag != expected_etag:
+        # T45: format with ``name`` and ``current_etag`` so the
+        # agent sees the page the write targeted (the *resolved*
+        # name, matching T39's design call — error wording
+        # references the resolved name, not the caller's raw
+        # input) and the literal ``if_match=`` value for the
+        # next call. The bridge has the post-write etag in hand
+        # (the verification re-read just synthesized it); the
+        # agent doesn't need an extra read round trip to learn
+        # it. ``post_meta.etag`` is the etag the bridge surfaces
+        # to the tool handler — ``None`` when SB stripped the
+        # ``ETag`` header and the synthesized-etag primitive
+        # returned ``None``; in that scenario the bridge can't
+        # tell the agent the next ``if_match=`` value, so the
+        # literal token is ``"None"`` and the agent falls back
+        # to the standard path (``read_page(name)``). The
+        # ``None`` case is rare on SBs that emit ``ETag`` (the
+        # common case); on this dev box the synthesized form is
+        # ``"{size_bytes}"`` and is always populated.
+        current_etag = post_meta.etag
         raise ToolError(
-            _CONCURRENT_EDIT_MSG.format(expected_etag=expected_etag)
+            _CONCURRENT_EDIT_MSG.format(
+                name=name,
+                expected_etag=expected_etag,
+                current_etag=current_etag,
+            )
         )
 
 

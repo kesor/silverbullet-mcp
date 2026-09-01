@@ -1046,7 +1046,25 @@ async def test_write_page_412_returns_tool_error_with_design_doc_wording() -> No
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool write_page: precondition failed; check if_match/if_none_match"
+    # T45: the standard 412 wording gains a literal
+    # ``read_page("index.md")`` pointer so the agent doesn't
+    # have to guess the read tool's name or thread the page
+    # name itself. The original ``precondition failed; check
+    # if_match/if_none_match`` prefix is byte-preserved so an
+    # agent that pattern-matches on the bare prefix still
+    # matches; the new suffix carries the page name in
+    # double-quotes (the resolved form, matching T39's
+    # design call) so an agent can copy-paste the read tool
+    # name + page into the next call.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool write_page: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("index.md") for the current etag and re-issue' in text
+    # No contention hint on a one-off 412 (the fixture clears
+    # the per-page counter, and a single 412 is below the
+    # threshold anyway).
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -1196,7 +1214,16 @@ async def test_delete_page_412_with_if_match_star_returns_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+    # T45: standard 412 wording gains a ``read_page("missing.md")``
+    # pointer so the agent doesn't have to guess the read tool's
+    # name. Original prefix byte-preserved; an agent that
+    # pattern-matches on the bare prefix still matches.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("missing.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -1212,7 +1239,15 @@ async def test_delete_page_412_with_stale_if_match_returns_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+    # T45: standard 412 wording gains the ``read_page("index.md")``
+    # pointer. See `test_delete_page_412_with_if_match_star_returns_tool_error`
+    # for the migration posture.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool delete_page: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("index.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -1548,7 +1583,16 @@ async def test_append_to_page_412_returns_tool_error_with_design_doc_wording() -
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool append_to_page: precondition failed; check if_match/if_none_match"
+    # T45: standard 412 wording gains the ``read_page("index.md")``
+    # pointer. See
+    # ``test_delete_page_412_with_if_match_star_returns_tool_error``
+    # for the migration posture.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool append_to_page: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("index.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -2803,7 +2847,16 @@ async def test_patch_page_lines_stale_if_match_returns_412_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool patch_page_lines: precondition failed; check if_match/if_none_match"
+    # T45: standard 412 wording gains the ``read_page("index.md")``
+    # pointer. See
+    # ``test_delete_page_412_with_if_match_star_returns_tool_error``
+    # for the migration posture.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool patch_page_lines: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("index.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -3371,10 +3424,17 @@ async def test_patch_page_replace_stale_if_match_returns_412_tool_error() -> Non
         )
 
     assert result.is_error is True
-    assert _text(result) == (
+    # T45: standard 412 wording gains the ``read_page("index.md")``
+    # pointer. See
+    # ``test_delete_page_412_with_if_match_star_returns_tool_error``
+    # for the migration posture.
+    text = _text(result)
+    assert text.startswith(
         "Error executing tool patch_page_replace: "
         "precondition failed; check if_match/if_none_match"
     )
+    assert 'read_page("index.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -5861,7 +5921,19 @@ async def test_check_task_stale_if_match_returns_412_tool_error() -> None:
         )
 
     assert result.is_error is True
-    assert _text(result) == "Error executing tool check_task: precondition failed; check if_match/if_none_match"
+    # T45: standard 412 wording gains the ``read_page("p.md")``
+    # pointer. ``check_task`` is read-modify-write so the
+    # resolved name on the standard-412 path is ``"p.md"``
+    # (the test passes ``page="p"``, which T39 normalizes to
+    # ``"p.md"`` — same convention as the other tools). See
+    # ``test_delete_page_412_with_if_match_star_returns_tool_error``
+    # for the migration posture.
+    text = _text(result)
+    assert text.startswith(
+        "Error executing tool check_task: precondition failed; check if_match/if_none_match"
+    )
+    assert 'read_page("p.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -8267,6 +8339,339 @@ async def test_t41_instructions_advertise_md_suffix_convention() -> None:
     )
 
 
+# --- T45: 412 retry guidance on the bridge surface ---------------------
+
+
+@pytest.mark.asyncio
+async def test_t45_standard_412_message_includes_read_page_pointer() -> None:
+    """T45: standard 412 ``ToolError`` carries a literal
+    ``read_page(<name>)`` pointer so the agent doesn't have to
+    guess the read tool's name.
+
+    The pre-T45 message ("precondition failed; check
+    if_match/if_none_match") gave the agent the rule but not the
+    call: it had to know that ``read_page`` is the read tool
+    and what to pass it. T45 widens the message with a literal
+    ``read_page("Foo.md")`` token (the resolved page name,
+    matching T39's design call) so the next call is a copy-paste
+    away.
+
+    The original prefix is byte-preserved — an agent that
+    pattern-matches on the bare ``precondition failed`` substring
+    still matches. Only agents that pinned the byte-for-byte
+    full message (a small set of v1.5 / earlier tests) need to
+    update; the assertion below checks the new suffix is
+    present without locking the full text.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "Foo.md", "content": "body", "if_match": "*"},
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # Original prefix still byte-preserved.
+    assert text.startswith(
+        "Error executing tool write_page: precondition failed; "
+        "check if_match/if_none_match"
+    )
+    # New suffix: literal ``read_page(<name>)`` token, with
+    # the page name in double-quotes (matching the
+    # ``read_page("Foo.md")`` shape — a copy-paste-able tool
+    # call).
+    assert 'read_page("Foo.md") for the current etag and re-issue' in text
+    # T42 hint absent (a one-off 412 is below the threshold).
+    assert "[concurrent_edit_hint:" not in text
+
+
+@pytest.mark.asyncio
+async def test_t45_standard_412_pointer_uses_resolved_name_after_t39() -> None:
+    """T45: the ``read_page(<name>)`` pointer references the
+    *resolved* name, not the caller's raw input.
+
+    T39 normalizes ``Foo`` → ``Foo.md``; the resolved name is
+    what the call actually targeted (and the only one that
+    would round-trip through ``read_page`` without a follow-up
+    404). Mirrors the existing T39 design call: error wording
+    references the resolved name, not the caller's input. A
+    caller that passes ``name="Foo"`` sees
+    ``read_page("Foo.md")`` in the 412 message, so the
+    suggested call works on the first try.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "Foo", "content": "body", "if_match": "*"},
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # The pointer names the resolved (``Foo.md``) form.
+    assert 'read_page("Foo.md")' in text
+    # And not the caller's raw input (would be a wrong-shaped
+    # pointer that 404s on the next call).
+    assert 'read_page("Foo")' not in text
+
+
+@pytest.mark.asyncio
+async def test_t45_concurrent_edit_message_includes_current_etag() -> None:
+    """T45: silent-overwrite 412 ``ToolError`` embeds the
+    current etag from the verification re-read.
+
+    The pre-T45 message ("concurrent edit detected: the page
+    changed since you read it at {expected_etag}; read it
+    again and re-issue the write with the current etag") gave
+    the agent a step-by-step recipe but no shortcut — it still
+    had to do an extra ``read_page`` to learn the current
+    etag. T45 closes that gap: the bridge has the post-write
+    etag in hand from the verification re-read, and the wording
+    embeds it directly as ``current etag is <etag>``. The
+    agent has the literal ``if_match=`` value for the next
+    call without an extra round trip.
+
+    The pre-T45 prefix is byte-preserved — an agent that
+    pattern-matches on the bare ``concurrent edit detected``
+    substring still matches (the new wording opens with the
+    same prefix, just with the resolved name inserted between
+    "on" and ":").
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            # SB ignores ``If-Match`` and writes anyway.
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        # Verification GET returns the post-write etag; the
+        # drift (``"v1"`` → ``"new"``) is what trips the helper.
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {
+                "name": "index.md",
+                "content": "body",
+                "if_match": '"v1"',
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # The bridge surfaces the post-write etag (the value the
+    # agent needs as the next ``if_match=``).
+    assert 'current etag is "new"' in text
+    # And the expected etag (so the agent sees what it sent).
+    assert '"v1"' in text
+    # The resolved name appears in the message — T39 normalizes
+    # ``index.md`` as-is (already has a ``.``).
+    assert "on index.md" in text
+
+
+@pytest.mark.asyncio
+async def test_t45_concurrent_edit_message_includes_if_match_retry_form() -> None:
+    """T45: the silent-overwrite 412 message carries the literal
+    ``if_match=<current_etag>`` token so the agent can copy-paste.
+
+    Building on the previous test's assertion
+    (``current etag is "new"`` in the message), this test
+    pins the literal ``if_match="new"`` token: the agent's
+    next-call surface is one-shot. A regression that embeds the
+    current etag as text but not as a copy-paste-able
+    ``if_match=`` token would surface here as a missing
+    substring, not as a vague "the agent still has to think"
+    failure.
+
+    The agent's retry looks like:
+    ``write_page(name="index.md", content="body",
+    if_match="new")`` — copy-paste from the previous call's
+    error message, no extra read required.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {
+                "name": "index.md",
+                "content": "body",
+                "if_match": '"v1"',
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # Literal ``if_match=<current_etag>`` token — the agent's
+    # copy-paste surface for the next call.
+    assert 'if_match="new"' in text
+
+
+@pytest.mark.asyncio
+async def test_t45_concurrent_edit_hint_marker_still_appends() -> None:
+    """T45: T42's ``[concurrent_edit_hint: true]`` marker still
+    rides on the standard 412 message after the wording change.
+
+    The pre-T45 / T42 contention marker was ``... [concurrent_edit_hint: true]``
+    appended after the bare ``precondition failed`` prefix. T45
+    inserts the ``read_page(<name>)`` suffix *between* the
+    prefix and the marker, so the full message in a contention
+    window becomes:
+    ``...; read_page("Foo.md") for the current etag and re-issue [concurrent_edit_hint: true]``.
+
+    This test fires four 412s on the standard path against the
+    same page (the 4th trips the T42 threshold) and asserts
+    that both the T45 suffix and the T42 marker appear. Pins
+    that the marker survives the wording change — an agent that
+    pattern-matches on ``[concurrent_edit_hint:`` still
+    matches after T45.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        # Three 412s: the message is the bare 412 wording plus
+        # the T45 suffix, no T42 marker (below the threshold).
+        for i in range(3):
+            result = await client.call_tool(
+                "write_page",
+                {"name": "Foo.md", "content": "x", "if_match": "*"},
+            )
+            assert result.is_error is True
+            text = _text(result)
+            assert (
+                "precondition failed; check if_match/if_none_match; "
+                'read_page("Foo.md") for the current etag and re-issue'
+            ) in text, (
+                f"412 #{i + 1} should carry the T45 suffix"
+            )
+            assert "[concurrent_edit_hint:" not in text, (
+                f"412 #{i + 1} should not carry the T42 marker"
+            )
+
+        # Fourth 412: trips the threshold; T42 marker appends
+        # after the T45 suffix.
+        result = await client.call_tool(
+            "write_page",
+            {"name": "Foo.md", "content": "x", "if_match": "*"},
+        )
+    assert result.is_error is True
+    text = _text(result)
+    # Both T45 and T42 surface.
+    assert 'read_page("Foo.md") for the current etag and re-issue' in text
+    assert "[concurrent_edit_hint: true]" in text
+    # T45 suffix sits *before* the T42 marker — the marker
+    # rides as the very last suffix on the message.
+    assert text.index('read_page("Foo.md")') < text.index(
+        "[concurrent_edit_hint:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t45_concurrent_edit_message_uses_resolved_name() -> None:
+    """T45: silent-overwrite 412 message names the *resolved*
+    page (T39), not the caller's raw input.
+
+    The pre-T45 message ("concurrent edit detected: …")
+    didn't name the page at all — the agent knew which page it
+    was writing (it just called ``write_page`` with that name)
+    so the message didn't repeat it. T45 adds the resolved
+    name to the message; the name should match the *resolved*
+    form so an agent that passes ``Foo`` and gets the
+    normalized ``Foo.md`` back in the error can use the
+    embedded etag against the right page on retry.
+
+    Matches the T39 design call: error wording references the
+    resolved name, not the caller's raw input. The test
+    exercises the bare-name case (``Foo`` → ``Foo.md``) so
+    the bridge has to thread the *post-normalization* name
+    into the message, not the raw input.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(200, headers={"ETag": '"new"'})
+        return httpx.Response(200, headers={"ETag": '"new"'})
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {
+                "name": "Foo",  # bare name → resolves to Foo.md
+                "content": "body",
+                "if_match": '"v1"',
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # Resolved name appears in the message; the caller's raw
+    # input (``Foo`` without ``.md``) doesn't.
+    assert "on Foo.md:" in text
+    assert "on Foo:" not in text
+
+
+@pytest.mark.asyncio
+async def test_t45_standard_412_pointer_omitted_for_empty_name() -> None:
+    """T45: when ``_translate_sb_errors`` is called with an
+    empty ``name`` (``list_pages`` is the only caller), the
+    standard 412 message doesn't include the
+    ``read_page(<name>)`` pointer.
+
+    An empty-name 412 isn't a per-page precondition (the call
+    has no ``if_match`` surface) — surfacing
+    ``read_page("")`` would be a confused-looking pointer.
+    The bare prefix ``precondition failed; check
+    if_match/if_none_match`` is enough; an agent that sees a
+    412 from ``list_pages`` knows the precondition wasn't
+    page-scoped and just needs to re-issue.
+
+    The test routes a 412 on ``list_pages`` (the only tool
+    that passes ``name=""`` to ``_translate_sb_errors``) and
+    asserts the bare prefix is present *without* a
+    ``read_page(`` suffix. Pin: a future refactor that
+    unconditionally appends the pointer (forgetting the
+    empty-name guard) would surface here as a wrong-shaped
+    message.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # ``list_pages`` issues ``GET /.fs``; a 412 here is
+        # unusual (the call has no precondition surface) but
+        # the bridge routes any 412 through
+        # ``_translate_sb_errors``.
+        return httpx.Response(412, text="precondition failed")
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_pages", {})
+
+    assert result.is_error is True
+    text = _text(result)
+    # Bare prefix is present.
+    assert text.startswith(
+        "Error executing tool list_pages: precondition failed; "
+        "check if_match/if_none_match"
+    )
+    # No ``read_page(`` pointer (empty name; the precondition
+    # wasn't page-scoped).
+    assert "read_page(" not in text
+    # T42 hint absent (one-off 412; the autouse fixture
+    # cleared the contention log, and a single 412 is below
+    # the threshold).
+    assert "[concurrent_edit_hint:" not in text
+
+
 # --- T42: 412 contention hint ---------------------------------------
 
 
@@ -8292,10 +8697,25 @@ async def test_t42_three_412s_no_hint_fourth_carries_concurrent_edit_hint() -> N
                 {"name": "W36.md", "content": "x", "if_match": "*"},
             )
             assert result.is_error is True
-            assert _text(result) == (
+            # T45: the standard 412 wording gains the
+            # ``read_page("W36.md")`` pointer (the resolved
+            # name), so the bare `==` assertion here becomes a
+            # `startswith` check plus a substring check on
+            # the new suffix. The T42 hint (which fires after
+            # the 4th 412) still rides as the same suffix
+            # *after* the T45 wording, so the 4th-call
+            # assertion below gains the T45 suffix in the
+            # middle.
+            text = _text(result)
+            assert text.startswith(
                 "Error executing tool write_page: precondition "
                 "failed; check if_match/if_none_match"
             ), f"412 #{i + 1} should not carry the hint"
+            assert (
+                'read_page("W36.md") for the current etag and re-issue'
+                in text
+            )
+            assert "[concurrent_edit_hint:" not in text
 
         # Fourth 412 trips the threshold.
         result = await client.call_tool(
@@ -8305,7 +8725,9 @@ async def test_t42_three_412s_no_hint_fourth_carries_concurrent_edit_hint() -> N
     assert result.is_error is True
     assert _text(result) == (
         "Error executing tool write_page: precondition failed; "
-        "check if_match/if_none_match [concurrent_edit_hint: true]"
+        'check if_match/if_none_match; '
+        'read_page("W36.md") for the current etag and re-issue '
+        "[concurrent_edit_hint: true]"
     )
 
 
@@ -8331,10 +8753,19 @@ async def test_t42_counter_is_per_page_not_global() -> None:
                 {"name": name, "content": "x", "if_match": "*"},
             )
             assert result.is_error is True
-            assert _text(result) == (
-                f"Error executing tool write_page: precondition "
-                f"failed; check if_match/if_none_match"
+            # T45: standard 412 wording gains the
+            # ``read_page(<name>)`` pointer; bare-`==` becomes
+            # `startswith` + substring checks.
+            text = _text(result)
+            assert text.startswith(
+                "Error executing tool write_page: precondition "
+                "failed; check if_match/if_none_match"
             ), f"single 412 on {name} should not carry the hint"
+            assert (
+                f'read_page("{name}") for the current etag and re-issue'
+                in text
+            )
+            assert "[concurrent_edit_hint:" not in text
 
 
 @pytest.mark.asyncio
@@ -8379,11 +8810,18 @@ async def test_t42_sliding_window_evicts_old_timestamps(monkeypatch) -> None:
             {"name": "W36.md", "content": "x", "if_match": "*"},
         )
     assert result.is_error is True
-    assert _text(result) == (
+    # T45: standard 412 wording gains the
+    # ``read_page("W36.md")`` pointer.
+    text = _text(result)
+    assert text.startswith(
         "Error executing tool write_page: precondition failed; "
         "check if_match/if_none_match"
     )
-    assert "concurrent_edit_hint" not in _text(result)
+    assert (
+        'read_page("W36.md") for the current etag and re-issue'
+        in text
+    )
+    assert "concurrent_edit_hint" not in text
 
 
 @pytest.mark.asyncio

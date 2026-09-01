@@ -525,6 +525,86 @@ agent learns the convention rather than continuing to retype.
   (the v1.3 contract path on SBs that emit them)
   are untouched.
 
+## [Unreleased] — v1.6 (412 retry guidance on the bridge surface)
+
+Build map: [`docs/wayfinder/map-v1.6.md`](docs/wayfinder/map-v1.6.md).
+**Status: T45 shipped 2026-09-01; v1.6 destination reached**. v1.5
+shipped the contention-window signal (T42) and the synthesized-etag
+fix (T44) but didn't address the underlying user complaint:
+agents in 412-contention loops don't know what to do next.
+v1.6 closes that gap by widening both 412 messages with
+actionable retry guidance so an agent that followed the
+concurrency protocol correctly sees the bridge tell it the next
+call's exact shape, without an extra read round trip on the
+silent-overwrite path and without having to guess the read
+tool's name on the standard path.
+
+### Changed
+
+- **T45 standard 412 wording gains `read_page(<name>)`
+  pointer** — the `_translate_sb_errors` `PreconditionFailed`
+  clause now appends `; read_page("<name>") for the current
+  etag and re-issue` to the standard 412 `ToolError` message.
+  The `<name>` is the resolved page name (T39's design call),
+  so an agent that called `write_page("Foo")` sees
+  `read_page("Foo.md")` in the error — a copy-paste-able
+  read tool call. The pre-T45 prefix `precondition failed;
+  check if_match/if_none_match` is byte-preserved: an agent
+  that pattern-matches on the bare prefix still matches; only
+  agents that pinned the byte-for-byte full message (a small
+  set of v1.5 / earlier tests) need to update. The standard
+  path can't embed the current etag directly (SB's 412
+  response body is empty on this build), so the wording
+  points at the read instead. The `list_pages` 412 has no
+  per-page name — the empty-name guard skips the pointer and
+  the bare prefix is enough. The T42 `[concurrent_edit_hint:
+  true]` contention marker rides as the trailing suffix *after*
+  the T45 wording, so a contention-window 412 reads:
+  `...; read_page("Foo.md") for the current etag and re-issue
+  [concurrent_edit_hint: true]`. An agent that pattern-matches
+  on either the bare prefix or the marker substring still
+  matches.
+
+- **T45 silent-overwrite 412 wording embeds the current
+  etag** — the `_CONCURRENT_EDIT_MSG` template (the
+  `ToolError` raised by `_verify_concurrency_token` on
+  SBs that don't honor `If-Match`) widens from the v1.5
+  single-placeholder form (`{expected_etag}`) to a
+  three-placeholder form (`{name}`, `{expected_etag}`,
+  `{current_etag}`). The bridge has the post-write etag in
+  hand from the verification re-read, and the wording
+  embeds it directly as
+  `current etag is "<etag>" — re-issue the write with
+  if_match="<etag>"`, so the agent has the literal
+  `if_match=` value for the next call without an extra
+  read round trip. The pre-T45 prefix
+  `concurrent edit detected` is byte-preserved: an agent
+  that pattern-matches on the bare prefix still matches;
+  only agents that pinned the byte-for-byte full message
+  (a small set of T31b tests) need to update. `name` is
+  the resolved page name (matching T39's design call —
+  error wording references the resolved name, not the
+  caller's raw input); `current_etag` falls back to
+  `"None"` when SB stripped the `ETag` header and the
+  synthesized-etag primitive returned `None` (the rare
+  case; on this dev box the synthesized form is
+  `"{size_bytes}"` and is always populated). No new
+  dependencies; no SDK version change; no new env vars.
+  Local to `_CONCURRENT_EDIT_MSG`,
+  `_verify_concurrency_token`, `_translate_sb_errors`'s
+  412 clause, the docs trio (`docs/design.md` /
+  `README.md` / `CHANGELOG.md`), and
+  `tests/test_tools_in_memory.py`. Seven new Layer-1 test
+  cases (the five the ticket enumerated plus
+  `test_t45_concurrent_edit_message_uses_resolved_name`
+  and `test_t45_standard_412_pointer_omitted_for_empty_name`
+  to pin the resolved-name and empty-name guards);
+  seven existing byte-for-byte 412 wording tests updated
+  from `==` to `startswith` + substring checks (matching
+  the T42 / T43 / T44 migration posture — only the test
+  pinned the full byte-for-byte message; agents that
+  pattern-match on the bare prefix are unaffected).
+
 ## [v1.3] — agent-grade discovery + edit hygiene
 
 Build map: [`docs/wayfinder/map-v1.3.md`](docs/wayfinder/map-v1.3.md).

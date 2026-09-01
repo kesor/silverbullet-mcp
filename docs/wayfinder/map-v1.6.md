@@ -154,6 +154,20 @@ the frontier at chart time. None claimed this
 session — chart-only pass, resolution belongs to a
 later session.
 
+**T45 resolved 2026-09-01 by pi**: v1.6 destination
+reached. Seven new Layer-1 cases in
+`tests/test_tools_in_memory.py` (the five the ticket
+enumerated plus `test_t45_concurrent_edit_message_uses_resolved_name`
+to pin T39's "error wording references the resolved
+name" design call, and `test_t45_standard_412_pointer_omitted_for_empty_name`
+to pin the empty-name guard for `list_pages`'s
+boundary case). Seven existing byte-for-byte 412
+wording tests updated from `==` to `startswith` +
+substring checks (matching the T42 / T43 / T44
+migration posture). 533 tests pass + 8 skipped
+(was 526 + 8 skipped at v1.5 close); `nix flake
+check` green.
+
 ## Notes
 
 - **Domain**: same as the prior maps (protocol bridge).
@@ -223,6 +237,7 @@ later session.
 ticket's resolution below -->
 
 - [Chart pass, 2026-09-01](#status): v1.6 destination named ("412 retry guidance on the bridge surface"); T45 (enrich both 412 messages with retry guidance and the current etag where the bridge has it in hand) charted with full detail below; the user's wider-scope option (auto-retry on the standard 412 path) was explicitly considered at chart time and ruled out for v1.6 — its design surface (idempotency, latency, concurrent-edit handling during the auto-retry window) deserves its own charter and ADR rather than a bolt-on. Recorded as out-of-scope below; can be revisited in a future map if the enriched messages alone don't close the user's complaint.
+- [T45. Enrich 412 messages with retry guidance and the current etag (where the bridge has it)](#t45-enrich-412-messages-with-retry-guidance-and-the-current-etag-where-the-bridge-has-it): both 412 messages widened — standard path gains a `; read_page("<name>") for the current etag and re-issue` suffix (resolved page name, T39's design call); silent-overwrite path embeds the post-write etag directly as `current etag is "<etag>" — re-issue the write with if_match="<etag>"` so the agent has the literal `if_match=` value for the next call without an extra read round trip. Pre-T45 prefixes byte-preserved; only byte-for-byte-pinned tests need updating. T42 contention marker still rides as a trailing suffix. 533 tests pass + 8 skipped; `nix flake check` green.
 
 ## Not yet specified
 
@@ -275,8 +290,54 @@ ordering and an explicit "Blocks:" line per ticket).
 
 > **Labels**: `wayfinder:task`
 > **Type**: AFK
-> **Assignee**: *(unclaimed)*
-> **Status**: 🟡 open — unblocked, on the frontier
+> **Assignee**: pi (claimed 2026-09-01, resolved same day)
+> **Status**: ✅ resolved 2026-09-01
+> **Resolution**: see commit `68eb2`. Both 412 messages
+> widened. Standard 412 (`_translate_sb_errors`'s
+> `PreconditionFailed` clause) gains a
+> `; read_page("<name>") for the current etag and
+> re-issue` suffix where `<name>` is the resolved
+> page name (T39's design call — error wording
+> references the resolved name, not the caller's raw
+> input); the empty-name guard skips the pointer for
+> `list_pages`'s boundary case. Silent-overwrite 412
+> (`_verify_concurrency_token`'s helper) widens
+> `_CONCURRENT_EDIT_MSG` from the v1.5
+> single-placeholder form (`{expected_etag}`) to a
+> three-placeholder form (`{name}`, `{expected_etag}`,
+> `{current_etag}`); the bridge embeds the
+> post-write etag directly as
+> `current etag is "<etag>" — re-issue the write with
+> if_match="<etag>"` so the agent has the literal
+> `if_match=` value for the next call without an
+> extra read round trip. Pre-T45 prefixes
+> (`precondition failed` / `concurrent edit detected`)
+> byte-preserved; only agents that pinned the
+> byte-for-byte full message (a small set of v1.5 /
+> earlier tests) need to update. The T42
+> `[concurrent_edit_hint: true]` marker rides as the
+> trailing suffix on the standard 412 message
+> *after* the T45 wording, so a contention-window
+> 412 reads: `...; read_page("Foo.md") for the
+> current etag and re-issue [concurrent_edit_hint: true]`.
+> Seven new Layer-1 cases in
+> `tests/test_tools_in_memory.py` (the five the
+> ticket enumerated plus
+> `test_t45_concurrent_edit_message_uses_resolved_name`
+> and
+> `test_t45_standard_412_pointer_omitted_for_empty_name`);
+> seven existing byte-for-byte 412 wording tests
+> updated from `==` to `startswith` + substring
+> checks. `README.md` concurrency section gains a
+> one-paragraph note ("On a 412, the bridge tells
+> you the next call's exact `if_match=` value…
+> You don't need to guess."). `docs/design.md`
+> § Tools § Status-code mapping 412 row gains a T45
+> paragraph documenting both surfaces. `CHANGELOG.md`
+> v1.6 `[Unreleased]` entry records the wording
+> change with the same migration posture as T42 /
+> T43 / T44. 533 tests pass + 8 skipped
+> (`nix flake check` green).
 > **Question**: How does both 412 paths — the
 > standard SB-honors-`If-Match` 412 (raised by
 > `_translate_sb_errors`) and the silent-overwrite
