@@ -33,6 +33,7 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from mcp_silverbullet.journal import JournalConfig
+from mcp_silverbullet.sb_client import SBClient
 from mcp_silverbullet.main import Settings, serve
 
 MARKER = "e2e-mcp-silverbullet-marker.md"
@@ -1399,6 +1400,177 @@ async def test_t46_append_to_page_no_concurrent_edit_on_byte_growth() -> None:
         with suppress(asyncio.CancelledError):
             await server_task
         await _delete_t46_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T47: auto-retry on read-modify-write end-to-end against live SB.
+#
+# Spawns a background task that writes to the page between
+# the agent's PUT and the verification re-read (simulating
+# a sustained concurrent writer — the W36 / Mav-Report
+# scenario the user reports). Pre-T47 the agent would see
+# a raw 412 on every attempt; post-T47 the bridge's
+# auto-retry re-reads and re-derives the operation against
+# the page's *current* state, and the agent sees a
+# successful tool call after 1–3 retries.
+# ---------------------------------------------------------------------------
+
+T47_MARKER = "e2e-mcp-silverbullet-t47-autoretry.md"
+
+
+async def _delete_t47_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T47_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_t47_append_to_page_succeeds_under_concurrent_writer() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
+    )
+    initial_body = "T47 initial body\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: write the initial body.
+                    created = await session.call_tool(
+                        "write_page",
+                        {"name": T47_MARKER, "content": initial_body},
+                    )
+                    assert created.is_error is False, created
+
+                    # Step 2: spawn a background writer that
+                    # touches the page repeatedly (simulating
+                    # a sustained concurrent writer — the
+                    # W36 / Mav-Report scenario).
+                    stop_writer = asyncio.Event()
+
+                    async def background_writer() -> None:
+                        sb_direct = SBClient(sb_url, token=sb_token)
+                        try:
+                            for i in range(8):
+                                if stop_writer.is_set():
+                                    break
+                                try:
+                                    page = await sb_direct.read_page(
+                                        T47_MARKER
+                                    )
+                                    new_body = page.body + (
+                                        f"bg-writer-{i}\n"
+                                    )
+                                    await sb_direct.write_page(
+                                        T47_MARKER, new_body
+                                    )
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(0.02)
+                        finally:
+                            await sb_direct._client.aclose()
+
+                    writer_task = asyncio.create_task(background_writer())
+                    try:
+                        # Step 3: agent calls append_to_page
+                        # while the background writer is
+                        # racing. The bridge's auto-retry
+                        # should land the agent's call
+                        # cleanly (the agent sees a
+                        # successful tool call, not 5 raw
+                        # 412s).
+                        appended = await session.call_tool(
+                            "append_to_page",
+                            {"name": T47_MARKER, "text": "agent\n"},
+                        )
+                        assert appended.is_error is False, (
+                            f"T47: bridge raised "
+                            f"{_text(appended)!r} despite a "
+                            f"background writer racing the "
+                            f"page. The auto-retry should "
+                            f"have caught the verification "
+                            f"helper's 412, re-read the "
+                            f"page, re-derived the appended "
+                            f"body, and landed the agent's "
+                            f"call cleanly within "
+                            f"max_retries=3 attempts."
+                        )
+                        apayload = appended.structured_content or {}
+                        # T23 ack envelope — the size of the
+                        # *final* body (initial + the writer's
+                        # bg-writer-N lines that landed
+                        # before the agent's successful
+                        # retry, + the agent's appended
+                        # text). The exact number depends
+                        # on how many bg-writer-N landed;
+                        # we just assert the agent's text
+                        # is present.
+                        assert apayload.get("size_bytes") >= len(
+                            initial_body
+                        ) + len("agent\n")
+
+                        # Step 4: confirm the agent's text
+                        # actually landed in the body (the
+                        # auto-retry's job is to land it,
+                        # not to silently lose it).
+                        read_back = await session.call_tool(
+                            "read_page", {"name": T47_MARKER}
+                        )
+                        assert read_back.is_error is False, read_back
+                        body = (
+                            read_back.structured_content or {}
+                        ).get("body")
+                        assert body is not None, (
+                            f"T47: read-back returned no body "
+                            f"— the bridge's auto-retry "
+                            f"must have lost the agent's "
+                            f"text. Got: {read_back}"
+                        )
+                        assert "agent\n" in body, (
+                            f"T47: agent's append didn't "
+                            f"land. Body: {body!r}"
+                        )
+                    finally:
+                        stop_writer.set()
+                        writer_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await writer_task
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t47_marker(sb_url, sb_token)
 
 
 # ---------------------------------------------------------------------------

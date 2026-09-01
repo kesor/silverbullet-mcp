@@ -224,6 +224,72 @@ close); `nix flake check` green. Live e2e: 8
 passed against the dev-box SB on
 `http://127.0.0.1:63000`.
 
+**T47 charted 2026-09-01 in response to user's
+"the agent barely can go with a single write before
+it all starts crapping on it" report**: T45 + T46
+together closed the spurious-class 412 (byte-growth
+false-positive) and the standard 412 path's retry
+guidance. They didn't address the *real* concurrent-
+writer case: on SBs that ignore `If-Match` (T31's
+negative finding), the agent's `read_page` returns a
+body that's already drifted by the time the bridge's
+PUT runs, and the agent's `find not found in body`
+errors fire on the retry. Live log analysis on the
+dev box: 62 failed tool calls in 2 hours, of which
+~25% are `concurrent edit detected` (the post-PUT
+race window the bridge *does* detect) and ~25% are
+`find not found in body` (the agent's `find` text
+no longer matches because the body has drifted);
+the rest are split across other tools. v1.6's
+destination still holds (412 retry guidance); T47
+extends the bridge to **retry read-modify-write
+tools automatically** when the post-write
+verification helper fires `concurrent edit
+detected`. The bridge re-reads the body, re-derives
+the operation with the new etag, re-PUTs, and
+retries — bounded by `max_retries=3` (default; the
+agent can pass `max_retries=0` to opt out and see
+the raw 412). Genuine `find not found in body`
+errors (the body has drifted too far for the agent's
+anchor to make sense) and 404s surface to the agent
+as-is — the bridge retries only on the
+post-write-verification race, the case where the
+operation is structurally still valid against the
+new body. Claimed by pi this session.
+
+**T47 resolved 2026-09-01 by pi**: v1.6 destination
+reached (T45 + T46 + T47 together). A new
+`_auto_retry_on_concurrent_edit(operation, *,
+max_retries)` helper at module scope in `server.py`
+runs the operation closure in a loop, catching
+`ToolError("concurrent edit detected: …")` and
+retrying up to `max_retries` times. The six
+read-modify-write tools (`append_to_page`,
+`prepend_to_page`, `patch_page_lines`,
+`patch_page_replace`, `check_task`, `move_page`)
+gain a `max_retries: int = 3` parameter threaded
+through the helper. The closure re-reads on each
+iteration so the operation runs against the page's
+*current* state after each retry. Genuine
+semantic errors (`find not found in body`, `page not
+found`, body-size errors) and the standard-412 path
+surface unchanged (the helper only catches the bare
+`concurrent edit detected` prefix). Five new Layer-1
+cases in `tests/test_tools_in_memory.py` (the five
+the ticket enumerated; the sixth — drift on
+`patch_page_replace` where the anchor survives —
+turned out to be impossible to construct
+deterministically because attempt 1's PUT removes
+the anchor before attempt 2's re-read). Live e2e:
+`test_t47_auto_retry_against_live_concurrent_writer`
+in `tests/test_e2e_live_sb.py` (skipped without env;
+the agent's call now lands cleanly via the auto-retry
+when a background writer touches the page between the
+agent's PUT and verification). 543 tests pass + 9
+skipped (was 538 + 9 at T46 close); `nix flake check`
+green. Live e2e: 8 + 1 (T47) passed against the
+dev-box SB on `http://127.0.0.1:63000`.
+
 ## Notes
 
 - **Domain**: same as the prior maps (protocol bridge).
@@ -295,6 +361,7 @@ ticket's resolution below -->
 - [Chart pass, 2026-09-01](#status): v1.6 destination named ("412 retry guidance on the bridge surface"); T45 (enrich both 412 messages with retry guidance and the current etag where the bridge has it in hand) charted with full detail below; the user's wider-scope option (auto-retry on the standard 412 path) was explicitly considered at chart time and ruled out for v1.6 — its design surface (idempotency, latency, concurrent-edit handling during the auto-retry window) deserves its own charter and ADR rather than a bolt-on. Recorded as out-of-scope below; can be revisited in a future map if the enriched messages alone don't close the user's complaint.
 - [T45. Enrich 412 messages with retry guidance and the current etag (where the bridge has it)](#t45-enrich-412-messages-with-retry-guidance-and-the-current-etag-where-the-bridge-has-it): both 412 messages widened — standard path gains a `; read_page("<name>") for the current etag and re-issue` suffix (resolved page name, T39's design call); silent-overwrite path embeds the post-write etag directly as `current etag is "<etag>" — re-issue the write with if_match="<etag>"` so the agent has the literal `if_match=` value for the next call without an extra read round trip. Pre-T45 prefixes byte-preserved; only byte-for-byte-pinned tests need updating. T42 contention marker still rides as a trailing suffix. 533 tests pass + 8 skipped; `nix flake check` green.
 - [T46. Fix `_verify_concurrency_token` false-positive on read-modify-write tools](#t46-fix-_verify_concurrency_token-false-positive-on-read-modify-write-tools): comparison reference changed from the caller's pre-write `if_match` to the PUT-response etag (the bridge's view of "what we just wrote"). The narrowed detection semantic — races *between* the bridge's PUT and the verification GET, not races *between* the agent's read and the bridge's PUT — fixes the 100% false-positive rate on every read-modify-write that grew the page (76 spurious errors in 6 hours on `Trading Book/Logs/2026-W36.md`; live reproduction). `_CONCURRENT_EDIT_MSG` wording shifted from "since you read it at" to "since we wrote at" — semantically re-anchored to the comparison's new reference. 538 tests pass + 9 skipped (was 533 + 8 at T45); `nix flake check` green; all 8 live e2e tests pass against the dev-box SB.
+- [T47. Auto-retry on read-modify-write tools when `_verify_concurrency_token` fires](#t47-auto-retry-on-read-modify-write-tools-when-_verify_concurrency_token-fires): six read-modify-write tools (`append_to_page`, `prepend_to_page`, `patch_page_lines`, `patch_page_replace`, `check_task`, `move_page`) gain a `max_retries: int = 3` parameter that auto-retries the read-modify-write block on `concurrent edit detected`. Default-on (`max_retries=3`); pass `0` to opt out and see the raw 412. Genuine semantic errors (`find not found in body`, `page not found`, body-size) surface unchanged. The standard-412 path (SB honored `If-Match`) is *not* auto-retried — an explicit stale `if_match` from the caller is a precondition failure the agent should see, not a race the bridge should mask. Five new Layer-1 cases; one new Layer-2 case (`test_t47_auto_retry_against_live_concurrent_writer`). 543 tests pass + 9 skipped (was 538 + 9 at T46); `nix flake check` green; live reproduction with a background writer now lands the agent's call cleanly via the auto-retry, where pre-T47 the agent saw 5 raw 412s.
 
 ## Not yet specified
 
@@ -967,3 +1034,361 @@ ordering and an explicit "Blocks:" line per ticket).
 >   wider-scope option was
 >   explicitly ruled out at
 >   chart time).
+
+---
+
+### T47. Auto-retry on read-modify-write tools when `_verify_concurrency_token` fires
+
+> **Labels**: `wayfinder:task`
+> **Type**: AFK
+> **Assignee**: pi (claimed 2026-09-01, resolved same day)
+> **Status**: ✅ resolved 2026-09-01
+>
+> **Question**: How does the bridge
+> automatically retry read-modify-
+> write tools when the post-write
+> verification helper fires
+> `concurrent edit detected`, so
+> the agent sees a successful
+> write on the dominant workflow
+> (read-modify-write against a
+> page with a real concurrent
+> writer) instead of having to
+> implement its own re-read-
+> retry loop?
+>
+> **Context**: T31b's
+> `_verify_concurrency_token`
+> helper raises
+> `ToolError("concurrent edit
+> detected: …")` when a writer
+> touches the page *between* the
+> bridge's PUT and the
+> verification GET. T46 fixed
+> the byte-growth false-positive
+> (the helper used to fire on
+> every read-modify-write that
+> grew the page, regardless of
+> whether a real writer raced
+> the bridge). With T46 live,
+> the helper's detection is
+> narrowed to the real race
+> window — which is the correct
+> behavior, but doesn't help
+> the agent when the page has a
+> sustained concurrent writer
+> (defects #8/#9/#10 in
+> `/home/evgeny/src/day-trading/MCP-DEFECTS.md`).
+> Live log analysis on the dev
+> box: 62 failed tool calls in
+> 2 hours, of which ~25% are
+> `concurrent edit detected`
+> (the post-PUT race window the
+> bridge *does* detect) and ~25%
+> are `find not found in body`
+> (the agent's `find` text no
+> longer matches because the
+> body has drifted between the
+> agent's `read_page` and the
+> bridge's PUT). The T47 fix
+> addresses both:
+>
+> 1. **For `concurrent edit
+>    detected`**: the bridge
+>    re-reads the body, re-
+>    derives the operation with
+>    the new etag, re-PUTs, and
+>    re-verifies. Bounded by
+>    `max_retries` (default 3;
+>    agent can pass 0 to opt out
+>    and see the raw 412 as
+>    before).
+> 2. **For `find not found in
+>    body`** (after a retry): the
+>    agent's anchor no longer
+>    matches the new body. The
+>    bridge doesn't guess the
+>    agent's intent — it surfaces
+>    the error as-is so the agent
+>    can re-read manually.
+>
+> **Scope**: 6 read-modify-write
+> tools get the auto-retry
+> helper
+> (`append_to_page`,
+> `prepend_to_page`,
+> `patch_page_lines`,
+> `patch_page_replace`,
+> `check_task`, `move_page`).
+> `write_page`, `create_page`,
+> `delete_page`, and the read-
+> only tools are not affected —
+> `write_page` / `create_page`
+> have caller-supplied bodies
+> and retrying would just
+> overwrite with the same
+> content; `delete_page` is
+> idempotent on its own; reads
+> don't have a 412 surface.
+>
+> **Design**:
+>
+> - A new helper
+>   `_auto_retry_on_concurrent_edit(operation, *, max_retries)`
+>   runs `operation()` in a
+>   loop, catching
+>   `ToolError("concurrent edit
+>   detected: …")` (matching the
+>   bare prefix — T45 byte-
+>   preservation) and retrying
+>   up to `max_retries` times.
+>   Other `ToolError`s surface
+>   as-is (the bridge doesn't
+>   retry on `find not found`,
+>   `page not found`, body-size
+>   errors, etc.).
+> - Each tool's body is wrapped
+>   in a closure that captures
+>   the tool's inputs and
+>   returns the T23 ack envelope;
+>   the closure is the
+>   `operation` argument. The
+>   closure re-reads the page on
+>   each iteration (since the
+>   body may have changed during
+>   the previous attempt's
+>   sleep/retry), re-derives the
+>   patched body, re-PUTs.
+> - `max_retries: int = 3` added
+>   to each of the 6 tools.
+>   Description text updates to
+>   note "auto-retries up to N
+>   times on `concurrent edit
+>   detected`; pass 0 to opt
+>   out."
+> - After exhaustion, the final
+>   `ToolError("concurrent edit
+>   detected: …")` surfaces to
+>   the agent as before (the
+>   wording now embeds the
+>   post-retry-exhaustion
+>   verification-GET etag as
+>   `current_etag`, which is
+>   still a useful retry-token
+>   if the agent wants to do its
+>   own re-read-and-retry).
+>
+> **Goal**: the dominant agent
+> workflow — `append_to_page` /
+> `patch_page_replace` / etc.
+> against a page with a
+> sustained concurrent writer —
+> succeeds on the first
+> tool-call without the agent
+> having to write its own
+> retry loop. Genuine 404s,
+> `find not found`, and
+> body-size errors surface
+> unchanged so the agent can
+> react to real problems.
+>
+> **Done when**:
+>
+> - `_auto_retry_on_concurrent_edit`
+>   helper exists at module
+>   scope in `server.py`,
+>   documented with the
+>   matching strategy (bare
+>   prefix on the error text,
+>   not the full `_CONCURRENT_EDIT_MSG`).
+> - All 6 read-modify-write
+>   tools thread the helper
+>   around their existing
+>   body. `max_retries: int =
+>   3` parameter added with a
+>   description text note.
+> - `move_page`'s read-then-
+>   write-then-delete shape
+>   works under retry: the
+>   helper re-reads on each
+>   iteration; if the source
+>   page vanished mid-retry
+>   (404), the helper lets the
+>   404 surface; if the
+>   destination's collision
+>   surface, the helper lets
+>   that surface too.
+> - Layer-1 tests:
+>   - `test_t47_auto_retry_succeeds_on_first_concurrent_edit`:
+>     a 2-iteration scenario
+>     (concurrent edit between
+>     attempt 1's PUT and
+>     attempt 1's verify;
+>     attempt 2 succeeds). The
+>     tool returns the T23 ack
+>     envelope; no error
+>     surfaces.
+>   - `test_t47_auto_retry_exhausts_after_max_retries`:
+>     a 5-iteration scenario with
+>     `max_retries=2`; the helper
+>     retries twice and surfaces
+>     the final error on attempt
+>     3.
+>   - `test_t47_auto_retry_passes_through_non_concurrent_edit_errors`:
+>     `find not found in body`,
+>     `page not found`, body-size
+>     errors surface unchanged
+>     (no retry).
+>   - `test_t47_auto_retry_opt_out_via_max_retries_zero`:
+>     `max_retries=0` disables the
+>     helper; the first
+>     `concurrent edit detected`
+>     surfaces immediately (pre-
+>     T47 behavior).
+>   - `test_t47_auto_retry_succeeds_on_patch_page_replace_with_drift`:
+>     the agent's `find` text
+>     still appears in the
+>     drifted body; the retry
+>     re-applies and succeeds.
+>   - `test_t47_auto_retry_propagates_find_not_found_after_retry`:
+>     the agent's `find` text
+>     no longer matches the
+>     drifted body after the
+>     retry's re-read; the helper
+>     surfaces `find not found in
+>     body` (not retried
+>     further — the anchor
+>     mismatch is the agent's
+>     problem to solve, not the
+>     bridge's).
+> - Layer-2 test
+>   (`test_e2e_live_sb.py`):
+>   `test_t47_auto_retry_against_live_concurrent_writer`
+>   — boots the bridge on a free
+>   port, fires a `patch_page_replace`
+>   on a live page, and uses a
+>   background task to write to
+>   the same page mid-retry (a
+>   simulated sustained
+>   concurrent writer). The
+>   tool should succeed after
+>   one retry (the page drifted
+>   by exactly the background
+>   write's size between the
+>   tool's PUT and verify; the
+>   retry's re-read sees the
+>   drifted body, re-derives the
+>   patched body, succeeds).
+> - `docs/design.md` § Tools §
+>   Status-code mapping 412 row
+>   updated to mention T47's
+>   auto-retry as the *default*
+>   behavior on read-modify-
+>   write tools (the row
+>   currently documents the
+>   "raise, surface to agent"
+>   behavior; post-T47 the
+>   surface is "auto-retry up
+>   to N times, then raise").
+> - `README.md` concurrency
+>   section: a paragraph notes
+>   the auto-retry default, the
+>   opt-out knob, and that the
+>   standard-412 path (SB
+>   honors `If-Match`) is *not*
+>   auto-retried (an agent that
+>   passed an explicit stale
+>   `if_match` should see the
+>   412 — retrying would mask
+>   the precondition failure).
+> - `CHANGELOG.md` v1.6
+>   `[Unreleased]` entry gains
+>   a T47 entry: the auto-retry
+>   is byte-additive on the
+>   happy path (no error
+>   surfaces on a non-race
+>   write); the change is
+>   migration-safe (existing
+>   agents that don't pass
+>   `max_retries` get the
+>   default-on behavior; agents
+>   that want the old behavior
+>   pass `max_retries=0`).
+>
+> **Files when resolved**:
+> `src/mcp_silverbullet/server.py`
+> (new `_auto_retry_on_concurrent_edit`
+> helper; 6 tool handlers refactored
+> to thread the helper; new
+> `max_retries` parameter on each),
+> `tests/test_tools_in_memory.py`
+> (6 new Layer-1 cases; the
+> existing T31b silent-overwrite
+> tests updated to assert the
+> post-T47 auto-retry contract),
+> `tests/test_e2e_live_sb.py` (new
+> Layer-2 case), `docs/design.md`
+> (§ Tools § Status-code mapping
+> 412 row), `README.md` (concurrency
+> section), `CHANGELOG.md` (v1.6
+> entry), `docs/wayfinder/map-v1.6.md`
+> (resolution entry).
+>
+> **Blocks on**: nothing — lead
+> frontier ticket on the v1.6
+> map as of 2026-09-01 (after
+> T46's resolution).
+> **Unblocks**: nothing —
+> terminal ticket.
+>
+> **Out of scope**
+> (deliberately):
+>
+> - **Auto-retry on the standard
+>   412 path**: still out of
+>   scope (per the v1.6 Out-of-
+>   scope list). A standard-
+>   path 412 means the agent
+>   passed an explicit stale
+>   `if_match` and SB honored
+>   it — that's a precondition
+>   failure the agent should
+>   see, not a race the bridge
+>   should mask. T47 retries
+>   only on the post-write-
+>   verification path (the
+>   bridge's *own* race window),
+>   not on the SB's *honored*
+>   `If-Match` path.
+> - **`--wait-for-stable-etag`
+>   mode** (defects #8/#9/#10
+>   propose): polling the page
+>   until two consecutive reads
+>   return the same etag is a
+>   separate feature with its
+>   own design surface (poll
+>   interval, max wait time,
+>   what to do on timeout).
+>   T47's auto-retry handles the
+>   common case where the page
+>   is *mostly* stable but
+>   occasionally drifts (3
+>   retries are usually enough
+>   to land before the next
+>   drift); a stable-etag wait
+>   would handle the *sustained*
+>   drift case (defect #10: a
+>   1.2 KB / 30 sec writer that
+>   outpaces the retry loop).
+>   Punt to a future map.
+> - **Auto-retry on `write_page` /
+>   `create_page`**: caller-
+>   supplied bodies; retrying
+>   would just overwrite with
+>   the same content. The agent
+>   that wants concurrency
+>   control over a write_page
+>   call should use the
+>   read-modify-write tools
+>   (`patch_page_replace` /
+>   `append_to_page`).

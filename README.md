@@ -153,6 +153,23 @@ the agent's own retry loop, or use the bridge's read-modify-write
 tools (which do their own internal re-read and pass the
 verification check).
 
+**T47 auto-retry is the default on read-modify-write tools.**
+By default, `append_to_page` / `prepend_to_page` /
+`patch_page_lines` / `patch_page_replace` / `check_task` /
+`move_page` retry up to `max_retries=3` times when the
+post-write verification helper fires `concurrent edit
+detected`. On each retry the bridge re-reads the body,
+re-derives the operation against the page's *current* state,
+and re-PUTs. Pass `max_retries=0` to opt out and see the raw
+412 (matches pre-v1.6 behavior). Genuine semantic errors
+(`find not found in body`, `page not found`, body-size
+errors) surface to the agent unchanged — the bridge retries
+only on the post-write-verification race, not on
+anchor-mismatch or 404. The standard-412 path (SB honored
+`If-Match` and returned 412) is *not* auto-retried: an agent
+that passed an explicit stale `if_match` should see the 412
+— retrying would mask the precondition failure.
+
 **Every successful write returns the new `etag`.** Pass it to the next
 `if_match` on the same page and you'll never see the concurrency error.
 

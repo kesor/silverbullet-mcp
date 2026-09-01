@@ -528,7 +528,7 @@ agent learns the convention rather than continuing to retype.
 ## [Unreleased] — v1.6 (412 retry guidance on the bridge surface)
 
 Build map: [`docs/wayfinder/map-v1.6.md`](docs/wayfinder/map-v1.6.md).
-**Status: T45 + T46 shipped 2026-09-01; v1.6 destination reached**.
+**Status: T45 + T46 + T47 shipped 2026-09-01; v1.6 destination reached**.
 v1.5
 shipped the contention-window signal (T42) and the synthesized-etag
 fix (T44) but didn't address the underlying user complaint:
@@ -661,6 +661,41 @@ tool's name on the standard path.
   wrote at" — the pre-T46 prefix is byte-preserved
   (agents pattern-matching on `concurrent edit detected`
   still match).
+
+- **T47 read-modify-write auto-retry** — six read-modify-write
+  tools (`append_to_page`, `prepend_to_page`,
+  `patch_page_lines`, `patch_page_replace`, `check_task`,
+  `move_page`) gain a `max_retries: int = 3` parameter that
+  auto-retries the read-modify-write block when the
+  post-write verification helper fires `concurrent edit
+  detected`. On each retry the bridge re-reads the body,
+  re-derives the operation against the page's *current*
+  state, and re-PUTs. Default-on (`max_retries=3`); pass
+  `max_retries=0` to opt out and see the raw 412 (matches
+  the pre-T47 behavior). Genuine semantic errors (`find
+  not found in body`, `page not found`, body-size errors)
+  surface to the agent unchanged — the bridge retries only
+  on the post-write-verification race, not on
+  anchor-mismatch or 404. The standard-412 path (SB
+  honored `If-Match` and returned 412) is *not*
+  auto-retried: an agent that passed an explicit stale
+  `if_match` should see the 412 — retrying would mask the
+  precondition failure. Live reproduction: a sustained
+  background writer that touched the page between the
+  agent's PUT and verification GET (5 retry attempts
+  before exhaustion) now lands the agent's call cleanly
+  via the auto-retry, where pre-T47 the agent saw 5 raw
+  412s. Five new Layer-1 cases in
+  `tests/test_tools_in_memory.py`
+  (`test_t47_auto_retry_succeeds_on_first_concurrent_edit`,
+  `test_t47_auto_retry_exhausts_after_max_retries`,
+  `test_t47_auto_retry_passes_through_non_concurrent_edit_errors`,
+  `test_t47_auto_retry_opt_out_via_max_retries_zero`,
+  `test_t47_auto_retry_propagates_find_not_found_after_retry`).
+  Migration-safe: existing agents that don't pass
+  `max_retries` get the default-on behavior; agents that
+  want the old behavior pass `max_retries=0`. No new
+  dependencies; no SDK version change; no new env vars.
 
 ## [v1.3] — agent-grade discovery + edit hygiene
 

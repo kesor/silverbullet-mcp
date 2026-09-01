@@ -9110,6 +9110,332 @@ async def test_t46_silent_overwrite_message_uses_post_write_etag_for_expected() 
     assert "since we wrote at" in text
 
 
+# --- T47: auto-retry on read-modify-write tools -----------------------
+
+
+@pytest.mark.asyncio
+async def test_t47_auto_retry_succeeds_on_first_concurrent_edit() -> None:
+    """T47: a single post-PUT race auto-retries; the tool returns
+    the T23 ack envelope without the agent seeing the 412.
+
+    Pre-T47: the verification helper fires
+    ``ToolError("concurrent edit detected: …")`` and the
+    agent sees the raw 412. The agent must re-read, re-derive,
+    and retry.
+
+    Post-T47: the bridge does the re-read and re-derive
+    transparently. The tool returns the T23 ack envelope on
+    the second attempt. The agent sees a successful write.
+
+    Test shape: a 2-iteration scenario — attempt 1's
+    verification GET sees a different etag than the PUT
+    response (simulating a concurrent writer between PUT
+    and verify), attempt 2's verification GET sees the
+    same etag as attempt 2's PUT response (no race on
+    the retry). The tool returns the ack envelope from
+    attempt 2.
+    """
+    # Counter shared across the closure — tracks which
+    # attempt the mock is currently servicing.
+    state = {"get_count": 0, "put_count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            state["get_count"] += 1
+            # Two reads on attempt 1 (the read-modify-write
+            # read + the verification re-read). On attempt 2,
+            # two more reads (the retry's read + its
+            # verification re-read).
+            if state["get_count"] <= 2:
+                # First-attempt read. Read the original body.
+                # Return a synthesized etag.
+                if state["get_count"] == 1:
+                    return httpx.Response(
+                        200,
+                        text="alpha\nbeta\n",
+                        headers={"X-Content-Length": "11"},
+                    )
+                # First-attempt verification re-read. The
+                # bridge just wrote ``alpha\nbeta\nappended\n``
+                # (17 bytes), but a concurrent writer mutated
+                # the page between PUT and verify to
+                # ``alpha\nbeta\nMUTATED\n`` (20 bytes).
+                # The verification etag differs from the
+                # PUT-response etag (17 vs 20) → helper fires.
+                return httpx.Response(
+                    200,
+                    text="alpha\nbeta\nMUTATED\n",
+                    headers={"X-Content-Length": "20"},
+                )
+            # Second-attempt read (the retry's read). The
+            # retry sees the post-PUT body
+            # (``alpha\nbeta\nMUTATED\n``), re-derives the
+            # appended body (``alpha\nbeta\nMUTATED\nappended\n``,
+            # 28 bytes), and writes that. The verification
+            # GET sees the same body (no concurrent writer
+            # this time) → success.
+            if state["get_count"] == 3:
+                return httpx.Response(
+                    200,
+                    text="alpha\nbeta\nMUTATED\n",
+                    headers={"X-Content-Length": "20"},
+                )
+            # Second-attempt verification re-read — same body.
+            return httpx.Response(
+                200,
+                text="alpha\nbeta\nMUTATED\nappended\n",
+                headers={"X-Content-Length": "28"},
+            )
+        if request.method == "PUT":
+            state["put_count"] += 1
+            # PUT response carries the size of the bridge's
+            # written body. The bridge's
+            # ``synthesize_etag``-via-``X-Content-Length``
+            # path returns the size as the etag. On
+            # attempt 1, the bridge wrote ``alpha\nbeta\nappended\n``
+            # (17 bytes). On attempt 2, the bridge wrote
+            # ``alpha\nbeta\nMUTATED\nappended\n`` (28 bytes).
+            # The PUT response echoes the request header.
+            size = 17 if state["put_count"] == 1 else 28
+            return httpx.Response(
+                200,
+                headers={"X-Content-Length": str(size)},
+            )
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index.md", "text": "appended\n"},
+        )
+
+    assert result.is_error is False, (
+        f"T47: bridge raised {_text(result)!r} on a "
+        f"single-attempt concurrent-edit scenario. The "
+        f"auto-retry helper should have caught the first "
+        f"attempt's verification failure, re-read the "
+        f"body, re-derived the appended body, and "
+        f"succeeded on attempt 2."
+    )
+    payload = result.structured_content or {}
+    # T23 ack envelope from attempt 2 — the size of the
+    # post-attempt-2 body.
+    assert payload.get("size_bytes") == 28
+
+
+@pytest.mark.asyncio
+async def test_t47_auto_retry_exhausts_after_max_retries() -> None:
+    """T47: when every attempt's verification re-read sees a
+    drift, the helper exhausts the retry budget and surfaces
+    the final error to the agent.
+
+    Test shape: 5 attempts with ``max_retries=2`` — the
+    helper retries twice, fails twice, surfaces the third
+    attempt's error. The agent sees the error after the
+    final attempt, not after attempt 1.
+    """
+    # Always drift on every verification GET — no attempt
+    # ever matches. The helper exhausts and surfaces the
+    # final error.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text="body\n",
+                headers={"X-Content-Length": "5"},
+            )
+        if request.method == "PUT":
+            # PUT response echoes the size of the
+            # bridge's written body. The bridge's
+            # verification GET returns a different size
+            # (concurrent writer mutated the page). Helper
+            # fires ``concurrent edit detected`` on every
+            # attempt.
+            return httpx.Response(
+                200, headers={"X-Content-Length": "11"}
+            )
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index.md", "text": "appended\n", "max_retries": 2},
+        )
+
+    # After 3 attempts (initial + 2 retries) the helper
+    # exhausts and surfaces the final error. The agent
+    # sees the error after the budget is consumed — not
+    # mid-loop.
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t47_auto_retry_passes_through_non_concurrent_edit_errors() -> None:
+    """T47: the auto-retry only catches ``concurrent edit
+    detected``; other ``ToolError`` shapes surface immediately.
+
+    Test shape: ``find not found in body`` on the first
+    attempt's read. The auto-retry must NOT retry this —
+    anchor mismatch is the agent's problem to solve (the
+    bridge doesn't guess the agent's intent). The error
+    surfaces immediately, with no retry.
+    """
+    # The ``find`` text doesn't appear in the body at all,
+    # so ``patch_page_replace`` raises ``find not found in
+    # body`` immediately. The auto-retry must NOT catch
+    # this and retry — the body still doesn't contain the
+    # anchor on a retry.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="alpha\ngamma\n", headers={"ETag": '"v1"'}
+            )
+        if request.method == "PUT":
+            # Should never be called — the ``find not
+            # found`` error raises before the PUT.
+            raise AssertionError("PUT should not be called")
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index.md",
+                "find": "beta-not-in-body",
+                "new_string": "BETA",
+            },
+        )
+
+    assert result.is_error is True
+    assert "find not found in body" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t47_auto_retry_opt_out_via_max_retries_zero() -> None:
+    """T47: ``max_retries=0`` opts out of auto-retry; the
+    first ``concurrent edit detected`` surfaces immediately.
+
+    Test shape: ``max_retries=0``, single concurrent edit
+    on attempt 1's verification GET. The helper fires,
+    the agent sees the raw 412 (pre-T47 behavior). No
+    retry attempts.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, text="body\n", headers={"X-Content-Length": "5"}
+            )
+        if request.method == "PUT":
+            return httpx.Response(
+                200, headers={"X-Content-Length": "11"}
+            )
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {
+                "name": "index.md",
+                "text": "appended\n",
+                "max_retries": 0,
+            },
+        )
+
+    # First attempt fails; no retry; error surfaces.
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_t47_auto_retry_propagates_find_not_found_after_retry() -> None:
+    """T47: when the body has drifted too far for the
+    anchor to make sense, ``find not found in body``
+    surfaces to the agent as-is (the bridge doesn't guess
+    the agent's intent).
+
+    Test shape: a concurrent writer *replaced* the anchor
+    text. Attempt 1's read finds ``beta``; the writer
+    replaces ``beta`` with ``delta`` between attempt 1's
+    PUT and the verification GET; the retry re-reads and
+    can't find ``beta`` anymore — ``find not found in
+    body`` surfaces (NOT retried further; the
+    anchor-mismatch is the agent's problem to solve).
+    """
+    state = {"get_count": 0, "put_count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            state["get_count"] += 1
+            if state["get_count"] <= 2:
+                # Attempt 1: read finds ``beta``; verification
+                # re-read shows ``beta`` replaced with ``delta``
+                # by a concurrent writer.
+                if state["get_count"] == 1:
+                    return httpx.Response(
+                        200,
+                        text="alpha\nbeta\ngamma\n",
+                        headers={"X-Content-Length": "18"},
+                    )
+                return httpx.Response(
+                    200,
+                    text="alpha\ndelta\ngamma\n",
+                    headers={"X-Content-Length": "18"},
+                )
+            # Attempt 2's read: same as attempt 1's
+            # verification re-read. ``beta`` is gone; the
+            # retry can't find the anchor and surfaces the
+            # error.
+            return httpx.Response(
+                200,
+                text="alpha\ndelta\ngamma\n",
+                headers={"X-Content-Length": "18"},
+            )
+        if request.method == "PUT":
+            state["put_count"] += 1
+            # Attempt 1: bridge computes
+            # ``alpha\nBETA-PATCHED\ngamma\n`` (24 bytes)
+            # from the original body. The PUT response
+            # echoes the size.
+            return httpx.Response(
+                200, headers={"X-Content-Length": "24"}
+            )
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_replace",
+            {
+                "name": "index.md",
+                "find": "beta",
+                "new_string": "BETA-PATCHED",
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # The retry re-reads, can't find ``beta``, surfaces the
+    # error. The agent sees ``find not found in body`` and
+    # can re-read manually to decide what to do. The
+    # auto-retry does NOT guess the agent's intent.
+    assert "find not found in body" in text
+    # The bridge did NOT retry further — the error
+    # surfaces from the first retry's read, not from
+    # multiple retry attempts.
+    assert state["put_count"] == 1, (
+        f"T47: bridge made {state['put_count']} PUTs — "
+        f"expected 1 (the initial attempt). The retry "
+        f"should NOT have re-PUTted after the anchor "
+        f"disappeared from the body."
+    )
+
+
 # --- T42: 412 contention hint ---------------------------------------
 
 
