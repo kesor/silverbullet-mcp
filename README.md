@@ -130,6 +130,29 @@ pinned the byte-for-byte full message need to update. The T42
 `[concurrent_edit_hint: true]` contention marker still rides as a
 trailing suffix after the v1.6 wording change.
 
+**T46 silent-overwrite 412 is rare on read-modify-write tools.**
+v1.6 narrowed the post-write verification helper's detection
+semantic: it now compares the verification-GET etag against the
+PUT-response etag (the bridge's view of "what we just wrote"),
+not the caller's pre-write `if_match`. The pre-v1.6 helper raised
+a spurious "concurrent edit detected" on every read-modify-write
+that grew the page (the synthesized etag is `str(size_bytes)`
+per T44; the post-write size differs from the pre-write size on
+every append / prepend / patch / move). Live reproduction on this
+dev box confirmed: 76 spurious errors in 6 hours on `Trading Book/
+Logs/2026-W36.md`, every one with `current_etag - expected_etag`
+exactly equal to the appended content length. T46 closes that
+gap — read-modify-write tools now succeed on a non-race write.
+The helper still catches genuine concurrent edits that land
+*between* the bridge's PUT and the verification GET (the narrow
+window in which another writer can land a PUT on the same page).
+A caller-supplied stale `if_match` (the agent manages its own
+etag round-trip and the page drifted in the gap) no longer fires
+the helper; that defense moved to the agent side — re-read on
+the agent's own retry loop, or use the bridge's read-modify-write
+tools (which do their own internal re-read and pass the
+verification check).
+
 **Every successful write returns the new `etag`.** Pass it to the next
 `if_match` on the same page and you'll never see the concurrency error.
 

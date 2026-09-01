@@ -403,8 +403,8 @@ async def _translate_sb_errors(name: str) -> AsyncIterator[None]:
 # byte-for-byte full message (a small set of T31b tests) needs
 # to update.
 _CONCURRENT_EDIT_MSG = (
-    "concurrent edit detected on {name}: the page changed since you "
-    "read it at {expected_etag}; current etag is {current_etag} — "
+    "concurrent edit detected on {name}: the page changed since we "
+    "wrote at {expected_etag}; current etag is {current_etag} — "
     "re-issue the write with if_match={current_etag}"
 )
 
@@ -685,13 +685,42 @@ async def _verify_concurrency_token(
     overwrites a page a concurrent agent already updated.
 
     The fix is post-write: re-read the page after a 200 write and
-    compare the post-write etag against the etag the caller passed
-    in ``if_match``. A mismatch means the page changed between
-    read and write (the very race ``If-Match`` exists to prevent);
-    the helper raises :exc:`ToolError("concurrent edit detected:
-    …")` so the agent sees the same conflict signal it would have
-    seen on an SB that honored ``If-Match``, just delivered later
-    in the round trip.
+    compare the post-write etag against the etag the PUT *response*
+    said the page is at (``post_write_meta.etag``). A mismatch
+    means a concurrent writer touched the page between our PUT and
+    the verification GET — the very race ``If-Match`` exists to
+    prevent. The helper raises :exc:`ToolError("concurrent edit
+    detected: …")` so the agent sees the same conflict signal it
+    would have seen on an SB that honored ``If-Match``, just
+    delivered later in the round trip.
+
+    T46: the comparison's reference point changed from
+    ``expected_etag`` (the caller's pre-write ``if_match``, which
+    is also the auto-threaded read etag for read-modify-write
+    tools) to ``post_write_meta.etag`` (the bridge's view of
+    "what we just wrote", from the PUT response). Pre-T46 the
+    helper compared the verification GET's etag against the
+    caller's pre-write etag — which *correctly* detects a race on
+    SBs that emit a real ``ETag`` (the etag identifies the resource
+    version; a mismatch means someone else wrote), but
+    *incorrectly* fires on every read-modify-write that grows the
+    page on the synthesized-etag path (the synthesized form is
+    ``str(size_bytes)`` per T44, and the post-write size always
+    differs from the pre-write size when the bridge writes a body
+    that grew). Live reproduction on this dev box: 76 spurious
+    "concurrent edit detected" errors in 6 hours on
+    ``Trading Book/Logs/2026-W36.md``, every one of them with
+    ``current_etag - expected_etag`` exactly equal to the size of
+    the appended content. The T46 fix is structural — the bridge
+    now asks "is the resource still at the version the PUT
+    response said it was?" rather than "is the resource still at
+    the version the caller read at?". On read-modify-write tools
+    the pre-write-read etag is no longer relevant to the
+    comparison — it remains in the ``expected_etag`` parameter
+    and the error wording for forensics (an agent that wants to
+    know "what did the bridge just write" reads
+    ``expected_etag``; an agent that wants the next-call etag
+    reads ``current_etag``).
 
     T45: the raised ``ToolError`` widens ``_CONCURRENT_EDIT_MSG``
     from the v1.3 / v1.4 / v1.5 single-placeholder form
@@ -793,7 +822,27 @@ async def _verify_concurrency_token(
         return  # page deleted post-write; not a concurrency violation
     except (ServerError, httpx.TimeoutException):
         return  # transient SB failure; verification is best-effort
-    if post_meta.etag != expected_etag:
+    if post_meta.etag != post_write_meta.etag:
+        # T46: compare against the PUT *response* etag (the
+        # bridge's view of "what we just wrote") rather than
+        # against the caller's pre-write etag. The PUT
+        # response's etag is what SB told the bridge the
+        # resource version is *immediately* after the bridge
+        # wrote; the verification GET asks "is the resource
+        # still at that version?". A mismatch means a
+        # concurrent writer touched the page between the PUT
+        # and the GET — the race the ``If-Match`` precondition
+        # exists to prevent. Pre-T46 the comparison was against
+        # ``expected_etag`` (the caller's pre-write etag); on
+        # the real-``ETag`` path that's equivalent (the etag
+        # identifies the version), but on the synthesized-etag
+        # path (``str(size_bytes)`` per T44) the post-write
+        # size always differs from the pre-write size when the
+        # bridge writes a body that grew, producing a 100%
+        # false-positive rate on every read-modify-write. Live
+        # reproduction confirmed: 76 spurious "concurrent edit
+        # detected" errors in 6 hours on ``Trading Book/Logs/
+        # 2026-W36.md``.
         # T45: format with ``name`` and ``current_etag`` so the
         # agent sees the page the write targeted (the *resolved*
         # name, matching T39's design call — error wording
@@ -812,11 +861,18 @@ async def _verify_concurrency_token(
         # ``None`` case is rare on SBs that emit ``ETag`` (the
         # common case); on this dev box the synthesized form is
         # ``"{size_bytes}"`` and is always populated.
+        # ``expected_etag`` placeholder carries the PUT-response
+        # etag (T46 re-anchoring) — semantically "the page
+        # changed since we wrote at" rather than "since you read
+        # it at". An agent reading ``expected_etag`` for
+        # forensics sees the bridge's view of what it just
+        # wrote; an agent reading ``current_etag`` sees the
+        # next-call etag.
         current_etag = post_meta.etag
         raise ToolError(
             _CONCURRENT_EDIT_MSG.format(
                 name=name,
-                expected_etag=expected_etag,
+                expected_etag=post_write_meta.etag,
                 current_etag=current_etag,
             )
         )

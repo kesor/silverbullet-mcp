@@ -528,7 +528,8 @@ agent learns the convention rather than continuing to retype.
 ## [Unreleased] — v1.6 (412 retry guidance on the bridge surface)
 
 Build map: [`docs/wayfinder/map-v1.6.md`](docs/wayfinder/map-v1.6.md).
-**Status: T45 shipped 2026-09-01; v1.6 destination reached**. v1.5
+**Status: T45 + T46 shipped 2026-09-01; v1.6 destination reached**.
+v1.5
 shipped the contention-window signal (T42) and the synthesized-etag
 fix (T44) but didn't address the underlying user complaint:
 agents in 412-contention loops don't know what to do next.
@@ -604,6 +605,62 @@ tool's name on the standard path.
   the T42 / T43 / T44 migration posture — only the test
   pinned the full byte-for-byte message; agents that
   pattern-match on the bare prefix are unaffected).
+
+- **T46 silent-overwrite 412 detection fix** — the
+  `_verify_concurrency_token` helper's comparison
+  reference changed from the caller's pre-write
+  `if_match` (T31b's original semantic — caught
+  read-vs-write races via the caller's stale etag) to
+  the PUT-response etag (the bridge's view of "what
+  we just wrote" — catches races between the bridge's
+  PUT and the verification GET). Pre-T46 the helper
+  raised a spurious "concurrent edit detected" on
+  every read-modify-write that grew the page: the
+  synthesized etag is `str(size_bytes)` per T44, and
+  the post-write size always differs from the
+  pre-write size on every append / prepend / patch /
+  move / `check_task`. Live reproduction on this dev
+  box: 76 spurious errors in 6 hours on `Trading Book/
+  Logs/2026-W36.md`, every one with `current_etag -
+  expected_etag` exactly equal to the appended content
+  length. The T46 fix is structural — the helper no
+  longer raises a spurious 412 on the dominant agent
+  workflow (read-modify-write tools); its detection
+  semantic narrows to the narrow PUT-to-GET window in
+  which a concurrent writer can land a PUT on the same
+  page. The wording's `expected_etag` placeholder now
+  carries the PUT-response etag (the bridge's view of
+  "what we wrote"); `current_etag` carries the
+  verification-GET etag (the next-call etag). The
+  framing shifts from "since you read it at" to "since
+  we wrote at" — the comparison now references the
+  bridge's PUT, not the agent's pre-write read. A
+  caller-supplied stale `if_match` (the agent manages
+  its own etag round-trip and the page drifted in the
+  gap) no longer fires the helper — that defense moved
+  to the agent side (re-read on the agent's own retry
+  loop, or use the bridge's read-modify-write tools
+  which do their own internal re-read and pass the
+  verification check). Five new Layer-1 cases
+  (`test_t46_silent_overwrite_passes_on_read_modify_write_byte_growth`,
+  `test_t46_silent_overwrite_still_detects_concurrent_edit_after_put`,
+  `test_t46_silent_overwrite_passes_for_write_page_same_body_back`,
+  `test_t46_silent_overwrite_passes_for_patch_page_lines_growing_page`,
+  `test_t46_silent_overwrite_message_uses_post_write_etag_for_expected`)
+  plus one new Layer-2 case
+  (`test_t46_append_to_page_no_concurrent_edit_on_byte_growth`)
+  end-to-end against the live SB. The pre-existing
+  `test_t31b_write_page_detects_concurrent_edit_via_silent_overwrite`
+  and `test_t31b_append_to_page_auto_threads_read_etag_when_if_match_is_none`
+  Layer-1 tests, plus the live `test_concurrent_edit_detected_via_post_write_verification`,
+  updated their mocks for the new semantic (PUT
+  response etag matches the caller's `if_match`; the
+  verification GET returns a drifted value to simulate
+  a post-PUT race). `_CONCURRENT_EDIT_MSG` wording
+  shifted from "since you read it at" to "since we
+  wrote at" — the pre-T46 prefix is byte-preserved
+  (agents pattern-matching on `concurrent edit detected`
+  still match).
 
 ## [v1.3] — agent-grade discovery + edit hygiene
 

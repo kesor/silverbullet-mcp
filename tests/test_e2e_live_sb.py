@@ -110,6 +110,13 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     body = "hello from T7 live e2e\n"
     server_task = asyncio.create_task(serve(settings))
@@ -433,7 +440,13 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     dpayload = diffed.structured_content or {}
                     assert dpayload.get("other") is None
                     assert dpayload.get("name", {}).get("body") == body
-                    assert "-appended\n" in dpayload.get("diff", "")
+                    # Body is ``body = "hello from T7 live e2e\n"``
+                    # (the marker was reset to ``body`` after
+                    # the move-back block above; the dry-run
+                    # append doesn't write). The literal-string
+                    # other_body is ``body`` + ``"NOT-APPENDED\n"``,
+                    # so the diff is *additive*: one line
+                    # added at line 2 (``+NOT-APPENDED\n``).
                     assert "+NOT-APPENDED\n" in dpayload.get("diff", "")
 
                     # ``diff_pages`` against a second page
@@ -535,7 +548,18 @@ async def test_live_sb_write_read_list_and_precondition() -> None:
                     # test that adds a body line above the
                     # bullets will shift them.
                     assert all(t["name"] == MARKER for t in tasks_payload)
-                    assert tasks_payload[0]["line"] == 2
+                    # Body layout: line 1 is the prose header
+                    # (``"hello from T7 live e2e\n"``); line 2 is
+                    # the section header (``"# Tasks\n"``); line
+                    # 3 is the first bullet. ``line`` is
+                    # 1-indexed against the full body — pre-
+                    # fix the test asserted ``== 2`` but the
+                    # body has the section header above the
+                    # first bullet, so the correct value is
+                    # ``3``. (Pinned because a future body
+                    # layout change would shift the line
+                    # numbers.)
+                    assert tasks_payload[0]["line"] == 3
 
                     # ``check_task`` (T30) round-trip against live
                     # SB: flip ``FirstTask`` from ``[ ]`` (todo) to
@@ -700,6 +724,13 @@ async def test_if_match_stale_etag_returns_412() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     body_a = "T31 first write body\n"
     body_b = "T31 second write body (no If-Match; mutates out-of-band)\n"
@@ -833,32 +864,38 @@ async def test_if_match_stale_etag_returns_412() -> None:
                             "if_match": etag_a,
                         },
                     )
-                    assert stale_write.is_error is True, (
-                        f"stale If-Match etag should 412 on "
-                        f"PUT /.fs/{T31_MARKER}; bridge returned "
-                        f"is_error=False (live SB silently "
-                        f"overwrote the page on a stale etag — "
-                        f"the v1.2 / v1.3 concurrency story "
-                        f"does not hold on this SB build; T31 "
-                        f"closes negatively; T31a / T31b spawn "
-                        f"to switch to the body-field "
-                        f"expected_last_modified convention "
-                        f"from xmatthewx/silverbullet-mcp-server)"
-                    )
-                    # The wording is the unified 412 translation
-                    # in :func:`_translate_sb_errors`. We assert
-                    # on the substring so future wording tweaks
-                    # don't break the test; the full message is
-                    # logged above on failure.
-                    assert stale_write.content, (
-                        "is_error=True but content is empty — "
-                        "no message to check the 412 wording against"
-                    )
-                    assert "precondition failed" in (
-                        stale_write.content[0].text
-                    ), (
-                        f"stale If-Match raised a non-412 error: "
-                        f"{stale_write.content[0].text!r}"
+                    # T31 closed negatively on this SB build:
+                    # the live SB does NOT honor ``If-Match`` on
+                    # PUT — it returns 200 regardless of the
+                    # header value. T46 documented this as
+                    # deliberate: the bridge's verification
+                    # helper no longer catches read-vs-write
+                    # races (it only catches races between the
+                    # bridge's PUT and the verification GET),
+                    # so a stale ``if_match`` from the caller
+                    # silently overwrites. This test documents
+                    # the SB fact (the precondition path never
+                    # fires) rather than asserting the bridge
+                    # surfaces a 412 — a future SB build that
+                    # honors ``If-Match`` would surface the 412
+                    # via :func:`_translate_sb_errors`'s
+                    # standard 412 clause (the T45 wording), at
+                    # which point this assertion can be tightened
+                    # to ``is_error=True`` and the wording check
+                    # below.
+                    assert stale_write.is_error is False, (
+                        f"T31 negative on this SB build: live "
+                        f"SB silently overwrites on a stale "
+                        f"if_match (no 412). Recorded as an SB "
+                        f"fact rather than a bridge failure; the "
+                        f"v1.2 / v1.3 concurrency story depends "
+                        f"on SB honoring ``If-Match``, which "
+                        f"this build does not. T46's verification "
+                        f"helper does NOT catch this case (only "
+                        f"races between the bridge's PUT and "
+                        f"verification GET); the agent's "
+                        f"responsibility to re-read on the agent "
+                        f"side if it wants staleness detection."
                     )
     finally:
         server_task.cancel()
@@ -911,6 +948,13 @@ async def test_if_match_synthetic_etag_drifts_on_body_change() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     body_a = "T31a first write body\n"
     body_b = "T31a second write body, longer\n"
@@ -1032,19 +1076,38 @@ async def test_if_match_synthetic_etag_drifts_on_body_change() -> None:
 # stale ``If-Match`` (the v1.3 SB-blocking fact). Without T31b
 # the v1.2 / v1.3 concurrency story was unsupported here. T31b's
 # post-write verification helper re-reads after a 200 write and
-# compares the post-write etag against the one the caller passed
-# in ``if_match``; a mismatch raises
+# compares the post-write etag against the bridge's view of
+# "what we just wrote" (T46: the PUT-response etag, not the
+# caller's pre-write ``if_match``); a mismatch raises
 # ``ToolError("concurrent edit detected: …")``.
 #
-# This live test exercises the same race as T31 but with the
-# helper in place: a write-then-mutate-out-of-band-then-write
-# sequence against the live SB, where the second write's
-# ``if_match`` is now stale. The T31 negative verification expected
-# ``is_error=True`` on the second write's *412 path* (which never
-# fires here); T31b's verification expects ``is_error=True`` on
-# the helper's post-write re-read path instead. End state is the
-# same — the agent sees ``concurrent edit detected`` — but the
-# mechanism differs (post-write re-read, not pre-write 412).
+# T46 narrowed the helper's detection semantic to *between the
+# bridge's PUT and the verification GET*. The pre-T46 semantic
+# (catches read-vs-write races via the caller's pre-write etag)
+# is gone — a caller-supplied stale ``if_match`` no longer fires
+# the helper. The agent that does its own etag round-trip and
+# passes a now-stale ``if_match`` sees a successful write on a
+# body that drifted; the verification GET matches the PUT
+# response (same body), so no error fires. The agent's only
+# defense against a read-vs-write race is to do its own
+# re-read-after-failure retry loop on the agent side, or to
+# use the bridge's read-modify-write tools (``append_to_page``,
+# ``patch_page_*``, ``move_page``, ``check_task``) which do
+# their own internal re-read and pass the verification check
+# (the dominant workflow — Grok's append_to_page on the W36
+# log page, etc.).
+#
+# This live test reflects the new semantic: the bridge
+# *successfully* writes a body that drifted (the synthesized
+# etag was already drift-stable from the original ``size_a``,
+# but the body has changed since the caller's read). No
+# concurrent-edit error fires; the write lands; the agent
+# sees a T23 ack envelope. The pre-T46 expectation that the
+# helper would catch this case is *intentionally* gone — T46
+# is a deliberate narrowing that fixes a 100% false-positive
+# rate on read-modify-write tools in exchange for the corner
+# case where an agent manages its own ``if_match`` and
+# silently loses concurrent edits.
 # ---------------------------------------------------------------------------
 
 T31B_MARKER = "e2e-mcp-silverbullet-t31b-verify.md"
@@ -1060,7 +1123,7 @@ async def _delete_t31b_marker(sb_url: str, sb_token: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_edit_detected_via_post_write_verification() -> None:
+async def test_t31b_stale_if_match_succeeds_silently_on_this_sb_build() -> None:
     sb_url, sb_token = _require_live_env()
     port = _free_port()
     host = "127.0.0.1"
@@ -1075,6 +1138,13 @@ async def test_concurrent_edit_detected_via_post_write_verification() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     body_a = "T31b first write body\n"
     body_b = "T31b second write body, longer\n"
@@ -1093,13 +1163,10 @@ async def test_concurrent_edit_detected_via_post_write_verification() -> None:
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 
-                    # Step 1: write body_a. The envelope's
-                    # ``etag`` is synthesized via T31a (SB
-                    # strips ``ETag`` on this build). Capture
-                    # the etag and the size for the synthetic
-                    # fallback path; T31a already verified the
-                    # synthesized value is stable across reads
-                    # of unchanged content.
+                    # Step 1: write body_a. Capture the
+                    # synthesized etag (SB strips ``ETag`` on
+                    # this build per T31; T31a / T44
+                    # synthesizes ``str(size_bytes)``).
                     created = await session.call_tool(
                         "write_page",
                         {"name": T31B_MARKER, "content": body_a},
@@ -1107,58 +1174,45 @@ async def test_concurrent_edit_detected_via_post_write_verification() -> None:
                     assert created.is_error is False, created
                     created_payload = created.structured_content or {}
                     etag_a = created_payload.get("etag")
-                    last_modified_a = created_payload.get("last_modified_ms")
                     size_a = created_payload.get("size_bytes")
                     if etag_a is None:
-                        # Same fallback as T31: synthesize a
-                        # ``"{bytes}"`` value from ``size_bytes``
-                        # the envelope *did* surface. T31a / T44
-                        # now does this automatically on the
-                        # bridge side, so this branch is
-                        # unreachable in normal operation — kept
-                        # as a defensive guard so a future
-                        # regression that strips T31a's fallback
-                        # doesn't crash this test. (Pre-T44 the
-                        # synthesized form was
-                        # ``"<ms>-<bytes>"``; T44 dropped the
-                        # mtime component because the bridge
-                        # stamps ``X-Last-Modified`` with
-                        # ``now_ms`` on every PUT, which made
-                        # the dashed form drift on every write
-                        # and caused T31b's verification to
-                        # raise a false-positive "concurrent
-                        # edit detected" on every successful
-                        # write.)
-                        if last_modified_a is None or size_a is None:
+                        if size_a is None:
                             raise AssertionError(
-                                "T31b: cannot construct a synthetic "
-                                "fallback etag; envelope missing both "
-                                "etag and X-Last-Modified/size_bytes"
+                                "T31b: cannot construct a "
+                                "synthetic fallback etag; "
+                                "envelope missing both etag "
+                                "and size_bytes"
                             )
                         etag_a = f'"{size_a}"'
 
                     # Step 2: write body_b (mutate out-of-band
                     # so ``etag_a`` is stale). No ``if_match``
-                    # here — this is the concurrent edit we're
-                    # trying to detect.
+                    # here — this is the "concurrent edit"
+                    # against which the bridge's verification
+                    # helper used to defend.
                     mutating_write = await session.call_tool(
                         "write_page",
                         {"name": T31B_MARKER, "content": body_b},
                     )
                     assert mutating_write.is_error is False, (
-                        "T31b: out-of-band mutating write failed; "
-                        "test setup broken"
+                        "T31b: out-of-band mutating write "
+                        "failed; test setup broken"
                     )
 
                     # Step 3: write body_c with the now-stale
-                    # ``if_match=etag_a``. On this SB build the
-                    # PUT returns 200 (T31's negative finding);
-                    # T31b's post-write verification helper
-                    # re-reads and detects the drift. The agent
-                    # sees the unified
-                    # ``"concurrent edit detected: …"``
-                    # ``ToolError`` rather than a silent
-                    # overwrite.
+                    # ``if_match=etag_a``. T46: the bridge's
+                    # verification helper now compares against
+                    # the PUT-response etag (the size of
+                    # body_c) rather than the caller's
+                    # pre-write etag (etag_a). The
+                    # verification GET sees the post-write
+                    # file size — body_c's size, matching the
+                    # PUT response — so no error fires. The
+                    # agent's stale ``if_match`` is silently
+                    # honored as if it were current; the
+                    # agent's responsibility to re-read on
+                    # the agent side if it wants
+                    # staleness detection.
                     stale_write = await session.call_tool(
                         "write_page",
                         {
@@ -1167,35 +1221,184 @@ async def test_concurrent_edit_detected_via_post_write_verification() -> None:
                             "if_match": etag_a,
                         },
                     )
-                    assert stale_write.is_error is True, (
-                        f"T31b: stale If-Match should surface "
-                        f"as 'concurrent edit detected' on this "
-                        f"SB build (T31 negative; T31b fallback "
-                        f"verification); bridge returned "
-                        f"is_error=False. The v1.3 concurrency "
-                        f"story is broken end-to-end."
+                    assert stale_write.is_error is False, (
+                        f"T46: write with stale if_match "
+                        f"should *succeed* (the verification "
+                        f"helper only catches races between "
+                        f"the bridge's PUT and the verification "
+                        f"GET, not read-vs-write races); bridge "
+                        f"raised {_text(stale_write)!r}."
                     )
-                    assert stale_write.content, (
-                        "is_error=True but content is empty — "
-                        "no message to check the wording against"
-                    )
-                    assert "concurrent edit detected" in (
-                        stale_write.content[0].text
+                    # T23 ack envelope: the write landed.
+                    spayload = stale_write.structured_content or {}
+                    assert spayload.get("size_bytes") == len(
+                        body_c.encode("utf-8")
                     ), (
-                        f"T31b: stale write raised a "
-                        f"non-concurrency error: "
-                        f"{stale_write.content[0].text!r}"
+                        f"T46: ack envelope's size_bytes "
+                        f"({spayload.get('size_bytes')}) "
+                        f"doesn't match body_c's byte count "
+                        f"({len(body_c.encode('utf-8'))})"
                     )
-                    assert etag_a in stale_write.content[0].text, (
-                        f"T31b: error message should name the "
-                        f"expected etag; got "
-                        f"{stale_write.content[0].text!r}"
+
+                    # Confirm the body actually changed on
+                    # disk — the silent-overwrite behavior is
+                    # the user's documented concern (T31
+                    # negative finding; the bridge can't
+                    # defend against it on SBs that ignore
+                    # ``If-Match``, and T46 explicitly
+                    # doesn't try — read-vs-write races need
+                    # either SB-side ``If-Match`` honoring or
+                    # agent-side re-read-after-failure).
+                    read_back = await session.call_tool(
+                        "read_page", {"name": T31B_MARKER}
                     )
+                    assert read_back.is_error is False, read_back
+                    assert (read_back.structured_content or {}).get(
+                        "body"
+                    ) == body_c
     finally:
         server_task.cancel()
         with suppress(asyncio.CancelledError):
             await server_task
         await _delete_t31b_marker(sb_url, sb_token)
+
+
+# ---------------------------------------------------------------------------
+# T46: append_to_page succeeds end-to-end against live SB.
+#
+# The user's reproduction (76 spurious "concurrent edit detected"
+# errors in 6 hours on ``Trading Book/Logs/2026-W36.md``) shows
+# the pre-T46 verification helper raised a silent-overwrite 412
+# on every successful read-modify-write that grew the page.
+# T46 fixes the helper's comparison reference (PUT-response
+# etag instead of caller's pre-write etag); this live test pins
+# the fix end-to-end against the real SB.
+#
+# Shape: read a known page (captures the synthesized etag),
+# append a known suffix, and assert the write succeeds without
+# a "concurrent edit detected" 412. Pre-T46 this test would
+# fail with a spurious 412 (the synthesized etag drifted by
+# exactly the size of the appended content); post-T46 the
+# write returns the T23 ack envelope.
+# ---------------------------------------------------------------------------
+
+T46_MARKER = "e2e-mcp-silverbullet-t46-append.md"
+
+
+async def _delete_t46_marker(sb_url: str, sb_token: str) -> None:
+    headers: dict[str, str] = {}
+    if sb_token:
+        headers["Authorization"] = f"Bearer {sb_token}"
+    async with httpx.AsyncClient(base_url=sb_url, headers=headers, timeout=5.0) as client:
+        with suppress(httpx.HTTPError):
+            await client.delete(f"/.fs/{T46_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_t46_append_to_page_no_concurrent_edit_on_byte_growth() -> None:
+    sb_url, sb_token = _require_live_env()
+    port = _free_port()
+    host = "127.0.0.1"
+    resource_url = f"http://{host}:{port}/mcp"
+    settings = Settings(
+        token=INBOUND_TOKEN,
+        sb_url=sb_url,
+        sb_token=sb_token,
+        resource_url=resource_url,
+        host=host,
+        port=port,
+        allowed_hosts=(),
+        journal=JournalConfig(enabled=False, space_path=None),
+        list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
+    )
+    initial_body = "T46 initial body\n"
+    append_suffix = "T46 append suffix\n"
+    server_task = asyncio.create_task(serve(settings))
+    try:
+        await _wait_listening(host, port)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {INBOUND_TOKEN}"},
+            timeout=15.0,
+        ) as http_client:
+            async with streamable_http_client(
+                url=resource_url,
+                http_client=http_client,
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+
+                    # Step 1: write the initial body.
+                    created = await session.call_tool(
+                        "write_page",
+                        {"name": T46_MARKER, "content": initial_body},
+                    )
+                    assert created.is_error is False, created
+
+                    # Step 2: append a known suffix. Pre-T46 this
+                    # would surface as a spurious "concurrent edit
+                    # detected" 412 because the synthesized etag
+                    # (T31a / T44's ``str(size_bytes)``) drifts
+                    # when the body grows. T46 fixes the
+                    # verification helper's comparison reference
+                    # to the PUT-response etag, so this call now
+                    # returns the T23 ack envelope.
+                    appended = await session.call_tool(
+                        "append_to_page",
+                        {"name": T46_MARKER, "text": append_suffix},
+                    )
+                    assert appended.is_error is False, (
+                        f"T46: append_to_page on the live SB "
+                        f"raised {_text(appended)!r}. Pre-T46 "
+                        f"this surfaced as a spurious 'concurrent "
+                        f"edit detected' because the "
+                        f"synthesized-etag post-write size "
+                        f"differed from the pre-write size by "
+                        f"exactly the appended content length. "
+                        f"The T46 fix compares the "
+                        f"verification-GET etag against the "
+                        f"PUT-response etag, not the caller's "
+                        f"pre-write etag, so a non-race write "
+                        f"succeeds."
+                    )
+                    apayload = appended.structured_content or {}
+                    # T23 ack envelope: ``size_bytes`` is the
+                    # combined body length. ``append_to_page``
+                    # inserts a separator newline only when the
+                    # existing body doesn't already end in one
+                    # (``initial_body`` ends in ``\n`` so no
+                    # separator is inserted here).
+                    expected_size = (
+                        len(initial_body)
+                        + len(append_suffix)
+                    )
+                    assert apayload.get("size_bytes") == expected_size, (
+                        f"T46: ack envelope's size_bytes "
+                        f"({apayload.get('size_bytes')}) "
+                        f"doesn't match the combined body "
+                        f"length ({expected_size})"
+                    )
+
+                    # Step 3: read-back confirms the appended
+                    # content landed on disk.
+                    read_back = await session.call_tool(
+                        "read_page", {"name": T46_MARKER}
+                    )
+                    assert read_back.is_error is False, read_back
+                    assert (read_back.structured_content or {}).get(
+                        "body"
+                    ) == initial_body + append_suffix
+    finally:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        await _delete_t46_marker(sb_url, sb_token)
 
 
 # ---------------------------------------------------------------------------
@@ -1241,6 +1444,13 @@ async def test_create_page_round_trip_on_empty_space() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     body = "T32 create page body\n"
     server_task = asyncio.create_task(serve(settings))
@@ -1332,6 +1542,13 @@ async def test_prepend_to_page_round_trip_with_frontmatter() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     # Pre-populate the page via the bridge so the test
     # doesn't depend on raw ``/.fs`` PUT semantics outside
@@ -1450,6 +1667,13 @@ async def test_body_size_cap_fires_before_sb_round_trip() -> None:
         allowed_hosts=(),
         journal=JournalConfig(enabled=False, space_path=None),
         list_pages_hydrate_etags=False,
+        auth_mode="static",
+        jwt_issuer=None,
+        jwt_audience=None,
+        jwt_jwks_url=None,
+        jwt_algorithms=(),
+        jwt_leeway_seconds=0,
+        log_level="INFO",
     )
     # 256 KiB + 1 byte of "a" — one byte over the cap.
     over_cap_body = "a" * (256 * 1024 + 1)

@@ -648,10 +648,21 @@ async def test_t39_check_task_normalizes_page_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             assert request.url.path == "/.fs/Foo.md"
+            # T46: the verification GET must echo the PUT
+            # response's etag so the post-write helper's
+            # comparison passes (no drift = no spurious
+            # concurrent-edit error). Both real-ETag and
+            # synthesized-etag paths converge on this — same
+            # etag on PUT response and verification GET is
+            # the no-concurrent-write shape the helper
+            # requires.
             return httpx.Response(
                 200,
                 text="header\n- [ ] task [[Ref]] ref\n",
-                headers={"X-Content-Length": "26"},
+                headers={
+                    "ETag": '"v2"',
+                    "X-Content-Length": "26",
+                },
             )
         if request.method == "PUT":
             assert request.url.path == "/.fs/Foo.md"
@@ -5619,13 +5630,28 @@ async def test_check_task_flips_todo_to_done_with_default_state() -> None:
     body = "header\n- [ ] task [[Ref]] ref\n"
     written_bodies: list[str] = []
     written_if_match: list[str | None] = []
+    get_count = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
+            get_count["n"] += 1
+            # First GET is the read-modify-write read
+            # (``"read-etag"`` is auto-threaded into the
+            # write's If-Match). Subsequent GETs are
+            # verification re-reads; T46 requires them to
+            # match the PUT response's etag so the helper's
+            # comparison passes (no concurrent-edit
+            # detected on a non-race write).
+            if get_count["n"] == 1:
+                return httpx.Response(
+                    200,
+                    text=body,
+                    headers={"ETag": '"read-etag"'},
+                )
             return httpx.Response(
                 200,
                 text=body,
-                headers={"ETag": '"read-etag"'},
+                headers={"ETag": '"write-etag"'},
             )
         if request.method == "PUT":
             written_bodies.append(request.read().decode("utf-8"))
@@ -5674,10 +5700,19 @@ async def test_check_task_returns_todo_state() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
+            # T46: the verification GET (second GET) must
+            # match the PUT response's etag so the helper's
+            # comparison passes. Both calls return ``"w"``
+            # here (matching the PUT response) — the read
+            # returns ``"w"`` too, which makes the
+            # auto-threaded ``If-Match`` match the PUT
+            # response's etag. The mock simplifies: a
+            # no-concurrent-edit case has the same etag on
+            # read, write, and verification.
             return httpx.Response(
                 200,
                 text="- [x] task [[Ref]] ref\n",
-                headers={"ETag": '"e"'},
+                headers={"ETag": '"w"'},
             )
         if request.method == "PUT":
             return httpx.Response(
@@ -5710,10 +5745,12 @@ async def test_check_task_returns_cancelled_state() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
+            # T46: see ``test_check_task_returns_todo_state``
+            # for the read/write/verification etag alignment.
             return httpx.Response(
                 200,
                 text="- [ ] task [[Ref]] ref\n",
-                headers={"ETag": '"e"'},
+                headers={"ETag": '"w"'},
             )
         if request.method == "PUT":
             body = request.read().decode("utf-8")
@@ -6140,17 +6177,34 @@ async def test_t31b_write_page_detects_concurrent_edit_via_silent_overwrite() ->
     same conflict signal it would have seen on an SB that
     honored ``If-Match``, just delivered later in the round
     trip.
+
+    T46: the helper's comparison reference changed from the
+    caller's pre-write ``if_match`` (the ``"v1"`` in the call
+    below) to the PUT *response* etag. The mock reflects the
+    new semantic: the PUT response carries ``"v1"`` (the version
+    the bridge just wrote); the verification GET returns
+    ``"new"`` (a different version, signalling a concurrent
+    writer touched the page after the bridge's write). Pre-T46
+    the mocks returned ``"new"`` for both PUT and GET and the
+    helper compared against the caller's ``"v1"`` — that
+    semantic is gone; the new comparison is
+    ``post_meta.etag != post_write_meta.etag`` and the new mock
+    is the only shape that triggers it.
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PUT":
-            # SB returns 200 on stale ``If-Match`` (the v1.3 SB
-            # fact T31 surfaced); the bridge's post-write
-            # verification is what catches the drift.
-            return httpx.Response(200, headers={"ETag": '"new"'})
-        # Verification GET returns the post-write etag, which
-        # drifts from the caller's ``"v1"`` — the page was
-        # mutated out-of-band between the agent's read and
-        # write.
+            # T46: PUT response carries the version the bridge
+            # just wrote (``"v1"`` — same as the caller's
+            # ``if_match``). The bridge's post-write verification
+            # uses *this* value as the reference for the
+            # subsequent verification GET comparison, not the
+            # caller's pre-write etag.
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns a *different* etag — a
+        # concurrent writer touched the page between the
+        # bridge's PUT and the verification re-read. T46 detects
+        # this as ``post_meta.etag ('"new"') != post_write_meta.etag
+        # ('"v1"')`` and surfaces the silent-overwrite error.
         return httpx.Response(200, headers={"ETag": '"new"'})
 
     server = _build(handler)
@@ -6162,9 +6216,14 @@ async def test_t31b_write_page_detects_concurrent_edit_via_silent_overwrite() ->
 
     assert result.is_error is True
     assert "concurrent edit detected" in _text(result)
-    # The error names the expected etag so the agent can see
-    # what the bridge was looking for.
+    # The error names the PUT-response etag (the bridge's view
+    # of "what we wrote") for the ``expected_etag`` placeholder
+    # — T46 re-anchored the wording from "since you read it at"
+    # to "since we wrote at". An agent reading ``expected_etag``
+    # sees ``"v1"`` (the version the bridge wrote); the next-
+    # call etag (``current_etag``) is ``"new"``.
     assert '"v1"' in _text(result)
+    assert '"new"' in _text(result)
 
 
 @pytest.mark.asyncio
@@ -6411,18 +6470,25 @@ async def test_t31b_append_to_page_auto_threads_read_etag_when_if_match_is_none(
             # First GET (the read-modify-write) returns
             # ``"read-etag"``, which the bridge auto-threads
             # into the write's ``If-Match``. Second GET (the
-            # verification re-read) returns ``"new"`` — drift
-            # means a concurrent edit happened between the
-            # read and the write, and the helper surfaces the
-            # unified concurrency error.
+            # verification re-read) returns ``"new"`` — a
+            # different version than the PUT response, which
+            # means a concurrent writer touched the page after
+            # the bridge's write.
             if request_count["get"] == 1:
                 return httpx.Response(
                     200, text="hello", headers={"ETag": '"read-etag"'}
                 )
             return httpx.Response(200, headers={"ETag": '"new"'})
         if request.method == "PUT":
-            return httpx.Response(200, headers={"ETag": '"new"'})
-        return httpx.Response(200, headers={"ETag": '"new"'})
+            # T46: PUT response carries ``"read-etag"`` (the
+            # version the bridge just wrote — same as the
+            # auto-threaded ``If-Match``). Pre-T46 this returned
+            # ``"new"`` and the helper compared against the
+            # caller's pre-write etag; the new semantic compares
+            # against this PUT-response etag, so the mock shape
+            # has to match.
+            return httpx.Response(200, headers={"ETag": '"read-etag"'})
+        return httpx.Response(200, headers={"ETag": '"read-etag"'})
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -7138,7 +7204,12 @@ async def test_prepend_to_page_auto_threads_read_etag_when_if_match_is_none() ->
             return httpx.Response(
                 200, text="body\n", headers={"ETag": '"new"'}
             )
-        return httpx.Response(200, headers={"ETag": '"new"'})
+        # T46: PUT response carries ``"read-etag"`` (the version
+        # the bridge just wrote — same as the auto-threaded
+        # ``If-Match``); the verification GET returns
+        # ``"new"`` (drift after the bridge's write); the
+        # helper surfaces the error.
+        return httpx.Response(200, headers={"ETag": '"read-etag"'})
 
     server = _build(handler)
     async with Client(server, raise_exceptions=True) as client:
@@ -8446,10 +8517,15 @@ async def test_t45_concurrent_edit_message_includes_current_etag() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PUT":
-            # SB ignores ``If-Match`` and writes anyway.
-            return httpx.Response(200, headers={"ETag": '"new"'})
-        # Verification GET returns the post-write etag; the
-        # drift (``"v1"`` → ``"new"``) is what trips the helper.
+            # T46: PUT response carries ``"v1"`` — the version
+            # the bridge just wrote (same as the caller's
+            # ``if_match``). The helper compares against this
+            # value (the bridge's view of "what we wrote"),
+            # not against the caller's pre-write etag.
+            return httpx.Response(200, headers={"ETag": '"v1"'})
+        # Verification GET returns ``"new"`` — the page drifted
+        # between the bridge's PUT and the re-read; T46 detects
+        # this as a concurrent edit and surfaces the error.
         return httpx.Response(200, headers={"ETag": '"new"'})
 
     server = _build(handler)
@@ -8465,10 +8541,16 @@ async def test_t45_concurrent_edit_message_includes_current_etag() -> None:
 
     assert result.is_error is True
     text = _text(result)
-    # The bridge surfaces the post-write etag (the value the
-    # agent needs as the next ``if_match=``).
+    # The bridge surfaces the verification-GET etag (the value
+    # the agent needs as the next ``if_match=``) — this is
+    # unchanged from pre-T46.
     assert 'current etag is "new"' in text
-    # And the expected etag (so the agent sees what it sent).
+    # T46: ``expected_etag`` is now the PUT-response etag
+    # (the bridge's view of "what we wrote"), not the caller's
+    # pre-write ``if_match``. An agent reading ``expected_etag``
+    # for forensics sees the version the bridge just wrote
+    # (``"v1"``); an agent reading ``current_etag`` sees the
+    # next-call etag (``"new"``).
     assert '"v1"' in text
     # The resolved name appears in the message — T39 normalizes
     # ``index.md`` as-is (already has a ``.``).
@@ -8496,7 +8578,11 @@ async def test_t45_concurrent_edit_message_includes_if_match_retry_form() -> Non
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PUT":
-            return httpx.Response(200, headers={"ETag": '"new"'})
+            # T46: PUT response carries ``"v1"`` (the version
+            # the bridge just wrote); the verification GET
+            # returns ``"new"`` (drift after the bridge's
+            # write); the helper surfaces the error.
+            return httpx.Response(200, headers={"ETag": '"v1"'})
         return httpx.Response(200, headers={"ETag": '"new"'})
 
     server = _build(handler)
@@ -8600,7 +8686,11 @@ async def test_t45_concurrent_edit_message_uses_resolved_name() -> None:
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PUT":
-            return httpx.Response(200, headers={"ETag": '"new"'})
+            # T46: PUT response carries ``"v1"`` (the version
+            # the bridge just wrote); the verification GET
+            # returns ``"new"`` (drift after the bridge's
+            # write); the helper surfaces the error.
+            return httpx.Response(200, headers={"ETag": '"v1"'})
         return httpx.Response(200, headers={"ETag": '"new"'})
 
     server = _build(handler)
@@ -8670,6 +8760,354 @@ async def test_t45_standard_412_pointer_omitted_for_empty_name() -> None:
     # cleared the contention log, and a single 412 is below
     # the threshold).
     assert "[concurrent_edit_hint:" not in text
+
+
+# --- T46: fix _verify_concurrency_token false-positive on byte-growth --
+
+
+@pytest.mark.asyncio
+async def test_t46_silent_overwrite_passes_on_read_modify_write_byte_growth() -> None:
+    """T46: a read-modify-write that grows the page no longer
+    triggers the spurious silent-overwrite 412.
+
+    The pre-T46 verification helper compared the
+    verification-GET etag against the caller's pre-write
+    ``if_match`` (the auto-threaded read etag). On the
+    synthesized-etag path (``str(size_bytes)`` per T44), the
+    post-write size always differs from the pre-write size
+    when the bridge writes a body that grew — producing a
+    100% false-positive rate on every read-modify-write that
+    changes the byte count.
+
+    Reproduction on the live dev box: ``append_to_page`` on
+    ``Trading Book/Logs/2026-W36.md`` raised spurious
+    "concurrent edit detected" on every retry (76 errors in
+    6 hours; each ``current_etag - expected_etag`` exactly
+    equals the size of the appended content). The T46 fix
+    compares the verification-GET etag against the
+    PUT-response etag (``post_write_meta.etag``), which is
+    the bridge's view of "what we just wrote". The
+    comparison passes when no concurrent edit happened.
+
+    This test pins the fix end-to-end through the bridge:
+    100-byte page → append 50 bytes → write returns the
+    T23 ack envelope with no error (the pre-T46 behavior
+    raised ``ToolError("concurrent edit detected: …")``).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # Pre-write read (100-byte page) and verification
+            # re-read (151-byte page after PUT). No ETag
+            # header → synthesized-etag path: etag =
+            # ``str(size_bytes)``.
+            if not getattr(handler, "read_done", False):
+                handler.read_done = True  # type: ignore[attr-defined]
+                return httpx.Response(
+                    200,
+                    text="x" * 100,
+                    headers={"X-Content-Length": "100"},
+                )
+            # Verification re-read returns the file size
+            # *after* the bridge's PUT, which is exactly
+            # the size of the new body the bridge wrote
+            # (no concurrent edit happened).
+            return httpx.Response(
+                200,
+                text="x" * 151,
+                headers={"X-Content-Length": "151"},
+            )
+        if request.method == "PUT":
+            # Bridge sent ``X-Content-Length: 151`` (the size
+            # of new_body); SB echoes it back. The bridge's
+            # ``meta.etag`` (from the PUT response) =
+            # ``str(151)`` — same as the verification GET.
+            # T46 compares verification-GET etag against
+            # this value, not against the pre-write
+            # ``expected_etag`` (which was ``str(100)``).
+            return httpx.Response(
+                200,
+                headers={"X-Content-Length": "151"},
+            )
+        return httpx.Response(404)
+
+    handler.read_done = False  # type: ignore[attr-defined]
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "append_to_page",
+            {"name": "index.md", "text": "y" * 50},
+        )
+
+    assert result.is_error is False, (
+        f"T46: bridge raised {_text(result)!r} on a "
+        f"non-concurrent-edit append. The pre-T46 "
+        f"verification helper compared the "
+        f"verification-GET etag against the caller's "
+        f"pre-write etag, which differed by the size "
+        f"of the appended content on every "
+        f"read-modify-write that grew the page. The "
+        f"fix compares against the PUT-response etag "
+        f"(the bridge's view of what it just wrote)."
+    )
+    payload = result.structured_content or {}
+    # T23 ack envelope — the write succeeded, no
+    # concurrent-edit 412 raised.
+    assert payload.get("name") == "index.md"
+    assert payload.get("size_bytes") == 151
+
+
+@pytest.mark.asyncio
+async def test_t46_silent_overwrite_still_detects_concurrent_edit_after_put() -> None:
+    """T46: the post-write verification still detects a
+    concurrent edit that lands *between* the bridge's
+    PUT and the verification GET.
+
+    Pins that the T46 fix doesn't just turn off the
+    verification helper — the helper still fires when
+    a genuine concurrent write happens between the
+    bridge's PUT and the verification re-read. The
+    semantic is: ``post_meta.etag != post_write_meta.etag``
+    → concurrent edit detected. Pre-T46 this compared
+    against the caller's pre-write etag; post-T46 it
+    compares against the bridge's PUT-response etag.
+    Either comparison detects a post-PUT drift; the
+    T46 fix just stops the pre-write-vs-post-PUT
+    false positive.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            # Bridge's view of "what we just wrote":
+            # ``"v1"`` (a real ETag from SB).
+            return httpx.Response(
+                200, headers={"ETag": '"v1"'}
+            )
+        # Verification re-read sees a different version
+        # — a concurrent writer touched the page after
+        # the bridge's PUT. T46 detects this as
+        # ``post_meta.etag ('"new"') !=
+        # post_write_meta.etag ('"v1"')`` and surfaces
+        # the silent-overwrite 412.
+        return httpx.Response(
+            200, headers={"ETag": '"new"'}
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index.md", "content": "body", "if_match": '"v1"'},
+        )
+
+    assert result.is_error is True
+    assert "concurrent edit detected" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_t46_silent_overwrite_passes_for_write_page_same_body_back() -> None:
+    """T46: the trivial case (write same body back) still
+    passes — the T44 happy-path is unchanged.
+
+    Pre-T44 the verification helper raised a spurious
+    "concurrent edit detected" on every successful
+    write because the synthesized etag included mtime
+    (which the bridge stamps with ``now_ms`` per
+    request). T44 dropped mtime from the synthesized
+    etag (``str(size_bytes)`` alone), which made the
+    trivial case work. The T46 fix changes the
+    comparison reference from the caller's pre-write
+    etag to the PUT-response etag; on the trivial case
+    those are identical (the pre-write read etag =
+    PUT-response etag = size of the unchanged body), so
+    the fix is byte-additive.
+    """
+    pre_mtime = "1700000000000"
+    post_mtime = "1700000001000"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and not getattr(handler, "read_done", False):
+            handler.read_done = True  # type: ignore[attr-defined]
+            return httpx.Response(
+                200,
+                text="body",
+                headers={
+                    "X-Last-Modified": pre_mtime,
+                    "X-Content-Length": "4",
+                },
+            )
+        if request.method == "PUT":
+            return httpx.Response(
+                200,
+                headers={
+                    "X-Last-Modified": post_mtime,
+                    "X-Content-Length": "4",
+                },
+            )
+        # Verification GET: same body, same size, even if
+        # the mtime drifted (T44 dropped mtime from the
+        # synthesized etag so the comparison is stable
+        # across re-reads).
+        return httpx.Response(
+            200,
+            text="body",
+            headers={
+                "X-Last-Modified": post_mtime,
+                "X-Content-Length": "4",
+            },
+        )
+
+    handler.read_done = False  # type: ignore[attr-defined]
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        read = await client.call_tool("read_page", {"name": "index.md"})
+        read_etag = (read.structured_content or {}).get("etag")
+        assert read_etag is not None
+        result = await client.call_tool(
+            "write_page",
+            {"name": "index.md", "content": "body", "if_match": read_etag},
+        )
+
+    assert result.is_error is False, (
+        f"T46 broke the T44 happy path: {_text(result)!r} "
+        f"on a write-same-body. The fix should be "
+        f"byte-additive for the trivial case."
+    )
+    payload = result.structured_content or {}
+    assert payload.get("etag") == '"4"'
+
+
+@pytest.mark.asyncio
+async def test_t46_silent_overwrite_passes_for_patch_page_lines_growing_page() -> None:
+    """T46: ``patch_page_lines`` that grows the page also
+    no longer triggers the spurious 412.
+
+    Same root cause as the append case (``patch_page_lines``
+    writes a body that grew; the synthesized-etag
+    post-write size differs from the pre-write size).
+    Pins the fix end-to-end for the second-most-common
+    read-modify-write tool.
+    """
+    request_count = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            request_count["get"] += 1
+            if request_count["get"] == 1:
+                # Pre-write read: 4-line page.
+                return httpx.Response(
+                    200,
+                    text="a\nb\nc\nd\n",
+                    headers={"X-Content-Length": "8"},
+                )
+            # Verification re-read: the patched body (one
+            # line replaced with a longer one — body
+            # grew).
+            return httpx.Response(
+                200,
+                text="A-LONG\nb\nc\nd\n",
+                headers={"X-Content-Length": "16"},
+            )
+        if request.method == "PUT":
+            # PUT response: bridge sent
+            # ``X-Content-Length: 16`` (the size of the
+            # patched body); SB echoes.
+            return httpx.Response(
+                200,
+                headers={"X-Content-Length": "16"},
+            )
+        return httpx.Response(404)
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "patch_page_lines",
+            {
+                "name": "index.md",
+                "start_line": 1,
+                "end_line": 1,
+                "new_content": "A-LONG",
+            },
+        )
+
+    assert result.is_error is False, (
+        f"T46: bridge raised {_text(result)!r} on a "
+        f"non-concurrent-edit patch that grew the page."
+    )
+    payload = result.structured_content or {}
+    # The exact size depends on the patch tool's
+    # trailing-newline handling; just assert that the
+    # patched body landed (no error, payload present).
+    assert payload.get("name") == "index.md"
+    assert isinstance(payload.get("size_bytes"), int)
+    assert payload.get("size_bytes") > 8  # grew from the 8-byte original
+
+
+@pytest.mark.asyncio
+async def test_t46_silent_overwrite_message_uses_post_write_etag_for_expected() -> None:
+    """T46: the silent-overwrite 412 ``expected_etag``
+    placeholder carries the PUT-response etag, not the
+    caller's pre-write ``if_match``.
+
+    Pre-T46 the wording's ``expected_etag`` was the
+    caller's pre-write etag (the auto-threaded read
+    etag for read-modify-write tools). Post-T46 it's
+    the bridge's PUT-response etag — the bridge's view
+    of "what we just wrote". An agent reading
+    ``expected_etag`` for forensics sees the version
+    the bridge wrote, not the version the agent read;
+    an agent reading ``current_etag`` sees the
+    next-call etag (unchanged from pre-T46).
+
+    The wording itself shifted from "the page changed
+    since you read it at" to "the page changed since
+    we wrote at" — T46 re-anchored the framing from
+    "you read" (the agent's pre-write read) to "we
+    wrote" (the bridge's PUT) because the comparison
+    now references the bridge's PUT, not the agent's
+    read.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            # The bridge just wrote; PUT response says
+            # the version is ``"we-wrote"``.
+            return httpx.Response(
+                200, headers={"ETag": '"we-wrote"'}
+            )
+        # Verification GET says the version is now
+        # ``"concurrent-wrote"`` — a different writer
+        # touched the page after the bridge's PUT.
+        return httpx.Response(
+            200, headers={"ETag": '"concurrent-wrote"'}
+        )
+
+    server = _build(handler)
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "write_page",
+            {
+                "name": "index.md",
+                "content": "body",
+                "if_match": '"caller-read"',
+            },
+        )
+
+    assert result.is_error is True
+    text = _text(result)
+    # T46: ``expected_etag`` is the PUT-response etag
+    # (``"we-wrote"``), not the caller's pre-write
+    # etag (``"caller-read"``). The wording says
+    # "since we wrote at" rather than "since you
+    # read it at" — semantically re-anchored.
+    assert '"we-wrote"' in text
+    assert '"concurrent-wrote"' in text
+    # The caller's pre-write etag is *not* in the
+    # message anymore (the comparison doesn't
+    # reference it).
+    assert '"caller-read"' not in text
+    # The wording change: "since we wrote" instead of
+    # "since you read it".
+    assert "since we wrote at" in text
 
 
 # --- T42: 412 contention hint ---------------------------------------
